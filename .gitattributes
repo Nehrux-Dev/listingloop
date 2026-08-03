@@ -1,0 +1,17 @@
+# Normalise line endings so the repo stays LF-only regardless of platform.
+* text=auto eol=lf
+
+# Files that must keep LF (they run inside Linux containers).
+*.sh   text eol=lf
+Dockerfile text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Binaries
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
