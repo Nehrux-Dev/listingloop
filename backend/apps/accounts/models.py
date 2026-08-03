@@ -2,6 +2,10 @@
 
 The project uses a custom user model from day one (swapping it later is
 painful) with e-mail as the login identifier instead of a username.
+
+Profile models (Brokerage, AgentProfile, BrandKit) live in ``profiles.py`` and
+are re-exported at the bottom of this module so ``from apps.accounts.models
+import ...`` works for every model in the app.
 """
 
 from __future__ import annotations
@@ -155,3 +159,26 @@ class User(AbstractBaseUser, PermissionsMixin):
     @property
     def is_nehrux_admin(self) -> bool:
         return self.role == Role.NEHRUX_ADMIN
+
+
+# Imported here (rather than the other way round) so Django's app registry
+# picks these models up when it loads apps.accounts.models. Placed at the end
+# to avoid a circular import at module load.
+from apps.accounts.profiles import (  # noqa: E402
+    AgentProfile,
+    BrandKit,
+    Brokerage,
+    DesignStyle,
+)
+
+__all__ = [
+    "AgentProfile",
+    "BrandKit",
+    "Brokerage",
+    "DesignStyle",
+    "ROLE_LEVELS",
+    "Role",
+    "SELF_ASSIGNABLE_ROLES",
+    "User",
+    "UserManager",
+]

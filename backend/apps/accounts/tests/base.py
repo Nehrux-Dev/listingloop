@@ -2,17 +2,35 @@
 
 from __future__ import annotations
 
+import io
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.urls import reverse
+from PIL import Image
 from rest_framework.test import APITestCase
 
-from apps.accounts.models import Role
+from apps.accounts.models import Brokerage, Role
 
 User = get_user_model()
 
 PASSWORD = "correct-horse-battery"
+
+
+def make_image_file(
+    name: str = "photo.png",
+    image_format: str = "PNG",
+    size: tuple[int, int] = (32, 32),
+    color: str = "#2563EB",
+) -> SimpleUploadedFile:
+    """A genuine, decodable image in memory."""
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format=image_format)
+    buffer.seek(0)
+    content_type = f"image/{image_format.lower()}"
+    return SimpleUploadedFile(name, buffer.read(), content_type=content_type)
 
 
 class AuthAPITestCase(APITestCase):
@@ -25,6 +43,24 @@ class AuthAPITestCase(APITestCase):
     me_url = reverse("accounts:me")
     platform_url = reverse("accounts_admin:platform-overview")
     brokerage_url = reverse("accounts_admin:brokerage-overview")
+
+    brokerages_url = reverse("profiles:brokerage-list")
+    agents_url = reverse("profiles:agent-list")
+    agent_me_url = reverse("profiles:agent-me")
+    brand_kits_url = reverse("profiles:brandkit-list")
+    brand_kit_mine_url = reverse("profiles:brandkit-mine")
+
+    @staticmethod
+    def brokerage_detail_url(brokerage) -> str:
+        return reverse("profiles:brokerage-detail", args=[brokerage.pk])
+
+    @staticmethod
+    def agent_detail_url(profile) -> str:
+        return reverse("profiles:agent-detail", args=[profile.pk])
+
+    @staticmethod
+    def brand_kit_detail_url(brand_kit) -> str:
+        return reverse("profiles:brandkit-detail", args=[brand_kit.pk])
 
     def setUp(self) -> None:
         super().setUp()
@@ -49,6 +85,22 @@ class AuthAPITestCase(APITestCase):
 
     def make_nehrux_admin(self, email: str = "nehrux@example.com"):
         return self.make_user(email, Role.NEHRUX_ADMIN)
+
+    @staticmethod
+    def make_brokerage(name: str = "Acme Realty", *admins) -> Brokerage:
+        brokerage = Brokerage.objects.create(name=name)
+        if admins:
+            brokerage.admins.set(admins)
+        return brokerage
+
+    def make_agent_in(self, brokerage, email: str = "agent@example.com"):
+        """Create an agent user and attach their auto-created profile."""
+        user = self.make_agent(email)
+        # The profile is created by a post_save signal on the user.
+        profile = user.agent_profile
+        profile.brokerage = brokerage
+        profile.save()
+        return user, profile
 
     # -- helpers ------------------------------------------------------------
 

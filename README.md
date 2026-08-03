@@ -6,13 +6,15 @@ Full-stack skeleton and local development environment.
 | -------------- | ---------------------------------------------------- |
 | Backend        | Python 3.12, Django 5.2, Django REST Framework       |
 | Auth           | JWT (simplejwt), httpOnly refresh cookie, 3 roles    |
+| Uploads        | Django storage API, local filesystem (swappable)     |
 | Database       | PostgreSQL 16                                        |
 | Background     | Celery 5.6 + Redis 7 (connection only, no tasks)     |
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
 | Orchestration  | Docker Compose                                       |
 
-Authentication and role-based access control are in place. There is no domain
-model or business logic yet.
+Authentication, role-based access control, and agent/brokerage/brand-kit
+profile management are in place. Listings, templates, AI content and compliance
+are still empty scaffolds.
 
 ---
 
@@ -70,12 +72,16 @@ docker compose exec backend python manage.py seed_dev_users
 | Email                 | Role            |
 | --------------------- | --------------- |
 | `agent@nehrux.test`   | Agent           |
+| `agent2@nehrux.test`  | Agent           |
 | `broker@nehrux.test`  | Brokerage Admin |
 | `admin@nehrux.test`   | Nehrux Admin    |
 
-Password for all three: `Passw0rd-Local-2026`. Sign in at
-http://localhost:5173/login. The nav bar changes by role, and an Agent who
-types `/platform` into the address bar lands on `/forbidden`.
+Password for all of them: `Passw0rd-Local-2026`. It also creates a brokerage
+("Harbour & Co Realty") with both agents as members and `broker@` as its
+administrator, so every screen has something to show.
+
+Sign in at http://localhost:5173/login. The nav bar changes by role, and an
+Agent who types `/platform` into the address bar lands on `/forbidden`.
 
 ---
 
@@ -110,6 +116,114 @@ roles are granted by an admin through the Django admin.
 The last two are example endpoints demonstrating the two permission styles.
 DRF defaults to `IsAuthenticated`, so anything new is private until it opts
 out explicitly.
+
+---
+
+## Profiles, brokerages and brand kits
+
+### Models
+
+| Model          | Notes |
+| -------------- | ----- |
+| `Brokerage`    | name, logo, required disclaimer, website, phone. `admins` (M2M to users) decides who may manage it. |
+| `AgentProfile` | one per user, created automatically when an Agent registers. Name, photo, phone, public email, job title, tagline, and a FK to `Brokerage` (`brokerage.agents` in reverse). |
+| `BrandKit`     | three colours, heading/body fonts, design style. Belongs to **exactly one** agent or brokerage, enforced by a database `CheckConstraint`. |
+
+They live in [backend/apps/accounts/profiles.py](backend/apps/accounts/profiles.py)
+and are re-exported from `apps.accounts.models`.
+
+Two relationships are deliberately kept separate: `AgentProfile.brokerage` is
+*membership*, `Brokerage.admins` is *administration*. A Brokerage Admin needs
+no agent profile, and an agent is not an admin of their own brokerage.
+
+### Endpoints
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| CRUD | `/api/brokerages/` | create/delete: Nehrux Admin only |
+| CRUD | `/api/agents/` | create/delete: Brokerage Admin and above |
+| GET/PATCH | `/api/agents/me/` | the caller's own profile |
+| CRUD | `/api/brand-kits/` | |
+| GET | `/api/brand-kits/mine/` | the caller's own kit, created on first call |
+
+### Who can do what
+
+| | Agent | Brokerage Admin | Nehrux Admin |
+| --- | --- | --- | --- |
+| Own profile | edit | — | edit any |
+| Colleagues' profiles | read | edit (own brokerage) | edit any |
+| Own brokerage | read | edit | edit any |
+| Create/delete a brokerage | no | no | yes |
+| Own brand kit | edit | edit their agents' | edit any |
+| Brokerage brand kit | read | edit | edit any |
+
+Two things an agent explicitly cannot do, both covered by tests: reassign
+themselves to another brokerage by PATCHing their own profile, and reach any
+record belonging to a different brokerage.
+
+The API distinguishes the two failure modes on purpose:
+
+- **404** — the record is outside the caller's queryset. The API does not
+  confirm it exists.
+- **403** — the record is visible (a colleague, the brokerage they belong to)
+  but the caller may not change it.
+
+### Uploads and storage
+
+Files go through Django's storage API only — no `open()`, no `os.path`, no
+hardcoded directories. Swapping backends is a settings change:
+
+```python
+# now, in settings.py
+STORAGES["default"] = {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+
+# later — pip install "django-storages[s3]", then:
+STORAGES["default"] = {
+    "BACKEND": "storages.backends.s3.S3Storage",
+    "OPTIONS": {"bucket_name": ..., "endpoint_url": ...},
+}
+```
+
+Nothing in the models, serializers, views or React app changes, because
+`ImageField` and `.url` are backend-agnostic.
+[backend/apps/core/storage.py](backend/apps/core/storage.py) explains the
+design; the short version:
+
+- `upload_to` callables return **keys**, not paths — forward-slash separated,
+  valid as both a filesystem path and an S3 object key.
+- Keys are random UUIDs under a namespace (`agents/photos/ab/abcd….png`). The
+  client's filename never touches storage, so path traversal and filename
+  collisions are structurally impossible, and replacing a photo produces a new
+  URL rather than a stale cached one.
+- Replaced and deleted files are cleaned up through `storage.delete()`.
+
+Validation runs at the model layer, so it applies to the API, the Django admin
+and any management command alike
+([backend/apps/core/validators.py](backend/apps/core/validators.py)):
+
+1. **Size** — `MAX_IMAGE_UPLOAD_MB`, default 5. Checked before the file is
+   decoded, so an oversized upload is cheap to reject and reports the real
+   reason.
+2. **Extension** — allowlist: `.jpg`, `.jpeg`, `.png`, `.webp`. SVG is excluded
+   because it can carry script.
+3. **Content** — the bytes are decoded and the *real* format compared against
+   the allowlist. Neither the filename nor the `Content-Type` header is
+   evidence of anything; this is the check that stops a script renamed
+   `photo.png`.
+
+### React forms
+
+| Route | Who | File |
+| ----- | --- | ---- |
+| `/profile` | agents | [ProfilePage.tsx](frontend/src/pages/ProfilePage.tsx) — details + photo upload |
+| `/brand-kit` | agents | [BrandKitPage.tsx](frontend/src/pages/BrandKitPage.tsx) — colours, fonts, style |
+| `/brokerage` | Brokerage Admin and above | [BrokeragePage.tsx](frontend/src/pages/BrokeragePage.tsx) — details, logo, disclaimer, agent list |
+
+The agent forms address `/me/` and `/mine/`, which resolve the record from the
+access token — there is no id in the URL or payload, so they structurally
+cannot be pointed at someone else. Client-side file checks in
+[FormControls.tsx](frontend/src/components/FormControls.tsx) are a courtesy for
+fast feedback; the server validates independently.
 
 ### Token storage — the important part
 
@@ -192,13 +306,21 @@ Notes:
 │   │   ├── wsgi.py
 │   │   └── asgi.py
 │   └── apps/                # one Django app per domain
-│       ├── core/            # health check, seed_dev_users command
-│       ├── accounts/        # user model, roles, JWT auth, permissions
+│       ├── core/            # cross-cutting infrastructure
+│       │   ├── storage.py       # upload keys, storage-backend indirection
+│       │   ├── validators.py    # image size / extension / content checks
+│       │   ├── fields.py        # ValidatedImageField (size before decode)
+│       │   ├── models.py        # TimeStampedModel
+│       │   └── management/      # seed_dev_users
+│       ├── accounts/        # identity, auth, and profile domain
 │       │   ├── models.py        # User + Role + ROLE_LEVELS
+│       │   ├── profiles.py      # Brokerage, AgentProfile, BrandKit
 │       │   ├── cookies.py       # httpOnly refresh-cookie handling (read this)
-│       │   ├── permissions.py   # role-based DRF permission classes
-│       │   ├── serializers.py
+│       │   ├── permissions.py   # role + object-level permission classes
+│       │   ├── serializers.py / profile_serializers.py
 │       │   ├── views.py         # register / login / refresh / logout / me
+│       │   ├── profile_views.py # brokerage / agent / brand-kit viewsets
+│       │   ├── signals.py       # profile provisioning, stored-file cleanup
 │       │   └── tests/
 │       ├── listings/        # property listings          (empty scaffold)
 │       ├── templates/       # reusable content templates (empty scaffold)
@@ -212,10 +334,12 @@ Notes:
         ├── main.tsx
         ├── App.tsx          # router + guarded routes
         ├── index.css        # @import "tailwindcss"
+        ├── api/profiles.ts  # profile/brokerage/brand-kit calls and types
         ├── auth/            # provider, guards, token store, API calls
-        ├── components/      # AppLayout (role-aware nav)
-        ├── lib/apiClient.ts # fetch wrapper with refresh-and-retry
-        └── pages/           # Login, Dashboard, Brokerage, Platform, Forbidden
+        ├── components/      # AppLayout, shared form controls
+        ├── lib/apiClient.ts # fetch wrapper: refresh-and-retry, multipart
+        └── pages/           # Login, Dashboard, Profile, BrandKit,
+                             #   Brokerage, Platform, Forbidden
 ```
 
 The remaining domain apps are empty scaffolds (`apps.py`, `models.py`,
@@ -261,11 +385,20 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-The suite runs against a throwaway database, uses an in-memory cache instead
-of Redis and a fast password hasher, so it needs nothing beyond a running
-Postgres. It covers successful and failed login, token refresh and rotation,
-logout revocation, registration, and access denied both for the wrong role
-(403) and for no token at all (401).
+115 tests. The suite runs against a throwaway database, uses an in-memory
+cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
+so it needs nothing beyond a running Postgres.
+
+- `test_auth.py` — login (success and failure), refresh and rotation replay,
+  logout revocation, registration rules, the httpOnly cookie contract.
+- `test_permissions.py` — access denied for the wrong role (403) and for no
+  token (401), role hierarchy, immediate effect of a role change.
+- `test_profiles.py` — CRUD for all three models, and the boundaries: an agent
+  cannot edit a colleague, reach another brokerage, move themselves between
+  brokerages, or delete their own profile.
+- `test_uploads.py` — valid uploads, non-image content, disallowed extensions,
+  oversized files, extension/content mismatch, storage-key shape, and cleanup
+  of replaced files.
 
 ### Celery
 
@@ -316,6 +449,10 @@ The defaults are tuned for local development. For anything public:
   CSRF token before doing that.
 - Swap `runserver` for gunicorn (already in `requirements.txt`) and build the
   frontend to static files instead of running the Vite dev server.
+- Serve `MEDIA_ROOT` from nginx (or move `STORAGES["default"]` to an object
+  store); Django's `static()` helper is DEBUG-only and does nothing in
+  production. Whichever you choose, make sure the media location cannot
+  execute anything it serves.
 - Prune the blacklist periodically:
   `manage.py flushexpiredtokens` (from simplejwt).
 

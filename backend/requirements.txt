@@ -8,6 +8,10 @@ django-environ>=0.12,<0.13
 # Database
 psycopg[binary]>=3.2,<4.0
 
+# Image handling: required by ImageField, and used by the upload validator to
+# confirm a file really is the image it claims to be.
+Pillow>=11.0,<12.0
+
 # Background processing
 celery>=5.5,<6.0
 redis>=5.2,<7.0

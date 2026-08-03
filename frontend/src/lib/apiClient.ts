@@ -70,11 +70,16 @@ type RequestOptions = Omit<RequestInit, 'body'> & {
 async function rawRequest(path: string, options: RequestOptions = {}): Promise<Response> {
   const { body, skipAuthRefresh: _skip, headers, ...rest } = options
 
+  const isFormData = body instanceof FormData
+
   const finalHeaders = new Headers(headers)
   finalHeaders.set('Accept', 'application/json')
-  if (body !== undefined) {
+  if (body !== undefined && !isFormData) {
     finalHeaders.set('Content-Type', 'application/json')
   }
+  // For FormData the Content-Type is deliberately NOT set: the browser has to
+  // generate it so it can append the multipart boundary. Setting it by hand
+  // produces a body the server cannot parse.
 
   // The access token travels in the Authorization header, never in a cookie —
   // a header cannot be attached automatically by the browser, so it carries no
@@ -84,10 +89,15 @@ async function rawRequest(path: string, options: RequestOptions = {}): Promise<R
     finalHeaders.set('Authorization', `Bearer ${token}`)
   }
 
+  let payload: BodyInit | undefined
+  if (body !== undefined) {
+    payload = isFormData ? body : JSON.stringify(body)
+  }
+
   return fetch(`${API_BASE_URL}${path}`, {
     ...rest,
     headers: finalHeaders,
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: payload,
     // Required for the httpOnly refresh cookie to be sent and stored.
     credentials: 'include',
   })

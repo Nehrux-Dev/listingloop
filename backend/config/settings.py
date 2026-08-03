@@ -205,8 +205,65 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-MEDIA_URL = "media/"
-MEDIA_ROOT = BASE_DIR / "media"
+
+# User uploads (agent photos, brokerage logos).
+MEDIA_URL = env("MEDIA_URL", default="/media/")
+MEDIA_ROOT = env("MEDIA_ROOT", default=str(BASE_DIR / "media"))
+
+
+# ---------------------------------------------------------------------------
+# File storage
+#
+# Everything that touches uploads goes through Django's storage API, so the
+# backend is a configuration choice rather than something baked into the code.
+# See apps/core/storage.py for the upload-key helpers and the reasoning.
+#
+# Today: the local filesystem under MEDIA_ROOT.
+# Later:  an S3-compatible bucket (MinIO, Backblaze B2, DO Spaces, S3) or a
+#         VPS volume. Swapping is a change to STORAGES["default"] plus
+#         `pip install django-storages[s3]` — no model, serializer, view or
+#         frontend change, because ImageField and `.url` are backend-agnostic:
+#
+#           STORAGES["default"] = {
+#               "BACKEND": "storages.backends.s3.S3Storage",
+#               "OPTIONS": {
+#                   "bucket_name": env("S3_BUCKET"),
+#                   "endpoint_url": env("S3_ENDPOINT_URL"),
+#                   "region_name": env("S3_REGION", default="auto"),
+#                   "querystring_auth": True,   # signed, expiring URLs
+#               },
+#           }
+# ---------------------------------------------------------------------------
+
+STORAGES = {
+    "default": {
+        "BACKEND": env(
+            "DEFAULT_FILE_STORAGE",
+            default="django.core.files.storage.FileSystemStorage",
+        ),
+    },
+    "staticfiles": {
+        "BACKEND": env(
+            "STATICFILES_STORAGE",
+            default="django.contrib.staticfiles.storage.StaticFilesStorage",
+        ),
+    },
+}
+
+#: Upload ceiling enforced by apps.core.validators.ImageUploadValidator on
+#: every write path, whatever the storage backend is.
+MAX_IMAGE_UPLOAD_MB = env.int("MAX_IMAGE_UPLOAD_MB", default=5)
+MAX_IMAGE_UPLOAD_BYTES = MAX_IMAGE_UPLOAD_MB * 1024 * 1024
+
+# Stop a huge multipart body from being buffered in memory before the
+# validator ever sees it: anything over 2.5 MB spills to a temp file.
+FILE_UPLOAD_MAX_MEMORY_SIZE = env.int(
+    "FILE_UPLOAD_MAX_MEMORY_SIZE", default=2 * 1024 * 1024
+)
+# Non-file form fields only; keeps oversized JSON/form posts out.
+DATA_UPLOAD_MAX_MEMORY_SIZE = env.int(
+    "DATA_UPLOAD_MAX_MEMORY_SIZE", default=5 * 1024 * 1024
+)
 
 
 # ---------------------------------------------------------------------------

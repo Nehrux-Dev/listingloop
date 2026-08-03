@@ -4,11 +4,13 @@ import { AuthProvider } from './auth/AuthContext.tsx'
 import { ProtectedRoute, RequireRole } from './auth/ProtectedRoute.tsx'
 import { ROLES } from './auth/types.ts'
 import AppLayout from './components/AppLayout.tsx'
+import BrandKitPage from './pages/BrandKitPage.tsx'
 import BrokeragePage from './pages/BrokeragePage.tsx'
 import DashboardPage from './pages/DashboardPage.tsx'
 import ForbiddenPage from './pages/ForbiddenPage.tsx'
 import LoginPage from './pages/LoginPage.tsx'
 import PlatformAdminPage from './pages/PlatformAdminPage.tsx'
+import ProfilePage from './pages/ProfilePage.tsx'
 
 export default function App() {
   return (
@@ -24,6 +26,11 @@ export default function App() {
           <Route element={<ProtectedRoute />}>
             <Route element={<AppLayout />}>
               <Route index element={<DashboardPage />} />
+
+              {/* Any authenticated user with an agent profile. Both pages
+                  address the caller's own record via /me/ and /mine/. */}
+              <Route path="profile" element={<ProfilePage />} />
+              <Route path="brand-kit" element={<BrandKitPage />} />
 
               {/* Hierarchical guard: Brokerage Admins and Nehrux Admins. */}
               <Route element={<RequireRole minimumRole={ROLES.BROKERAGE_ADMIN} />}>

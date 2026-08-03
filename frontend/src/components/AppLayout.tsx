@@ -28,6 +28,18 @@ export default function AppLayout() {
               Dashboard
             </NavLink>
 
+            {/* Only agents have a profile and a personal brand kit. */}
+            {hasRole(ROLES.AGENT) && (
+              <>
+                <NavLink to="/profile" className={linkClass}>
+                  My profile
+                </NavLink>
+                <NavLink to="/brand-kit" className={linkClass}>
+                  Brand kit
+                </NavLink>
+              </>
+            )}
+
             {/* Nav links are filtered by role purely so users are not shown
                 doors they cannot open. The routes themselves are guarded, and
                 the API enforces the real boundary. */}
