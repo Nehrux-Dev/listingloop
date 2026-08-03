@@ -11,8 +11,8 @@ urlpatterns = [
     path("api/auth/", include("apps.accounts.urls")),
     path("api/admin/", include("apps.accounts.admin_urls")),
     path("api/", include("apps.accounts.profile_urls")),
+    path("api/", include("apps.listings.urls")),
     # Domain apps are wired up here as they gain endpoints:
-    # path("api/listings/", include("apps.listings.urls")),
     # path("api/templates/", include("apps.templates.urls")),
     # path("api/ai-content/", include("apps.ai_content.urls")),
     # path("api/compliance/", include("apps.compliance.urls")),

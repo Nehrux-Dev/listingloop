@@ -28,6 +28,10 @@ export default function AppLayout() {
               Dashboard
             </NavLink>
 
+            <NavLink to="/listings" className={linkClass}>
+              Listings
+            </NavLink>
+
             {/* Only agents have a profile and a personal brand kit. */}
             {hasRole(ROLES.AGENT) && (
               <>

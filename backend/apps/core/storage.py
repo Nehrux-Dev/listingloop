@@ -74,6 +74,11 @@ def brokerage_logo_upload_to(instance, filename: str) -> str:
     return build_upload_key("brokerages/logos", filename)
 
 
+def listing_photo_upload_to(instance, filename: str) -> str:
+    """Storage key for a listing photo."""
+    return build_upload_key("listings/photos", filename)
+
+
 def delete_stored_file(file_field) -> None:
     """Delete the file behind a ``FieldFile``, if any, via the storage API.
 

@@ -12,9 +12,9 @@ Full-stack skeleton and local development environment.
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
 | Orchestration  | Docker Compose                                       |
 
-Authentication, role-based access control, and agent/brokerage/brand-kit
-profile management are in place. Listings, templates, AI content and compliance
-are still empty scaffolds.
+Authentication, role-based access control, profile management and property
+listings (manual entry, URL import, verification) are in place. Templates, AI
+content and compliance are still empty scaffolds.
 
 ---
 
@@ -225,6 +225,109 @@ cannot be pointed at someone else. Client-side file checks in
 [FormControls.tsx](frontend/src/components/FormControls.tsx) are a courtesy for
 fast feedback; the server validates independently.
 
+---
+
+## Listings
+
+### Models
+
+| Model | Notes |
+| ----- | ----- |
+| `Listing` | address + structured location, price, bedrooms, bathrooms, square footage, property type, features (JSON list), status, verification status, provenance. Owned by one `AgentProfile`. |
+| `ListingPhoto` | image, caption, `order`, and `source_url` when imported. |
+
+Every attribute is nullable on purpose: an import that cannot establish a value
+has to be able to leave it blank rather than write a plausible guess.
+
+### Endpoints
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| CRUD | `/api/listings/` | filter with `?verification_status=` / `?status=` |
+| GET | `/api/listings/summary/` | counts for the caller's scope |
+| POST | `/api/listings/{id}/verify/` | requires `{"confirmed": true}` |
+| POST | `/api/listings/{id}/unverify/` | withdraw verification |
+| POST | `/api/listings/import-url/` | one-off fetch of a public listing page |
+| CRUD | `/api/listing-photos/` | multipart upload, `?listing=` filter |
+
+### Scoping
+
+Listings are **per agent**, not per brokerage: an agent sees only their own,
+even from a colleague at the same brokerage whose *profile* they can see. A
+Brokerage Admin sees every listing under the brokerages they administer; a
+Nehrux Admin sees all of them. The rule lives in `Listing.objects.for_user`
+rather than in the viewset, so every future caller — a Celery task, a
+management command — inherits it instead of reimplementing it.
+
+### Verification
+
+This is the gate that protects everything downstream. Two rules, both on the
+model so they hold for the admin and the shell as well as the API:
+
+1. A listing starts **unverified** and becomes verified *only* through
+   `POST /api/listings/{id}/verify/` with `{"confirmed": true}`.
+   `verification_status` is read-only on the serializer, so it cannot be set in
+   an ordinary PATCH, and the endpoint refuses while any of `address`, `city`,
+   `price` or `property_type` is blank.
+2. **Editing the data undoes it.** Change the price, address, bed count or
+   features and the listing drops back to unverified. Without this, an agent
+   could verify a listing and then quietly change the price while everything
+   downstream still treated it as reviewed. Changing only the *sales* status
+   (draft → active → sold) does not reset it, because that does not change what
+   the listing claims.
+
+Later features must fetch listings through
+[`get_listing_for_content`](backend/apps/listings/services.py), which applies
+scoping and the verified check together, rather than calling
+`Listing.objects.get()` directly.
+
+### URL import
+
+`POST /api/listings/import-url/` fetches one page, once, when an agent asks.
+Nothing is scheduled and nothing is re-fetched.
+
+**Making the server fetch a user-supplied URL is SSRF by construction**, so
+[fetching.py](backend/apps/listings/fetching.py) is deliberately restrictive:
+http/https only; the hostname is resolved and *every* address it maps to must
+be publicly routable (loopback, private, link-local — including the
+`169.254.169.254` cloud-metadata address — reserved and multicast are all
+refused); redirects are followed one hop at a time and re-validated; the
+response is size- and time-limited; content types are allowlisted; and no
+cookies, auth or proxy configuration are inherited. The endpoint is throttled.
+The module documents the one residual gap honestly — DNS rebinding — and says
+where the real fix belongs (egress control at the network edge).
+
+Extraction ([extraction.py](backend/apps/listings/extraction.py)) works in
+three tiers and **never guesses**:
+
+1. **JSON-LD** (schema.org) — the site stating what its numbers mean. Trusted.
+2. **Open Graph / meta** — images and description.
+3. **Labelled text** — bedrooms, bathrooms and floor area only, and only where
+   a number sits against an unambiguous label. If the page yields *conflicting*
+   values, the field is left blank with a warning. Picking one would be a coin
+   flip.
+
+Price is never read from page text at all — a listing page is full of numbers
+that look like prices (price history, comparables, mortgage estimates).
+
+The result is always a DRAFT, UNVERIFIED listing plus `imported_fields` (what
+was actually populated) and `import_warnings` (what could not be read, in plain
+language). If the page cannot be fetched at all the API returns 502 and creates
+nothing. Remote photos are downloaded through the same guarded fetcher and the
+same image validation as a browser upload; one bad image is skipped with a
+warning rather than losing the import.
+
+### React
+
+| Route | File |
+| ----- | ---- |
+| `/listings` | [ListingsPage.tsx](frontend/src/pages/ListingsPage.tsx) — list, filter by verification |
+| `/listings/new`, `/listings/:id` | [ListingFormPage.tsx](frontend/src/pages/ListingFormPage.tsx) — all fields, features editor, multi-photo upload, verification panel |
+| `/listings/import` | [ListingImportPage.tsx](frontend/src/pages/ListingImportPage.tsx) — paste a URL, see exactly what was and was not extracted |
+
+Blank numeric inputs are sent as `null`, never `0` — a blank field means "not
+known".
+
 ### Token storage — the important part
 
 Full reasoning lives in
@@ -322,7 +425,13 @@ Notes:
 │       │   ├── profile_views.py # brokerage / agent / brand-kit viewsets
 │       │   ├── signals.py       # profile provisioning, stored-file cleanup
 │       │   └── tests/
-│       ├── listings/        # property listings          (empty scaffold)
+│       ├── listings/        # property listings
+│       │   ├── models.py        # Listing (+ verification rules), ListingPhoto
+│       │   ├── fetching.py      # SSRF-guarded outbound fetch (read this)
+│       │   ├── extraction.py    # conservative parsing; never guesses
+│       │   ├── importing.py     # one-off URL import -> unverified draft
+│       │   ├── services.py      # get_listing_for_content (the verified gate)
+│       │   └── tests/
 │       ├── templates/       # reusable content templates (empty scaffold)
 │       ├── ai_content/      # AI-generated copy          (empty scaffold)
 │       └── compliance/      # regulatory rules           (empty scaffold)
@@ -385,9 +494,10 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-115 tests. The suite runs against a throwaway database, uses an in-memory
+183 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
-so it needs nothing beyond a running Postgres.
+so it needs nothing beyond a running Postgres. The import tests stub the fetch
+layer, so no test touches the network.
 
 - `test_auth.py` — login (success and failure), refresh and rotation replay,
   logout revocation, registration rules, the httpOnly cookie contract.
@@ -399,6 +509,16 @@ so it needs nothing beyond a running Postgres.
 - `test_uploads.py` — valid uploads, non-image content, disallowed extensions,
   oversized files, extension/content mismatch, storage-key shape, and cleanup
   of replaced files.
+- `listings/test_listings.py` — CRUD, photos, and scoping: agent A cannot see,
+  edit, delete or verify agent B's listings, including as a colleague at the
+  same brokerage.
+- `listings/test_verification.py` — the transitions: explicit confirmation
+  required, incomplete listings refused, editing data resets verification,
+  changing sales status does not, and the content gate.
+- `listings/test_import.py` — extraction from structured data, refusal to
+  invent anything from a bare or ambiguous page, graceful fetch failure, photo
+  handling, and the SSRF guard against loopback, private ranges, the cloud
+  metadata address and non-HTTP schemes.
 
 ### Celery
 
@@ -458,5 +578,9 @@ The defaults are tuned for local development. For anything public:
 
 ## Next steps
 
-Deliberately not included yet: domain models for listings/templates/AI
-content/compliance, Celery tasks, CI, and production settings.
+Deliberately not included yet: templates, AI content and compliance domain
+models, Celery tasks, CI, and production settings.
+
+When the import needs to handle slow pages or bulk use, move
+`import_listing_from_url` into a Celery task — the service function is already
+self-contained, and the worker is already running.

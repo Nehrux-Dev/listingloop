@@ -296,6 +296,10 @@ REST_FRAMEWORK = {
         # Applied to login / register / refresh (see the `auth` throttle scope)
         # to blunt credential stuffing.
         "auth": env("AUTH_THROTTLE_RATE", default="30/min"),
+        # The listing import makes the server fetch a user-supplied URL, so it
+        # is kept deliberately slow: it is a manual, one-at-a-time action, and
+        # an unthrottled version would be an open outbound-request proxy.
+        "listing_import": env("LISTING_IMPORT_THROTTLE_RATE", default="10/min"),
     },
 }
 
