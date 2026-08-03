@@ -6,7 +6,7 @@ Full-stack skeleton and local development environment.
 | -------------- | ------------------------------------------------ |
 | Backend        | Python 3.12, Django 5.2, Django REST Framework   |
 | Database       | PostgreSQL 16                                    |
-| Background     | Celery 5.5 + Redis 7 (connection only, no tasks) |
+| Background     | Celery 5.6 + Redis 7 (connection only, no tasks) |
 | Frontend       | React 19, TypeScript, Vite, Tailwind CSS v4      |
 | Orchestration  | Docker Compose                                   |
 
