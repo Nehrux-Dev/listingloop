@@ -300,6 +300,9 @@ REST_FRAMEWORK = {
         # is kept deliberately slow: it is a manual, one-at-a-time action, and
         # an unthrottled version would be an open outbound-request proxy.
         "listing_import": env("LISTING_IMPORT_THROTTLE_RATE", default="10/min"),
+        # Every render occupies a browser page and the renderer's pool is
+        # deliberately small, so preview/export are rate limited per user.
+        "render": env("RENDER_THROTTLE_RATE", default="60/min"),
     },
 }
 
@@ -352,6 +355,27 @@ AUTH_COOKIE_SAMESITE = env("AUTH_COOKIE_SAMESITE", default="Lax")
 AUTH_COOKIE_PATH = env("AUTH_COOKIE_PATH", default="/api/auth/")
 # Empty means a host-only cookie, which is the safest default.
 AUTH_COOKIE_DOMAIN = env("AUTH_COOKIE_DOMAIN", default="")
+
+
+# ---------------------------------------------------------------------------
+# Rendering service
+#
+# Chromium lives in its own container (see the `renderer` service). Django
+# composes the HTML and posts it there; the service only screenshots. That
+# split keeps ~700 MB of browser out of the Django image and lets the browser
+# stay warm, which the Step 4 prototype showed is worth ~430 ms per image.
+#
+# The renderer renders arbitrary HTML, so it must NOT be published to the host
+# or reachable from outside the compose network. The shared token below is a
+# second layer, not the only one.
+# ---------------------------------------------------------------------------
+
+RENDERER_URL = env("RENDERER_URL", default="http://renderer:8080")
+RENDERER_TOKEN = env("RENDERER_TOKEN", default="dev-renderer-token-change-me")
+RENDERER_TIMEOUT_SECONDS = env.int("RENDERER_TIMEOUT_SECONDS", default=30)
+#: Device pixel ratio for exports. 1 is already 1080px wide for social.
+RENDERER_SCALE = env.int("RENDERER_SCALE", default=1)
+RENDERER_JPG_QUALITY = env.int("RENDERER_JPG_QUALITY", default=90)
 
 
 # ---------------------------------------------------------------------------

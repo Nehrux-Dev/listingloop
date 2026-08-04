@@ -7,14 +7,16 @@ Full-stack skeleton and local development environment.
 | Backend        | Python 3.12, Django 5.2, Django REST Framework       |
 | Auth           | JWT (simplejwt), httpOnly refresh cookie, 3 roles    |
 | Uploads        | Django storage API, local filesystem (swappable)     |
+| Rendering      | Playwright/Chromium in its own container, warm browser |
 | Database       | PostgreSQL 16                                        |
 | Background     | Celery 5.6 + Redis 7 (connection only, no tasks)     |
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
 | Orchestration  | Docker Compose                                       |
 
-Authentication, role-based access control, profile management and property
-listings (manual entry, URL import, verification) are in place. Templates, AI
-content and compliance are still empty scaffolds.
+Authentication, role-based access control, profile management, property
+listings (manual entry, URL import, verification) and the template/design
+system (controlled editing, multi-dimension export) are in place. AI content
+and compliance are still empty scaffolds.
 
 ---
 
@@ -67,6 +69,7 @@ Seed one account per role (refuses to run unless `DEBUG=True`):
 
 ```bash
 docker compose exec backend python manage.py seed_dev_users
+docker compose exec backend python manage.py seed_templates
 ```
 
 | Email                 | Role            |
@@ -328,6 +331,121 @@ warning rather than losing the import.
 Blank numeric inputs are sent as `null`, never `0` — a blank field means "not
 known".
 
+---
+
+## Templates and designs
+
+Built on **Approach A** from the [Step 4 prototype](prototypes/render-comparison/):
+Playwright/Chromium, running in its own `renderer` container with a warm
+browser.
+
+### Models
+
+| Model | Notes |
+| ----- | ----- |
+| `Template` | name, category (10), style (6), canvas-level `layout_definition`, and a `permission_map` derived from its elements. |
+| `TemplateElement` | `key`, element type, **permission**, fractional `geometry`, `style_properties`, `content_source`, and `constraints`. |
+| `Design` | a saved instance: template + agent + (verified) listing + `overrides`. |
+| `DesignExport` | one rendered image at one dimension and format. |
+
+### The permission model
+
+Four levels, declared per element:
+
+| Permission | May change |
+| ---------- | ---------- |
+| `locked` | nothing — brokerage logos, compliance disclaimers |
+| `content_only` | text / image swap; geometry and styling fixed |
+| `styled` | content, plus colour and size within an explicit allowlist |
+| `free` | content, styling, and move/resize within declared `bounds` |
+
+**Enforced server-side on every write**, in
+[overrides.py](backend/apps/templates/overrides.py). The editor greys out
+controls it should, but that is styling — the API assumes the client is hostile
+and re-derives the rules from the template each time: unknown element keys are
+rejected rather than stored, each field is checked against what the permission
+allows, and each value against the element's constraints (colour allowlists,
+font-size bounds, movement bounds, text length). One bad element rejects the
+whole payload, so the client's model never silently diverges from the server's.
+
+Two subtler rules worth knowing: an *empty* override on a locked element is
+still rejected (a client that thinks it can edit should be told it cannot), and
+image overrides name a **storage key, never a URL** — accepting a URL would let
+a design make the renderer fetch it.
+
+The API publishes `permission_map` and per-element `editable_fields` so the UI
+builds the right controls from the server's rules rather than its own copy.
+
+### Rendering pipeline
+
+```
+Listing + Template + BrandKit  →  Django composes HTML  →  renderer  →  PNG/JPG
+     (render_context.py)          (html_builder.py)     (Playwright)   (storage)
+```
+
+Django owns the HTML; the renderer is a dumb "HTML in, image out" service. That
+split means template logic is testable in Python without a browser, and the
+renderer can be scaled or replaced independently.
+
+The renderer container is **not published to the host** — it renders arbitrary
+HTML, so only the backend reaches it over the compose network, with a shared
+token. Its browser contexts run with **JavaScript disabled and all network
+requests blocked**; every image arrives inlined as a data URI, resolved through
+the storage API by Django. It keeps a small bounded pool of pages, because
+Chromium's memory grows with live pages.
+
+### One template, four dimensions
+
+Element geometry is **fractional** (0..1 of the canvas), so Instagram Post,
+Story, Facebook and LinkedIn come from one layout rather than four:
+
+| Dimension | Size | Notes |
+| --------- | ---- | ----- |
+| Instagram Post | 1080×1080 | |
+| Instagram Story | 1080×1920 | content inset from top/bottom for platform chrome |
+| Facebook | 1200×630 | |
+| LinkedIn | 1200×627 | |
+
+Type scales with the **smaller side** of the canvas, not the height. Scaling
+with height looked right at 1:1 and broke at 9:16 — a Story is 1.8× taller but
+no wider, so height-scaled type grew while the text box did not and long
+headings wrapped into the element below.
+
+Exports are saved through the same storage abstraction as every upload
+(`designs/exports/...`), so generated images follow user uploads to object
+storage — there is no separate output path to migrate.
+
+### Endpoints
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| GET | `/api/templates/` | `?category=` `?style=` `?search=` |
+| GET | `/api/templates/facets/` | filter options with counts |
+| CRUD | `/api/designs/` | scoped like listings |
+| GET | `/api/designs/{id}/resolved/` | every element resolved, with its permission |
+| POST | `/api/designs/{id}/rename/` `duplicate/` | |
+| POST | `/api/designs/{id}/preview/` | renders inline, saves nothing |
+| POST | `/api/designs/{id}/export/` | one or more dimensions, PNG or JPG |
+| GET | `/api/render-dimensions/` | the supported sizes |
+
+Templates are **read-only over the API** — they are product content, authored
+in the Django admin (`manage.py seed_templates` creates a starting library).
+Designs may only be built on **verified** listings, honouring the Step 4 gate.
+
+### React
+
+| Route | File |
+| ----- | ---- |
+| `/templates` | [TemplateLibraryPage.tsx](frontend/src/pages/TemplateLibraryPage.tsx) — browse, filter by category and style |
+| `/designs` | [DesignsPage.tsx](frontend/src/pages/DesignsPage.tsx) — save/reopen/rename/duplicate/delete |
+| `/designs/:id` | [DesignEditorPage.tsx](frontend/src/pages/DesignEditorPage.tsx) — controlled editing, preview, export |
+
+Controls come from [ElementControls.tsx](frontend/src/components/ElementControls.tsx),
+which renders from the API's `editable_fields`: locked elements show their value
+with no affordance, colour allowlists render as swatches rather than a picker
+(offering values the server will reject is worse than not offering them), and
+`free` elements get sliders clamped to their bounds.
+
 ### Token storage — the important part
 
 Full reasoning lives in
@@ -396,7 +514,9 @@ Notes:
 
 ```
 .
-├── docker-compose.yml       # Postgres, Redis, Django, Celery worker, Vite
+├── docker-compose.yml       # Postgres, Redis, Django, Celery, renderer, Vite
+├── renderer/                # HTML -> image service (Playwright, warm Chromium)
+├── prototypes/              # Step 4 rendering comparison (not part of the app)
 ├── .env.example             # every variable the stack reads
 ├── backend/
 │   ├── Dockerfile
@@ -432,7 +552,14 @@ Notes:
 │       │   ├── importing.py     # one-off URL import -> unverified draft
 │       │   ├── services.py      # get_listing_for_content (the verified gate)
 │       │   └── tests/
-│       ├── templates/       # reusable content templates (empty scaffold)
+│       ├── templates/       # template library, controlled editing, rendering
+│       │   ├── models.py        # Template, TemplateElement, Design, DesignExport
+│       │   ├── overrides.py     # permission enforcement (read this)
+│       │   ├── html_builder.py  # design -> HTML, fractional geometry
+│       │   ├── render_context.py# listing/agent/brand data for a design
+│       │   ├── rendering.py     # renderer client, export + storage
+│       │   ├── dimensions.py    # the four social sizes
+│       │   └── tests/
 │       ├── ai_content/      # AI-generated copy          (empty scaffold)
 │       └── compliance/      # regulatory rules           (empty scaffold)
 └── frontend/
@@ -469,6 +596,7 @@ docker compose exec backend python manage.py makemigrations
 docker compose exec backend python manage.py migrate
 docker compose exec backend python manage.py createsuperuser # becomes a Nehrux Admin
 docker compose exec backend python manage.py seed_dev_users  # one user per role
+docker compose exec backend python manage.py seed_templates  # the template library
 docker compose exec backend python manage.py shell
 
 docker compose logs -f backend
@@ -494,10 +622,11 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-183 tests. The suite runs against a throwaway database, uses an in-memory
+274 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
-layer, so no test touches the network.
+layer and the render tests stub the renderer service, so no test touches the
+network or needs a browser.
 
 - `test_auth.py` — login (success and failure), refresh and rotation replay,
   logout revocation, registration rules, the httpOnly cookie contract.
@@ -519,6 +648,12 @@ layer, so no test touches the network.
   invent anything from a bare or ambiguous page, graceful fetch failure, photo
   handling, and the SSRF guard against loopback, private ranges, the cloud
   metadata address and non-HTTP schemes.
+- `templates/test_element_permissions.py` — every permission level, both what
+  it allows and what it refuses, including editing a locked element via the API.
+- `templates/test_designs.py` — save/reopen round trip, rename, duplicate,
+  delete, the verified-listing gate, and scoping.
+- `templates/test_rendering.py` — HTML composition, all four export dimensions,
+  PNG and JPG, storage, and useful failure when the renderer is down.
 
 ### Celery
 

@@ -7,6 +7,8 @@ import AppLayout from './components/AppLayout.tsx'
 import BrandKitPage from './pages/BrandKitPage.tsx'
 import BrokeragePage from './pages/BrokeragePage.tsx'
 import DashboardPage from './pages/DashboardPage.tsx'
+import DesignEditorPage from './pages/DesignEditorPage.tsx'
+import DesignsPage from './pages/DesignsPage.tsx'
 import ForbiddenPage from './pages/ForbiddenPage.tsx'
 import ListingFormPage from './pages/ListingFormPage.tsx'
 import ListingImportPage from './pages/ListingImportPage.tsx'
@@ -14,6 +16,7 @@ import ListingsPage from './pages/ListingsPage.tsx'
 import LoginPage from './pages/LoginPage.tsx'
 import PlatformAdminPage from './pages/PlatformAdminPage.tsx'
 import ProfilePage from './pages/ProfilePage.tsx'
+import TemplateLibraryPage from './pages/TemplateLibraryPage.tsx'
 
 export default function App() {
   return (
@@ -41,6 +44,12 @@ export default function App() {
               <Route path="listings/new" element={<ListingFormPage />} />
               <Route path="listings/import" element={<ListingImportPage />} />
               <Route path="listings/:id" element={<ListingFormPage />} />
+
+              {/* Templates are read-only product content; designs are scoped
+                  server-side to the caller, so no extra guard is needed. */}
+              <Route path="templates" element={<TemplateLibraryPage />} />
+              <Route path="designs" element={<DesignsPage />} />
+              <Route path="designs/:id" element={<DesignEditorPage />} />
 
               {/* Hierarchical guard: Brokerage Admins and Nehrux Admins. */}
               <Route element={<RequireRole minimumRole={ROLES.BROKERAGE_ADMIN} />}>

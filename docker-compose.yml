@@ -44,6 +44,10 @@ services:
   backend:
     build:
       context: ./backend
+    # Named explicitly and shared with celery_worker: both are built from the
+    # same context, and giving them separate images lets one silently run
+    # stale code after a dependency change.
+    image: real-estate-backend
     restart: unless-stopped
     command: >
       sh -c "python manage.py migrate --noinput &&
@@ -58,6 +62,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      RENDERER_URL: http://renderer:8080
+      RENDERER_TOKEN: ${RENDERER_TOKEN:-dev-renderer-token-change-me}
       PYTHONUNBUFFERED: "1"
     ports:
       - "${BACKEND_HOST_PORT:-8000}:8000"
@@ -68,6 +74,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      renderer:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health/"]
       interval: 10s
@@ -75,9 +83,31 @@ services:
       retries: 10
       start_period: 20s
 
+  # HTML -> image. Renders arbitrary HTML, so it is deliberately NOT published
+  # to the host: only other compose services can reach it. See renderer/.
+  renderer:
+    build:
+      context: ./renderer
+    restart: unless-stopped
+    environment:
+      RENDERER_TOKEN: ${RENDERER_TOKEN:-dev-renderer-token-change-me}
+      RENDERER_PAGES_PER_VIEWPORT: ${RENDERER_PAGES_PER_VIEWPORT:-2}
+    expose:
+      - "8080"
+    # Chromium peaks around 700 MB per the Step 4 prototype; the cap keeps a
+    # runaway render from taking the rest of the stack down with it.
+    mem_limit: ${RENDERER_MEM_LIMIT:-1500m}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   celery_worker:
     build:
       context: ./backend
+    image: real-estate-backend
     restart: unless-stopped
     command: ["celery", "-A", "config", "worker", "--loglevel=info"]
     env_file:

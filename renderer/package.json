@@ -1,0 +1,13 @@
+{
+  "name": "renderer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "HTML to image service. Keeps one warm Chromium; all template logic lives in Django.",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

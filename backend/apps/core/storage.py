@@ -79,6 +79,15 @@ def listing_photo_upload_to(instance, filename: str) -> str:
     return build_upload_key("listings/photos", filename)
 
 
+def design_export_upload_to(instance, filename: str) -> str:
+    """Storage key for a rendered design export.
+
+    Generated images go through exactly the same storage abstraction as
+    user uploads — there is no separate "output" path to migrate later.
+    """
+    return build_upload_key("designs/exports", filename)
+
+
 def delete_stored_file(file_field) -> None:
     """Delete the file behind a ``FieldFile``, if any, via the storage API.
 
