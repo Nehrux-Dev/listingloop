@@ -1,0 +1,52 @@
+{
+  "_comment": "Shapes mirror the real API payloads (Listing + AgentProfile + Brokerage + BrandKit) so the template exercises the fields it would actually receive.",
+
+  "listing": {
+    "id": 1,
+    "address": "12 Harbour View Terrace",
+    "city": "Manly",
+    "state": "NSW",
+    "postcode": "2095",
+    "country": "Australia",
+    "full_address": "12 Harbour View Terrace, Manly, NSW, 2095",
+    "price": "1850000.00",
+    "bedrooms": 4,
+    "bathrooms": "2.5",
+    "square_footage": 2400,
+    "property_type": "house",
+    "features": [
+      "Ocean views",
+      "Double garage",
+      "North-facing garden",
+      "Renovated kitchen",
+      "Solar + battery"
+    ],
+    "description": "A light-filled family home a short walk from the beach, with an open-plan living area opening onto a north-facing garden.",
+    "status": "active",
+    "verification_status": "verified"
+  },
+
+  "agent": {
+    "name": "Test Agent",
+    "job_title": "Principal Agent",
+    "phone": "+61 400 000 000",
+    "email": "agent@nehrux.test",
+    "tagline": "Harbour specialist"
+  },
+
+  "brokerage": {
+    "name": "Harbour & Co Realty",
+    "phone": "+61 2 5550 0000",
+    "website": "harbourandco.example",
+    "required_disclaimer": "All information is provided as a guide only. Prospective purchasers should make their own enquiries."
+  },
+
+  "brand_kit": {
+    "primary_color": "#0F172A",
+    "secondary_color": "#475569",
+    "accent_color": "#C2874A",
+    "heading_font": "DejaVu Sans",
+    "body_font": "DejaVu Sans",
+    "design_style": "luxury"
+  }
+}

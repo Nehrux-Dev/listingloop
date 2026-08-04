@@ -1,0 +1,19 @@
+{
+  "name": "render-comparison",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Standalone prototype comparing headless-browser vs structured SVG rendering of a listing template to PNG.",
+  "scripts": {
+    "render": "node src/index.js",
+    "render:quick": "node src/index.js --iterations 3"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "pixelmatch": "^6.0.0",
+    "playwright": "^1.49.0",
+    "pngjs": "^7.0.0",
+    "satori": "^0.12.1",
+    "satori-html": "^0.3.2"
+  }
+}
