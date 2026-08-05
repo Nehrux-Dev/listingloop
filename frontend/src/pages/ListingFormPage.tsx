@@ -283,7 +283,45 @@ export default function ListingFormPage() {
               error={errors.country}
             />
           </div>
+
+          {/* Optional map pin. Left to the agent rather than geocoded: a wrong
+              pin on a public page is worse than no pin. */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <TextField
+              label="Latitude"
+              value={form.latitude}
+              onChange={(value) => update('latitude', value)}
+              error={errors.latitude}
+              hint="Optional — drops a pin on the public page."
+            />
+            <TextField
+              label="Longitude"
+              value={form.longitude}
+              onChange={(value) => update('longitude', value)}
+              error={errors.longitude}
+            />
+          </div>
         </Card>
+
+        {listing?.is_verified && listing.public_slug && (
+          <Card
+            title="Public page"
+            description="Live while this listing is verified and on the market."
+          >
+            <a
+              href={`/p/${listing.public_slug}`}
+              target="_blank"
+              rel="noreferrer"
+              className="break-all text-sm text-slate-700 underline underline-offset-2"
+            >
+              {window.location.origin}/p/{listing.public_slug}
+            </a>
+            <p className="text-xs text-slate-500">
+              Editing any detail unverifies the listing and takes this page offline
+              until you confirm it again.
+            </p>
+          </Card>
+        )}
 
         <Card title="Property details">
           <div className="grid gap-4 sm:grid-cols-2">

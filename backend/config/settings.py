@@ -306,6 +306,12 @@ REST_FRAMEWORK = {
         # Every generation costs real money at the provider, so the ceiling is
         # low by default and per-user rather than per-IP.
         "ai_generate": env("AI_GENERATE_THROTTLE_RATE", default="20/hour"),
+        # The public enquiry form is an unauthenticated POST that stores text —
+        # the first line of spam defence, and the only one that helps against
+        # volume. Per IP.
+        "enquiry": env("ENQUIRY_THROTTLE_RATE", default="5/hour"),
+        # Public page reads. Generous: this is a page anyone may look at.
+        "public_page": env("PUBLIC_PAGE_THROTTLE_RATE", default="120/min"),
     },
 }
 
@@ -358,6 +364,24 @@ AUTH_COOKIE_SAMESITE = env("AUTH_COOKIE_SAMESITE", default="Lax")
 AUTH_COOKIE_PATH = env("AUTH_COOKIE_PATH", default="/api/auth/")
 # Empty means a host-only cookie, which is the safest default.
 AUTH_COOKIE_DOMAIN = env("AUTH_COOKIE_DOMAIN", default="")
+
+
+# ---------------------------------------------------------------------------
+# Public pages
+#
+# Only consult X-Forwarded-For when actually behind a trusted proxy. Otherwise
+# any client can spoof the header and walk straight through the per-IP rate
+# limit on the enquiry form.
+# ---------------------------------------------------------------------------
+
+TRUST_PROXY_HEADERS = env.bool("TRUST_PROXY_HEADERS", default=False)
+
+#: A form submitted faster than this was not filled in by a person. Set to 0
+#: to disable the timing check.
+ENQUIRY_MIN_FILL_SECONDS = env.float("ENQUIRY_MIN_FILL_SECONDS", default=3.0)
+
+#: Base URL used to build shareable public listing links.
+PUBLIC_SITE_URL = env("PUBLIC_SITE_URL", default="http://localhost:5173")
 
 
 # ---------------------------------------------------------------------------

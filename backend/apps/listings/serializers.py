@@ -70,6 +70,9 @@ class ListingSerializer(serializers.ModelSerializer):
             "postcode",
             "country",
             "full_address",
+            "latitude",
+            "longitude",
+            "public_slug",
             "price",
             "bedrooms",
             "bathrooms",
@@ -95,6 +98,9 @@ class ListingSerializer(serializers.ModelSerializer):
             "id",
             "agent_name",
             "full_address",
+            # Generated once and never changed: a link that has been shared
+            # must keep working even after the address is edited.
+            "public_slug",
             "is_verified",
             # Verification is only ever changed through the verify/unverify
             # actions or by editing the data. Making these writable would let a

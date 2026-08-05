@@ -613,6 +613,104 @@ variants and the extra output tokens are wasted.
 
 ---
 
+## Public listing pages
+
+A public, unauthenticated page per listing at `/p/<slug>`, plus an enquiry form
+that feeds an inbox inside the app.
+
+### What is public, and what is not
+
+`Listing.objects.publicly_visible()` is the single definition: **verified**, has
+a slug, and not a draft or withdrawn. Sold listings stay up — they are marketing
+material in their own right. Every public view goes through that one queryset;
+writing the filter a second time is how an unverified listing ends up online.
+
+A hidden listing returns **404, not 403** — identical to a slug that never
+existed. A 403 would confirm the record exists and leak its internal state to
+anyone guessing.
+
+Editing a verified listing unverifies it, which takes the public page down
+immediately. That is the Step 4 gate doing its job at the last possible moment.
+
+The public serializer is a **written-out allowlist**, not the authenticated one
+with fields removed. Subclassing would make every future field public by
+default; here, anything not named is not published. Verification state, import
+provenance, source URLs and internal ids are all absent, and there is a test
+that keeps it that way.
+
+### The map
+
+Pluggable via `VITE_MAP_PROVIDER`. Default is **OpenStreetMap**: no API key, no
+billing account, no third-party cookies on a page served to visitors who have
+consented to nothing. `google` and `mapbox` are selectable and need a public,
+referrer-restricted token in `VITE_MAP_API_KEY` — that token ships to every
+browser, so restrict it in the provider console and never put a secret there.
+
+All three render in an `<iframe>` rather than a JS SDK, so no third-party script
+runs on the page and swapping providers stays a one-line change.
+
+Coordinates are entered by the agent on the listing form, not geocoded. A
+geocoder is another external dependency with its own rate limits and terms, and
+a wrong pin on a public page is worse than no pin — a listing without one shows
+its address in words instead.
+
+### Enquiries
+
+Stored against both the listing and the agent. The agent is captured **at
+submission time** rather than followed through the listing: if the listing is
+reassigned later, the message stays with whoever was actually contacted.
+
+Enquiries are never publicly readable. The public can create one; only the
+agent it was addressed to, their brokerage admin, and a Nehrux Admin can read
+it back. This is the only data in the system about people who never signed up,
+so the scoping matters more here than anywhere.
+
+They are also read-only in the app — an agent can triage the status but not
+edit the words, because the record is the only copy of what someone sent.
+
+### Spam protection
+
+Layered, with no third-party service and no CAPTCHA in front of a real buyer:
+
+| Layer | What it stops |
+| ----- | ------------- |
+| Per-IP rate limit (`ENQUIRY_THROTTLE_RATE`, default 5/hour) | volume |
+| Honeypot field | anything that fills every input it finds |
+| Signed form token + timing floor | submissions faster than a person can type, and replayed tokens |
+| Content heuristics | link stuffing, marketing vocabulary, all-caps |
+| Duplicate suppression | the same message twice in ten minutes |
+
+**Flagged, not discarded.** A submission that trips a check is stored with
+`status = spam` and its reasons, and the agent can see the spam folder with the
+reasons listed. The expensive failure here is not spam reaching an inbox — it is
+a false positive silently binning a real enquiry about a $2m house. The honeypot
+is the one exception: no human can fill a hidden field, so that submission is
+refused outright.
+
+The response is **identical whether or not something was flagged**. Telling a
+bot which check caught it is free tuning advice.
+
+`ENQUIRY_MIN_FILL_SECONDS` tunes the timing floor without a deploy. Only enable
+`TRUST_PROXY_HEADERS` behind a real reverse proxy — without one, any client can
+spoof `X-Forwarded-For` and walk straight through the per-IP limit.
+
+### Endpoints
+
+| Method | Path | Auth |
+| ------ | ---- | ---- |
+| GET | `/api/public/listings/<slug>/` | **none** |
+| POST | `/api/public/listings/<slug>/enquire/` | **none**, throttled |
+| GET | `/api/enquiries/` | agent · `?include_spam=true` |
+| GET | `/api/enquiries/summary/` | agent |
+| POST | `/api/enquiries/{id}/status/` | agent |
+
+Those first two are the only unauthenticated endpoints in the project. They opt
+out of the project-wide `IsAuthenticated` default explicitly, one at a time,
+rather than by loosening the default — and they live under an obvious `public/`
+prefix so the URLconf shows which routes serve anonymous requests.
+
+---
+
 ## Compliance
 
 A **data-driven rules engine**, not business logic. The actual requirements are
@@ -907,7 +1005,7 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-453 tests. The suite runs against a throwaway database, uses an in-memory
+498 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
 layer, the render tests stub the renderer service and the AI tests stub the
@@ -957,6 +1055,9 @@ provider, so no test touches the network, needs a browser, or spends money.
   rewrites it.
 - `compliance/test_integration.py` — evaluation after generation, the export
   gate, and that the seeded set is labelled as pending review.
+- `listings/test_public_pages.py` — public rendering of a verified listing,
+  enquiry submission and storage, every spam layer, the enquiry inbox scoping,
+  and that unverified, draft and withdrawn listings are all unreachable.
 
 ### Celery
 

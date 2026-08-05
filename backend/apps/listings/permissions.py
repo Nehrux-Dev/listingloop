@@ -47,6 +47,30 @@ class ListingPermission(BasePermission):
         return can_manage_listing(user, obj)
 
 
+class EnquiryPermission(BasePermission):
+    """An enquiry belongs to the agent it was addressed to.
+
+    Follows ``enquiry.agent`` rather than ``enquiry.listing.agent``: if a
+    listing is reassigned, the messages a member of the public sent to the
+    original agent stay with that agent.
+    """
+
+    message = "You do not have permission to act on this enquiry."
+
+    def has_permission(self, request, view) -> bool:
+        return _active_user(request) is not None
+
+    def has_object_permission(self, request, view, obj) -> bool:
+        user = _active_user(request)
+        if user is None:
+            return False
+        if user.is_nehrux_admin:
+            return True
+        if user.is_brokerage_admin:
+            return administers(user, obj.agent.brokerage_id)
+        return obj.agent.user_id == user.id
+
+
 class ListingPhotoPermission(BasePermission):
     """Photo access follows the listing it belongs to."""
 

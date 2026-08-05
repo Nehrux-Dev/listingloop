@@ -50,6 +50,24 @@ class ListingCrudTests(ListingAPITestCase):
         self.assertEqual(listing.agent, self.profile)
         self.assertEqual(listing.features, ["Pool", "Solar"])
 
+    def test_the_public_slug_is_exposed_but_not_writable(self):
+        """The agent needs the link; nobody gets to change it."""
+        listing = self.make_listing(self.profile)
+        self.authenticate_as(self.agent)
+
+        response = self.client.patch(
+            self.listing_detail_url(listing),
+            {"public_slug": "chosen-by-me", "latitude": "-33.797"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        listing.refresh_from_db()
+        self.assertNotEqual(listing.public_slug, "chosen-by-me")
+        self.assertEqual(response.data["public_slug"], listing.public_slug)
+        # Coordinates, on the other hand, are the agent's to set.
+        self.assertEqual(str(listing.latitude), "-33.797000")
+
     def test_a_new_listing_is_never_verified(self):
         self.authenticate_as(self.agent)
 

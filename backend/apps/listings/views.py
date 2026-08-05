@@ -22,11 +22,24 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
+from django.utils import timezone
+
 from apps.accounts.models import AgentProfile
 from apps.listings.fetching import FetchError, UnsafeUrlError
 from apps.listings.importing import import_listing_from_url
-from apps.listings.models import Listing, ListingPhoto, VerificationStatus
-from apps.listings.permissions import ListingPermission, ListingPhotoPermission
+from apps.listings.models import (
+    Enquiry,
+    EnquiryStatus,
+    Listing,
+    ListingPhoto,
+    VerificationStatus,
+)
+from apps.listings.permissions import (
+    EnquiryPermission,
+    ListingPermission,
+    ListingPhotoPermission,
+)
+from apps.listings.public_serializers import EnquirySerializer, EnquiryStatusSerializer
 from apps.listings.serializers import (
     ListingImportResultSerializer,
     ListingImportSerializer,
@@ -168,6 +181,60 @@ class ListingViewSet(viewsets.ModelViewSet):
         return Response(payload, status=status.HTTP_201_CREATED)
 
     import_url.throttle_scope = "listing_import"
+
+
+class EnquiryViewSet(viewsets.ReadOnlyModelViewSet):
+    """The agent's enquiry inbox.
+
+    Read-and-triage only: enquiries are created by the public endpoint and are
+    a record of what someone actually sent. Editing the words of a message a
+    member of the public wrote would destroy the only copy of it.
+    """
+
+    serializer_class = EnquirySerializer
+    permission_classes = [IsAuthenticated, EnquiryPermission]
+
+    def get_queryset(self) -> QuerySet[Enquiry]:
+        queryset = Enquiry.objects.for_user(self.request.user).select_related(
+            "listing", "agent"
+        )
+
+        listing_id = self.request.query_params.get("listing")
+        if listing_id and listing_id.isdigit():
+            queryset = queryset.filter(listing_id=int(listing_id))
+
+        status_filter = self.request.query_params.get("status")
+        if status_filter in EnquiryStatus.values:
+            queryset = queryset.filter(status=status_filter)
+        elif self.request.query_params.get("include_spam") != "true":
+            # Spam is kept, but out of the way unless asked for.
+            queryset = queryset.genuine()
+
+        return queryset
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request: Request) -> Response:
+        queryset = Enquiry.objects.for_user(request.user)
+        return Response(
+            {
+                "total": queryset.genuine().count(),
+                "new": queryset.filter(status=EnquiryStatus.NEW).count(),
+                "spam": queryset.filter(status=EnquiryStatus.SPAM).count(),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="status")
+    def set_status(self, request: Request, pk=None) -> Response:
+        """Triage: mark read, replied, archived, or spam."""
+        enquiry = self.get_object()
+        serializer = EnquiryStatusSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        enquiry.status = serializer.validated_data["status"]
+        if enquiry.status != EnquiryStatus.NEW and enquiry.read_at is None:
+            enquiry.read_at = timezone.now()
+        enquiry.save(update_fields=["status", "read_at", "updated_at"])
+        return Response(self.get_serializer(enquiry).data)
 
 
 class ListingPhotoViewSet(viewsets.ModelViewSet):

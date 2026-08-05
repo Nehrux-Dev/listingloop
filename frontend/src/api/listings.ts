@@ -56,6 +56,10 @@ export type Listing = {
   postcode: string
   country: string
   full_address: string
+  latitude: string | null
+  longitude: string | null
+  /** Stable public URL segment; generated once and never changed. */
+  public_slug: string | null
   price: string | null
   bedrooms: number | null
   bathrooms: string | null
@@ -94,6 +98,8 @@ export type ListingInput = {
   state: string
   postcode: string
   country: string
+  latitude: string
+  longitude: string
   price: string
   bedrooms: string
   bathrooms: string
@@ -120,6 +126,8 @@ export function toListingPayload(input: ListingInput): Record<string, unknown> {
     state: input.state.trim(),
     postcode: input.postcode.trim(),
     country: input.country.trim(),
+    latitude: numeric(input.latitude),
+    longitude: numeric(input.longitude),
     price: numeric(input.price),
     bedrooms: numeric(input.bedrooms),
     bathrooms: numeric(input.bathrooms),
@@ -138,6 +146,8 @@ export function emptyListingInput(): ListingInput {
     state: '',
     postcode: '',
     country: '',
+    latitude: '',
+    longitude: '',
     price: '',
     bedrooms: '',
     bathrooms: '',
@@ -156,6 +166,8 @@ export function listingToInput(listing: Listing): ListingInput {
     state: listing.state,
     postcode: listing.postcode,
     country: listing.country,
+    latitude: listing.latitude ?? '',
+    longitude: listing.longitude ?? '',
     price: listing.price ?? '',
     bedrooms: listing.bedrooms?.toString() ?? '',
     bathrooms: listing.bathrooms ?? '',

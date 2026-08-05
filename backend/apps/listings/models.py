@@ -20,12 +20,14 @@ holds for the Django admin, a shell session and a data migration.
 from __future__ import annotations
 
 from decimal import Decimal
+from uuid import uuid4
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
+from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
 from apps.core.models import TimeStampedModel
@@ -96,6 +98,20 @@ class ListingQuerySet(models.QuerySet):
         """
         return self.filter(verification_status=VerificationStatus.VERIFIED)
 
+    def publicly_visible(self):
+        """Listings that may be served on an unauthenticated page.
+
+        Verified, because unreviewed data must never be published; and not a
+        draft or a withdrawn listing, because those are not on the market. The
+        single definition all public views go through — a second, subtly
+        different filter somewhere else is how an unverified listing ends up
+        online.
+        """
+        return self.filter(
+            verification_status=VerificationStatus.VERIFIED,
+            public_slug__isnull=False,
+        ).exclude(status__in=[ListingStatus.DRAFT, ListingStatus.WITHDRAWN])
+
     def for_user(self, user):
         """Scope to what ``user`` is allowed to see.
 
@@ -130,6 +146,33 @@ class Listing(TimeStampedModel):
     state = models.CharField(_("state or region"), max_length=120, blank=True)
     postcode = models.CharField(_("postcode"), max_length=20, blank=True)
     country = models.CharField(_("country"), max_length=120, blank=True)
+
+    # Optional map pin. Left to the agent rather than geocoded automatically:
+    # a geocoder is another external dependency with its own rate limits and
+    # terms, and a wrong pin on a public page is worse than no pin.
+    latitude = models.DecimalField(
+        _("latitude"),
+        max_digits=9,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("-90")), MaxValueValidator(Decimal("90"))],
+    )
+    longitude = models.DecimalField(
+        _("longitude"),
+        max_digits=9,
+        decimal_places=6,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("-180")), MaxValueValidator(Decimal("180"))],
+    )
+
+    #: Stable identifier for the public URL. Generated once, then never changed
+    #: — a shared link that stops working because someone edited the suburb is
+    #: worse than a slug that no longer matches the address.
+    public_slug = models.SlugField(
+        _("public slug"), max_length=180, unique=True, null=True, blank=True
+    )
 
     # -- core attributes ----------------------------------------------------
     # Every attribute is nullable: an import that cannot find a value must be
@@ -267,6 +310,28 @@ class Listing(TimeStampedModel):
         """Gate for templates and AI content. Only verified listings qualify."""
         return self.is_verified
 
+    @property
+    def is_publicly_visible(self) -> bool:
+        return (
+            self.is_verified
+            and bool(self.public_slug)
+            and self.status not in (ListingStatus.DRAFT, ListingStatus.WITHDRAWN)
+        )
+
+    @property
+    def has_map_pin(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
+
+    def _build_public_slug(self) -> str:
+        """A readable slug with a short random suffix.
+
+        Readable because these get shared by hand; suffixed because two units
+        in the same building would otherwise collide, and because a guessable
+        slug invites scraping the whole set.
+        """
+        base = slugify(f"{self.address} {self.city}")[:150] or f"listing-{self.pk or ''}"
+        return f"{base}-{uuid4().hex[:6]}".strip("-")
+
     def missing_required_fields(self) -> list[str]:
         """Which of ``REQUIRED_FOR_VERIFICATION`` are still empty."""
         missing = []
@@ -312,6 +377,12 @@ class Listing(TimeStampedModel):
         Compared against the stored row rather than tracked in memory, so it
         works no matter how the instance was loaded or mutated.
         """
+        if not self.public_slug:
+            self.public_slug = self._build_public_slug()
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"public_slug"}
+
         update_fields = kwargs.get("update_fields")
         # The two mark_* helpers save an explicit field list; leaving them
         # alone here is what stops this check from immediately undoing them.
@@ -341,6 +412,102 @@ class Listing(TimeStampedModel):
                     }
 
         return super().save(*args, **kwargs)
+
+
+class EnquiryStatus(models.TextChoices):
+    NEW = "new", _("New")
+    READ = "read", _("Read")
+    REPLIED = "replied", _("Replied")
+    ARCHIVED = "archived", _("Archived")
+    SPAM = "spam", _("Spam")
+
+
+class EnquiryQuerySet(models.QuerySet):
+    def for_user(self, user):
+        """Enquiries reach the agent whose listing they were sent about.
+
+        Same scoping as everything else: an agent's own, a brokerage admin's
+        brokerage, everything for a Nehrux Admin. Enquiries contain a member of
+        the public's contact details, so the scoping matters more here than
+        anywhere — this is the only place in the system holding data about
+        people who never signed up.
+        """
+        if not user.is_authenticated:
+            return self.none()
+        if user.is_nehrux_admin:
+            return self
+        if user.is_brokerage_admin:
+            return self.filter(agent__brokerage__admins=user).distinct()
+        return self.filter(agent__user=user)
+
+    def genuine(self):
+        return self.exclude(status=EnquiryStatus.SPAM)
+
+
+class Enquiry(TimeStampedModel):
+    """A message from a member of the public about a listing.
+
+    Never publicly readable. The public can create one; only the agent it was
+    addressed to (and their brokerage) can read it back.
+    """
+
+    listing = models.ForeignKey(
+        Listing, on_delete=models.CASCADE, related_name="enquiries", verbose_name=_("listing")
+    )
+    #: Denormalised from the listing at submission time on purpose: if the
+    #: listing is later reassigned, the enquiry stays with the agent who was
+    #: actually contacted.
+    agent = models.ForeignKey(
+        "accounts.AgentProfile",
+        on_delete=models.CASCADE,
+        related_name="enquiries",
+        verbose_name=_("agent"),
+    )
+
+    name = models.CharField(_("name"), max_length=120)
+    email = models.EmailField(_("email"), blank=True)
+    phone = models.CharField(_("phone"), max_length=40, blank=True)
+    message = models.TextField(_("message"))
+
+    status = models.CharField(
+        _("status"),
+        max_length=16,
+        choices=EnquiryStatus.choices,
+        default=EnquiryStatus.NEW,
+        db_index=True,
+    )
+    read_at = models.DateTimeField(_("read at"), null=True, blank=True)
+
+    # -- spam forensics -----------------------------------------------------
+    # Kept so a flood can be traced and a rule tuned, not to profile anyone.
+    ip_address = models.GenericIPAddressField(_("IP address"), null=True, blank=True)
+    user_agent = models.CharField(_("user agent"), max_length=400, blank=True)
+    #: Filled when the spam checks fired. The message is still stored: a false
+    #: positive that silently discards a real buyer is the expensive failure.
+    spam_reasons = models.JSONField(_("spam reasons"), default=list, blank=True)
+
+    objects = EnquiryQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = _("enquiry")
+        verbose_name_plural = _("enquiries")
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["agent", "-created_at"]),
+            models.Index(fields=["listing", "-created_at"]),
+            models.Index(fields=["status", "-created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.name} about listing {self.listing_id}"
+
+    @property
+    def is_spam(self) -> bool:
+        return self.status == EnquiryStatus.SPAM
+
+    @property
+    def contact_summary(self) -> str:
+        return " · ".join(part for part in (self.email, self.phone) if part)
 
 
 class ListingPhoto(TimeStampedModel):

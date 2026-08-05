@@ -9,6 +9,7 @@ import BrokeragePage from './pages/BrokeragePage.tsx'
 import DashboardPage from './pages/DashboardPage.tsx'
 import DesignEditorPage from './pages/DesignEditorPage.tsx'
 import DesignsPage from './pages/DesignsPage.tsx'
+import EnquiriesPage from './pages/EnquiriesPage.tsx'
 import ForbiddenPage from './pages/ForbiddenPage.tsx'
 import ListingFormPage from './pages/ListingFormPage.tsx'
 import ListingImportPage from './pages/ListingImportPage.tsx'
@@ -16,6 +17,7 @@ import ListingsPage from './pages/ListingsPage.tsx'
 import LoginPage from './pages/LoginPage.tsx'
 import PlatformAdminPage from './pages/PlatformAdminPage.tsx'
 import ProfilePage from './pages/ProfilePage.tsx'
+import PublicListingPage from './pages/PublicListingPage.tsx'
 import TemplateLibraryPage from './pages/TemplateLibraryPage.tsx'
 
 export default function App() {
@@ -23,6 +25,10 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <Routes>
+          {/* Public — no session required, and deliberately outside the app
+              shell: these pages are shared with people who have no account. */}
+          <Route path="/p/:slug" element={<PublicListingPage />} />
+
           {/* Public */}
           <Route path="/login" element={<LoginPage />} />
           <Route path="/forbidden" element={<ForbiddenPage />} />
@@ -44,6 +50,7 @@ export default function App() {
               <Route path="listings/new" element={<ListingFormPage />} />
               <Route path="listings/import" element={<ListingImportPage />} />
               <Route path="listings/:id" element={<ListingFormPage />} />
+              <Route path="enquiries" element={<EnquiriesPage />} />
 
               {/* Templates are read-only product content; designs are scoped
                   server-side to the caller, so no extra guard is needed. */}

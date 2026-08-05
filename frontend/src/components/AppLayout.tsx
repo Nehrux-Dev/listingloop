@@ -37,6 +37,9 @@ export default function AppLayout() {
             <NavLink to="/designs" className={linkClass}>
               Designs
             </NavLink>
+            <NavLink to="/enquiries" className={linkClass}>
+              Enquiries
+            </NavLink>
 
             {/* Only agents have a profile and a personal brand kit. */}
             {hasRole(ROLES.AGENT) && (
