@@ -156,6 +156,8 @@ def run_generation(generation: GeneratedContent, *, completion_fn=None) -> Gener
     generation.finished_at = timezone.now()
     generation.save()
 
+    _run_compliance(generation, variants)
+
     logger.info(
         "Generation %s for listing %s: %s, %s/%s variants usable (%s tokens, $%s)",
         generation.pk,
@@ -167,6 +169,33 @@ def run_generation(generation: GeneratedContent, *, completion_fn=None) -> Gener
         generation.estimated_cost_usd,
     )
     return generation
+
+
+def _run_compliance(generation, variants) -> None:
+    """Check each variant against the compliance rules and store the results.
+
+    Runs here, right after generation, so the flags are already waiting when
+    the agent opens the review panel rather than appearing only at export.
+
+    Failures are swallowed on purpose: compliance is a *review aid* layered on
+    top of a finished generation, and a broken rule set must not turn a
+    successful, paid-for generation into a failed job. The absence of an
+    evaluation is visible in the UI, which is the honest signal.
+    """
+    from apps.compliance.engine import evaluate_and_store
+    from apps.compliance.subjects import from_content_variant
+
+    for variant in variants:
+        try:
+            evaluate_and_store(
+                from_content_variant(variant),
+                generated_content=generation,
+                content_variant=variant,
+            )
+        except Exception:
+            logger.warning(
+                "Compliance evaluation failed for variant %s", variant.pk, exc_info=True
+            )
 
 
 def _store_variants(generation, payload: dict, listing, facts: dict) -> list[ContentVariant]:

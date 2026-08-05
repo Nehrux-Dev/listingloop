@@ -9,15 +9,16 @@ Full-stack skeleton and local development environment.
 | Uploads        | Django storage API, local filesystem (swappable)     |
 | Rendering      | Playwright/Chromium in its own container, warm browser |
 | AI content     | OpenAI, one call → six validated variants, via Celery |
+| Compliance     | Data-driven rules, editable in the Django admin      |
 | Database       | PostgreSQL 16                                        |
 | Background     | Celery 5.6 + Redis 7 (connection only, no tasks)     |
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
 | Orchestration  | Docker Compose                                       |
 
-Authentication, role-based access control, profile management, property
-listings (manual entry, URL import, verification), the template/design system
-(controlled editing, multi-dimension export) and AI caption generation
-(validated, async) are in place. Compliance is still an empty scaffold.
+All five domains are in place: accounts, listings (manual entry, URL import,
+verification), templates/designs (controlled editing, multi-dimension export),
+AI content (validated, async, six variants per call) and a data-driven
+compliance rules engine.
 
 ---
 
@@ -71,6 +72,7 @@ Seed one account per role (refuses to run unless `DEBUG=True`):
 ```bash
 docker compose exec backend python manage.py seed_dev_users
 docker compose exec backend python manage.py seed_templates
+docker compose exec backend python manage.py seed_compliance_rules   # PLACEHOLDERS
 ```
 
 | Email                 | Role            |
@@ -609,6 +611,100 @@ Worth checking as you read: whether the six formats actually read differently
 from each other. If they are near-identical, the prompt is not earning its
 variants and the extra output tokens are wasted.
 
+---
+
+## Compliance
+
+A **data-driven rules engine**, not business logic. The actual requirements are
+not settled and will be decided by people who do not write Python, so this app
+ships generic *check types* and the rules themselves live in the database.
+
+**Adding a rule never needs a deployment.** Adding a new *kind* of check does,
+and that is the line: if a requirement can be expressed as "this phrase must
+not appear" or "this field must be filled in", it is data.
+
+### ⚠ The seeded rules are placeholders
+
+`manage.py seed_compliance_rules` creates eight rules, every one of them marked
+`PENDING LEGAL REVIEW` with a note saying so. They exist to demonstrate the
+pipeline, not because anyone has approved the wording. Nothing should be
+treated as final until someone with the authority sets a rule to **Approved**.
+
+Re-seeding will not revert a rule that has been approved — so signed-off
+wording cannot be silently overwritten by a redeploy.
+
+If you do not want provisional rules blocking real work yet, set
+`COMPLIANCE_BLOCK_EXPORTS=False` for advisory-only behaviour without
+deactivating anything.
+
+### Check types
+
+| Type | `rule_data` |
+| ---- | ----------- |
+| `required_field_present` | `{"field": "brokerage_name", "label": "Brokerage name"}` |
+| `disclaimer_present` | `{"text": "...", "match": "normalised｜exact｜all_words"}` |
+| `prohibited_phrase` | `{"phrases": ["guaranteed return"], "whole_word": true}` |
+| `required_phrase` | `{"phrases": [...], "mode": "any｜all"}` |
+| `prohibited_pattern` | `{"pattern": "regex", "flags": "i"}` |
+| `length_limit` | `{"field": "caption", "max": 2200}` |
+| `custom` | `{"handler": "name_registered_in_code"}` |
+
+Matching is deliberately tolerant of how copy travels: case, whitespace runs
+and smart quotes are normalised, because a curly apostrophe is not a compliance
+failure. `all_words` mode exists for disclaimers split across design elements.
+
+**`custom` never imports anything from the database.** The obvious
+implementation — `import_string(rule_data["handler"])` — would be remote code
+execution by configuration, since a non-engineer edits these rows by design.
+Handlers resolve against a registry populated in code; an unregistered name is
+reported as a rule problem, never imported.
+
+### A broken rule never blocks an agent
+
+Rules are edited by non-engineers, so a malformed regex will happen. Each rule
+is evaluated in its own try/except and a rule that raises is reported as
+`rule_error` — a problem *with the rule*, attributed to the rule, and never
+counted as a compliance failure by the content. The direction matters: a broken
+rule cannot invent a failure against an agent, and cannot silently pass content
+either.
+
+### Where it runs
+
+| Moment | Behaviour |
+| ------ | --------- |
+| After AI generation | every variant evaluated and stored, so flags are waiting when the agent opens the panel |
+| Design editor | `GET /api/designs/{id}/compliance/` — live, unstored |
+| **Design export** | evaluated first; an `error`-severity failure returns **409** with the report and nothing is rendered |
+
+Warnings never block, and are returned alongside a successful export rather
+than passed over silently. Either way the attempt is written to
+`ComplianceEvaluation` as an audit trail.
+
+Compliance sees the design as the *renderer* resolves it — including locked
+elements the agent never touched, which is exactly where a required disclaimer
+lives.
+
+### The admin is the product surface
+
+`/admin/compliance/compliancerule/` is built for whoever owns the rules:
+
+- the `rule_data` shape for every check type is shown inline with worked examples;
+- bad `rule_data` is rejected on save with a readable message, because a rule
+  that saves and then silently never fires is worse than an error;
+- placeholder rules are visually flagged, with a banner counting them;
+- a **"try this rule against some text"** box runs the rule on save and reports
+  the verdict, so an author can see what it does before it starts blocking
+  exports.
+
+### Endpoints
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| GET | `/api/compliance/rules/` | read-only — agents are checked against rules, not in charge of them |
+| GET | `/api/compliance/rules/summary/` | counts, including how much is still provisional |
+| POST | `/api/compliance/evaluate/` | check a design, variant, listing or raw text now |
+| GET | `/api/compliance/evaluations/` | the stored audit trail, scoped |
+
 The sample listings are created in a transaction that is rolled back, so a
 review run leaves no rows behind. `--offline` uses a canned response to check
 the harness without a key or a bill; it tells you nothing about quality.
@@ -735,7 +831,13 @@ Notes:
 │       │   ├── services.py      # synchronous pipeline (Part A)
 │       │   ├── tasks.py         # Celery wrapper (Part B)
 │       │   └── management/      # ai_sample_run, for judging quality
-│       └── compliance/      # regulatory rules           (empty scaffold)
+│       └── compliance/      # data-driven rules engine
+│           ├── models.py        # ComplianceRule, ComplianceEvaluation
+│           ├── checks.py        # the generic check types (read this)
+│           ├── subjects.py      # adapters: design / AI content / listing
+│           ├── engine.py        # the evaluator
+│           ├── admin.py         # the non-engineer's interface
+│           └── management/      # seed_compliance_rules (PLACEHOLDERS)
 └── frontend/
     ├── Dockerfile
     ├── vite.config.ts       # React + Tailwind plugins, /api dev proxy
@@ -752,9 +854,7 @@ Notes:
                              #   Brokerage, Platform, Forbidden
 ```
 
-The remaining domain apps are empty scaffolds (`apps.py`, `models.py`,
-`admin.py`, `migrations/`) registered in `INSTALLED_APPS`. Wire a new app's
-routes up by uncommenting its line in
+Every domain app is wired up in
 [backend/config/urls.py](backend/config/urls.py).
 
 ---
@@ -807,7 +907,7 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-375 tests. The suite runs against a throwaway database, uses an in-memory
+453 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
 layer, the render tests stub the renderer service and the AI tests stub the
@@ -850,6 +950,13 @@ provider, so no test touches the network, needs a browser, or spends money.
 - `ai_content/test_variants.py` — one call producing all six formats, each rule
   firing on the format it was poisoned in, per-variant review and editing, and
   that one rejected variant does not spoil a good one.
+- `compliance/test_engine.py` — every check type against copy it should pass
+  and copy it should catch, rule selection and scoping, `rule_data` validation,
+  and that a broken rule is contained. Rules are constructed by the tests: the
+  placeholder content is provisional and pinning it would fail the day someone
+  rewrites it.
+- `compliance/test_integration.py` — evaluation after generation, the export
+  gate, and that the seeded set is labelled as pending review.
 
 ### Celery
 
@@ -909,8 +1016,13 @@ The defaults are tuned for local development. For anything public:
 
 ## Next steps
 
-Deliberately not included yet: the compliance domain, CI, and production
-settings.
+Deliberately not included yet: CI and production settings.
+
+**The compliance rule content is the open item.** The engine is finished; the
+rules are placeholders. Someone with the authority needs to work through
+`/admin/compliance/compliancerule/`, replace or confirm each rule's wording and
+severity, and set it to Approved. Until then every check reports itself as
+provisional, and `COMPLIANCE_BLOCK_EXPORTS=False` keeps them advisory.
 
 When the listing import needs to handle slow pages or bulk use, move
 `import_listing_from_url` into a Celery task the same way `run_generation` was

@@ -1,6 +1,7 @@
 /** Types and calls for the template library, designs and exports. */
 
 import { apiRequest } from '../lib/apiClient.ts'
+import type { ComplianceReport } from './compliance.ts'
 import type { Paginated } from './profiles.ts'
 
 export type TemplateCategory =
@@ -245,12 +246,19 @@ export function previewDesign(id: number, dimension: string): Promise<PreviewRes
   })
 }
 
+/**
+ * Export, subject to compliance.
+ *
+ * The response carries the compliance report either way: on success so
+ * warnings are seen rather than passed over, and on a 409 so the agent is told
+ * exactly which rule stopped them.
+ */
 export function exportDesign(
   id: number,
   dimensions: string[],
   format: 'png' | 'jpg',
-): Promise<DesignExport[]> {
-  return apiRequest<DesignExport[]>(`/api/designs/${id}/export/`, {
+): Promise<{ exports: DesignExport[]; compliance: ComplianceReport }> {
+  return apiRequest(`/api/designs/${id}/export/`, {
     method: 'POST',
     body: { dimensions, export_format: format },
   })

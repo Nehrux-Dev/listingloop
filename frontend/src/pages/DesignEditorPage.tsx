@@ -18,6 +18,8 @@ import {
   type ResolvedDesign,
   type TemplateDetail,
 } from '../api/templates.ts'
+import { fetchDesignCompliance, type ComplianceReport } from '../api/compliance.ts'
+import { CompliancePanel } from '../components/CompliancePanel.tsx'
 import { Alert, Card } from '../components/FormControls.tsx'
 import { ElementControls } from '../components/ElementControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
@@ -45,6 +47,19 @@ export default function DesignEditorPage() {
 
   const [exportDims, setExportDims] = useState<string[]>(['instagram_post'])
   const [exportFormat, setExportFormat] = useState<'png' | 'jpg'>('png')
+  const [compliance, setCompliance] = useState<ComplianceReport | null>(null)
+  const [checkingCompliance, setCheckingCompliance] = useState(true)
+
+  const checkCompliance = useCallback(async () => {
+    setCheckingCompliance(true)
+    try {
+      setCompliance(await fetchDesignCompliance(designId))
+    } catch {
+      setCompliance(null)
+    } finally {
+      setCheckingCompliance(false)
+    }
+  }, [designId])
 
   const load = useCallback(async () => {
     try {
@@ -67,6 +82,10 @@ export default function DesignEditorPage() {
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => {
+    void checkCompliance()
+  }, [checkCompliance])
 
   useEffect(() => {
     fetchRenderDimensions().then(setDimensions).catch(() => setDimensions([]))
@@ -101,6 +120,8 @@ export default function DesignEditorPage() {
       setDirty(false)
       setMessage('Design saved.')
       setResolved(await fetchResolvedDesign(designId, dimension))
+      // The edit may have introduced or fixed a compliance issue.
+      void checkCompliance()
     } catch (error) {
       // The server returns errors keyed by element, so they land on the
       // control that caused them.
@@ -140,13 +161,25 @@ export default function DesignEditorPage() {
     setErrors({})
     setMessage(null)
     try {
-      await exportDesign(designId, exportDims, exportFormat)
+      const result = await exportDesign(designId, exportDims, exportFormat)
       setDesign(await fetchDesign(designId))
+      setCompliance(result.compliance)
       setMessage(`Exported ${exportDims.length} image${exportDims.length === 1 ? '' : 's'}.`)
     } catch (error) {
-      setErrors({
-        detail: error instanceof ApiError ? error.message : 'Could not export this design.',
-      })
+      // A 409 means compliance stopped it. The report comes back in the error
+      // body, so the agent is told which rule and why rather than just "no".
+      if (error instanceof ApiError && error.status === 409) {
+        const data = error.data as { compliance?: ComplianceReport } | null
+        if (data?.compliance) setCompliance(data.compliance)
+        setErrors({
+          detail:
+            'This design does not meet the compliance rules yet — see the flags below.',
+        })
+      } else {
+        setErrors({
+          detail: error instanceof ApiError ? error.message : 'Could not export this design.',
+        })
+      }
     } finally {
       setBusy(false)
     }
@@ -277,6 +310,13 @@ export default function DesignEditorPage() {
             {previewMs !== null && (
               <p className="text-[11px] text-slate-400">Rendered in {previewMs} ms</p>
             )}
+          </Card>
+
+          <Card
+            title="Compliance"
+            description="Checked against the current rule set before export."
+          >
+            <CompliancePanel report={compliance} loading={checkingCompliance} />
           </Card>
 
           <Card title="Export" description="One design, every platform size.">

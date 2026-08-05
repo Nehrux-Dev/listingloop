@@ -361,6 +361,18 @@ AUTH_COOKIE_DOMAIN = env("AUTH_COOKIE_DOMAIN", default="")
 
 
 # ---------------------------------------------------------------------------
+# Compliance
+#
+# When True, a rule with ERROR severity stops a design being exported. The
+# seeded rule set is a PLACEHOLDER pending legal review, so an operator who
+# does not yet want provisional rules blocking real work can set this to False
+# and get advisory-only behaviour without deleting or deactivating anything.
+# ---------------------------------------------------------------------------
+
+COMPLIANCE_BLOCK_EXPORTS = env.bool("COMPLIANCE_BLOCK_EXPORTS", default=True)
+
+
+# ---------------------------------------------------------------------------
 # OpenAI
 #
 # The key is read here and used only by the backend. It appears in no

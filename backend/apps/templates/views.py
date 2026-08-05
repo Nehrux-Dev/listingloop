@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 
+from django.conf import settings
 from django.db.models import QuerySet
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
@@ -216,6 +217,19 @@ class DesignViewSet(viewsets.ModelViewSet):
 
     preview.throttle_scope = "render"
 
+    @action(detail=True, methods=["get"], url_path="compliance")
+    def compliance(self, request: Request, pk=None) -> Response:
+        """What the compliance rules say about this design, right now.
+
+        Read-only and unstored: the editor calls this to show flags while the
+        agent is still working. The stored record is written at export, which
+        is the moment that needs an audit trail.
+        """
+        from apps.compliance.engine import evaluate
+        from apps.compliance.subjects import from_design
+
+        return Response(evaluate(from_design(self.get_object())).as_dict())
+
     @action(
         detail=True,
         methods=["post"],
@@ -223,10 +237,34 @@ class DesignViewSet(viewsets.ModelViewSet):
         throttle_classes=[ScopedRateThrottle],
     )
     def export(self, request: Request, pk=None) -> Response:
-        """Render and save one design at one or more dimensions."""
+        """Render and save one design at one or more dimensions.
+
+        Compliance runs first. A rule with ERROR severity stops the export and
+        returns the report — the point of the check is to catch material before
+        it is published, and an export is the last moment that is still true.
+        Warnings are returned alongside a successful export rather than
+        blocking it.
+        """
+        from apps.compliance.engine import evaluate_and_store
+        from apps.compliance.subjects import from_design
+
         design = self.get_object()
         serializer = DesignExportRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        report, _evaluation = evaluate_and_store(from_design(design), design=design)
+
+        if report.blocks_export and settings.COMPLIANCE_BLOCK_EXPORTS:
+            return Response(
+                {
+                    "detail": (
+                        "This design cannot be exported yet: it does not meet "
+                        "the compliance rules below."
+                    ),
+                    "compliance": report.as_dict(),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         exports = export_design_bundle(
             design,
@@ -234,9 +272,14 @@ class DesignViewSet(viewsets.ModelViewSet):
             serializer.validated_data["export_format"],
         )
         return Response(
-            DesignExportSerializer(
-                exports, many=True, context=self.get_serializer_context()
-            ).data,
+            {
+                "exports": DesignExportSerializer(
+                    exports, many=True, context=self.get_serializer_context()
+                ).data,
+                # Returned even on success so warnings are seen rather than
+                # silently passed over.
+                "compliance": report.as_dict(),
+            },
             status=status.HTTP_201_CREATED,
         )
 

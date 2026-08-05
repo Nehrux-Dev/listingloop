@@ -174,9 +174,12 @@ class ExportTests(RenderingTestCase):
         )
 
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(len(response.data), 4)
+        # The export response also carries the compliance report — an export
+        # that passed its checks says so, rather than leaving it implied.
+        self.assertEqual(len(response.data["exports"]), 4)
+        self.assertIn("compliance", response.data)
 
-        by_dimension = {row["dimension"]: row for row in response.data}
+        by_dimension = {row["dimension"]: row for row in response.data["exports"]}
         self.assertEqual(by_dimension["instagram_post"]["width"], 1080)
         self.assertEqual(by_dimension["instagram_post"]["height"], 1080)
         self.assertEqual(by_dimension["instagram_story"]["height"], 1920)
@@ -228,6 +231,7 @@ class ExportTests(RenderingTestCase):
         )
 
         self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data["exports"]), 1)
         export = DesignExport.objects.get()
         self.assertEqual(export.export_format, ExportFormat.JPG)
         self.assertTrue(export.image.name.endswith(".jpg"))
