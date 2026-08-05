@@ -17,6 +17,7 @@ import {
   type Listing,
   type ListingInput,
 } from '../api/listings.ts'
+import { AiContentPanel } from '../components/AiContentPanel.tsx'
 import {
   Alert,
   Card,
@@ -444,6 +445,12 @@ export default function ListingFormPage() {
             </ul>
           )}
         </Card>
+      )}
+
+      {/* Mounting this panel loads any existing captions. It does NOT
+          generate — that only happens when the button inside is clicked. */}
+      {listing && (
+        <AiContentPanel listingId={listing.id} isVerified={listing.is_verified} />
       )}
 
       {/* The review step. */}

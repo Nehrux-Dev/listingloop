@@ -303,6 +303,9 @@ REST_FRAMEWORK = {
         # Every render occupies a browser page and the renderer's pool is
         # deliberately small, so preview/export are rate limited per user.
         "render": env("RENDER_THROTTLE_RATE", default="60/min"),
+        # Every generation costs real money at the provider, so the ceiling is
+        # low by default and per-user rather than per-IP.
+        "ai_generate": env("AI_GENERATE_THROTTLE_RATE", default="20/hour"),
     },
 }
 
@@ -355,6 +358,40 @@ AUTH_COOKIE_SAMESITE = env("AUTH_COOKIE_SAMESITE", default="Lax")
 AUTH_COOKIE_PATH = env("AUTH_COOKIE_PATH", default="/api/auth/")
 # Empty means a host-only cookie, which is the safest default.
 AUTH_COOKIE_DOMAIN = env("AUTH_COOKIE_DOMAIN", default="")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI
+#
+# The key is read here and used only by the backend. It appears in no
+# serializer, no template and no error returned to a client; the frontend calls
+# our API, and our API calls OpenAI. That is the only arrangement in which the
+# key cannot be pulled out of a browser.
+# ---------------------------------------------------------------------------
+
+OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
+OPENAI_MODEL = env("OPENAI_MODEL", default="gpt-4o-mini")
+OPENAI_TEMPERATURE = env.float("OPENAI_TEMPERATURE", default=0.7)
+OPENAI_MAX_OUTPUT_TOKENS = env.int("OPENAI_MAX_OUTPUT_TOKENS", default=700)
+OPENAI_TIMEOUT_SECONDS = env.float("OPENAI_TIMEOUT_SECONDS", default=45.0)
+OPENAI_MAX_RETRIES = env.int("OPENAI_MAX_RETRIES", default=2)
+
+#: USD per MILLION tokens. Configurable because published prices change, and a
+#: stored cost computed from a stale hardcoded rate is quietly wrong. A model
+#: missing from this table records 0 rather than a plausible guess.
+OPENAI_PRICING: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4.1-mini": {"input": 0.40, "output": 1.60},
+    "gpt-4.1": {"input": 2.00, "output": 8.00},
+}
+for _override in env.list("OPENAI_PRICING_OVERRIDES", default=[]):
+    # Format: "model:input_per_million:output_per_million"
+    try:
+        _name, _in, _out = _override.split(":")
+        OPENAI_PRICING[_name] = {"input": float(_in), "output": float(_out)}
+    except ValueError:
+        pass
 
 
 # ---------------------------------------------------------------------------

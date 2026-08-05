@@ -93,3 +93,6 @@ desktop.ini
 # Claude Code
 # ---------------------------------------------------------------------------
 .claude/settings.local.json
+
+# AI sample-run output (regenerate with manage.py ai_sample_run)
+backend/ai_sample_run.md

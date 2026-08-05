@@ -8,15 +8,16 @@ Full-stack skeleton and local development environment.
 | Auth           | JWT (simplejwt), httpOnly refresh cookie, 3 roles    |
 | Uploads        | Django storage API, local filesystem (swappable)     |
 | Rendering      | Playwright/Chromium in its own container, warm browser |
+| AI content     | OpenAI (structured JSON output), validated, via Celery |
 | Database       | PostgreSQL 16                                        |
 | Background     | Celery 5.6 + Redis 7 (connection only, no tasks)     |
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
 | Orchestration  | Docker Compose                                       |
 
 Authentication, role-based access control, profile management, property
-listings (manual entry, URL import, verification) and the template/design
-system (controlled editing, multi-dimension export) are in place. AI content
-and compliance are still empty scaffolds.
+listings (manual entry, URL import, verification), the template/design system
+(controlled editing, multi-dimension export) and AI caption generation
+(validated, async) are in place. Compliance is still an empty scaffold.
 
 ---
 
@@ -446,6 +447,115 @@ with no affordance, colour allowlists render as swatches rather than a picker
 (offering values the server will reject is worse than not offering them), and
 `free` elements get sliders clamped to their bounds.
 
+---
+
+## AI caption generation
+
+Set `OPENAI_API_KEY` in `.env` and restart the backend **and the worker**.
+Without it the API fails cleanly rather than silently.
+
+### The key never reaches the browser
+
+It is read from the environment by the backend, used in
+[client.py](backend/apps/ai_content/client.py), and appears in no serializer, no
+response body and no error message. The frontend calls *our* API; our API calls
+OpenAI. Configuration failures return "not configured on this server" and put
+the detail in the log — naming internal environment variables in a response is
+a habit that eventually leaks something that matters.
+
+### Only verified fields, and only those
+
+[prompts.py](backend/apps/ai_content/prompts.py) builds a numbered, id-tagged
+list of verified fields and tells the model that list is the entire universe of
+things it may assert. Note what is *not* sent: internal notes, the source URL,
+import warnings, other listings — and deliberately not the **street address**,
+because a caption naming an occupied home's exact address is a privacy problem.
+An optional agent tone note is fenced and explicitly demoted below the rules, so
+it cannot talk the model out of them.
+
+Output is requested as **structured JSON** against a strict schema, so it is
+parsed rather than scraped.
+
+### Nothing the model returns is trusted
+
+The prompt asks for all of this; [validation.py](backend/apps/ai_content/validation.py)
+checks that it happened. Models mostly comply, and "mostly" is not a standard
+you can publish under a real estate licence — the dangerous failure is copy that
+reads perfectly and contains one plausible invented number.
+
+| Check | Severity |
+| ----- | -------- |
+| Numbers that trace to no listing field (prices, distances, percentages) | error |
+| Features not in the listing (a pool, a cellar, a view) | error |
+| Investment / financial claims (yield, ROI, "will appreciate", gearing) | error |
+| Legal / planning claims (zoning, approvals, title, heritage) | error |
+| Comparative superlatives ("best in the street") | warning |
+| Place names that are not the listing's own | warning |
+| Malformed or excessive hashtags | warning |
+
+Errors are reserved for the unambiguous; heuristics that can misfire produce
+warnings, because a validator that cries wolf gets switched off. Shorthand is
+understood — `$1.85m` is the same fact as `$1,850,000` — and numbers appearing
+in the agent's own verified description count as verified.
+
+**On rejection the copy never lands in `caption`.** It goes to
+`rejected_output`, so an invented claim is not sitting in the field the UI
+renders as publishable text. It is kept, because debugging the prompt needs it.
+
+### Three independent statuses
+
+`job_status` (queued/running/ready/failed) · `validation_status`
+(pending/passed/flagged/rejected) · `review_status` (draft/approved/rejected).
+
+A generation can be *ready* and validation-*rejected*, and it starts as a
+*draft* either way. Collapsing these would make "the model returned something"
+indistinguishable from "a person approved it". Content that failed the fact
+check **cannot be approved** at all.
+
+### Generation is never a side effect
+
+`POST /api/ai-content/generate/` is the only code path that starts a job. No
+read endpoint creates one — opening a listing a hundred times costs nothing.
+That is asserted directly in `test_opening_a_listing_does_not_trigger_generation`,
+because an expensive external call that fires on render is a bill that grows
+with page views.
+
+Regenerating creates a **new** record rather than overwriting, so the history
+survives for prompt comparison and audit.
+
+### Endpoints
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| POST | `/api/ai-content/generate/` | 202 with a job id; throttled per user |
+| GET | `/api/ai-content/?listing=N` | history for a listing |
+| GET | `/api/ai-content/{id}/` | full record, including the facts used |
+| GET | `/api/ai-content/{id}/status/` | small payload, for polling |
+| POST | `/api/ai-content/{id}/review/` | agent approves or discards |
+| GET | `/api/ai-content/usage/` | token and cost totals, scoped |
+
+Cost is recorded per generation — including for rejected ones, since they were
+still billed. Prices are configured in settings and overridable by env, because
+a stored cost computed from a stale hardcoded rate is quietly wrong. An unknown
+model records 0 rather than a plausible guess.
+
+### Judging caption quality
+
+The tests prove the pipeline works; they cannot tell you whether the captions
+are any good. For that:
+
+```bash
+docker compose exec backend python manage.py ai_sample_run
+docker compose exec backend python manage.py ai_sample_run --offline   # harness only
+```
+
+Runs 15 sample listings — chosen to probe the edges, including several
+deliberately sparse ones where a model is most tempted to invent — and writes
+`backend/ai_sample_run.md` for you to read. The sample listings are created in a
+transaction that is rolled back, so a review run leaves no rows behind.
+`--offline` uses a canned response to check the harness without a key or a bill;
+it tells you nothing about quality.
+
 ### Token storage — the important part
 
 Full reasoning lives in
@@ -560,7 +670,14 @@ Notes:
 │       │   ├── rendering.py     # renderer client, export + storage
 │       │   ├── dimensions.py    # the four social sizes
 │       │   └── tests/
-│       ├── ai_content/      # AI-generated copy          (empty scaffold)
+│       ├── ai_content/      # AI caption generation
+│       │   ├── models.py        # GeneratedContent (job/validation/review)
+│       │   ├── prompts.py       # the facts contract with the model
+│       │   ├── validation.py    # fact-check the response (read this)
+│       │   ├── client.py        # OpenAI wrapper; key is backend-only
+│       │   ├── services.py      # synchronous pipeline (Part A)
+│       │   ├── tasks.py         # Celery wrapper (Part B)
+│       │   └── management/      # ai_sample_run, for judging quality
 │       └── compliance/      # regulatory rules           (empty scaffold)
 └── frontend/
     ├── Dockerfile
@@ -610,8 +727,19 @@ docker compose exec frontend npm run typecheck
 Rebuild after changing `requirements.txt` or `package.json`:
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
+
+If one service's build fails (a flaky pull, say), compose aborts the whole `up`
+and the *other* services keep running their old images — which looks like your
+change had no effect. Rebuild the ones you touched explicitly:
+
+```bash
+docker compose up -d --no-deps --build backend celery_worker
+```
+
+`backend` and `celery_worker` share an image on purpose, so the worker cannot
+end up running older code than the API.
 
 Both source trees are bind-mounted, so Django's autoreloader and Vite's HMR
 pick up code changes without a rebuild.
@@ -622,11 +750,11 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-274 tests. The suite runs against a throwaway database, uses an in-memory
+338 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
-layer and the render tests stub the renderer service, so no test touches the
-network or needs a browser.
+layer, the render tests stub the renderer service and the AI tests stub the
+provider, so no test touches the network, needs a browser, or spends money.
 
 - `test_auth.py` — login (success and failure), refresh and rotation replay,
   logout revocation, registration rules, the httpOnly cookie contract.
@@ -654,6 +782,14 @@ network or needs a browser.
   delete, the verified-listing gate, and scoping.
 - `templates/test_rendering.py` — HTML composition, all four export dimensions,
   PNG and JPG, storage, and useful failure when the renderer is down.
+- `ai_content/test_generation.py` — successful generation and storage, the
+  prompt's field discipline, cost estimation, and a deliberately poisoned
+  response (invented pool, wrong price, fake yield, planning approval) being
+  caught and kept out of the caption field.
+- `ai_content/test_validation.py` — every validation rule, against both copy it
+  should pass and copy it should catch.
+- `ai_content/test_api.py` — job dispatch and polling, review, scoping, usage
+  totals, and that reads never trigger generation.
 
 ### Celery
 
@@ -713,9 +849,15 @@ The defaults are tuned for local development. For anything public:
 
 ## Next steps
 
-Deliberately not included yet: templates, AI content and compliance domain
-models, Celery tasks, CI, and production settings.
+Deliberately not included yet: the compliance domain, CI, and production
+settings.
 
-When the import needs to handle slow pages or bulk use, move
-`import_listing_from_url` into a Celery task — the service function is already
-self-contained, and the worker is already running.
+When the listing import needs to handle slow pages or bulk use, move
+`import_listing_from_url` into a Celery task the same way `run_generation` was
+— the service function is already self-contained.
+
+The caption validator is rule-based and its feature vocabulary is a fixed list
+([`FEATURE_VOCABULARY`](backend/apps/ai_content/validation.py)). It will not
+catch a feature nobody has thought of yet. Read `ai_sample_run` output
+periodically and grow the list from what you see; that is cheaper and more
+predictable than checking one model's output with another model.
