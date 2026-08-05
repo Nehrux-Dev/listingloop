@@ -53,6 +53,34 @@ class ValidationStatus(models.TextChoices):
 
 class ContentKind(models.TextChoices):
     SOCIAL_CAPTION = "social_caption", _("Social caption and hashtags")
+    CONTENT_PACK = "content_pack", _("Full content pack")
+
+
+class VariantKind(models.TextChoices):
+    """The pieces produced by one generation.
+
+    All of these come back from a SINGLE API call. Asking six times would cost
+    roughly six times as much and, worse, would let the variants drift apart —
+    six independent calls can each pick a different fact to lead with.
+    """
+
+    INSTAGRAM_CAPTION = "instagram_caption", _("Instagram caption")
+    FACEBOOK_CAPTION = "facebook_caption", _("Facebook caption")
+    LINKEDIN_CAPTION = "linkedin_caption", _("LinkedIn caption")
+    SHARING_MESSAGE = "sharing_message", _("Sharing message")
+    PROPERTY_DESCRIPTION = "property_description", _("Property page description")
+    HASHTAGS = "hashtags", _("Hashtags")
+
+
+#: Order the UI displays them in.
+VARIANT_ORDER: tuple[str, ...] = (
+    VariantKind.INSTAGRAM_CAPTION,
+    VariantKind.FACEBOOK_CAPTION,
+    VariantKind.LINKEDIN_CAPTION,
+    VariantKind.SHARING_MESSAGE,
+    VariantKind.PROPERTY_DESCRIPTION,
+    VariantKind.HASHTAGS,
+)
 
 
 class GeneratedContentQuerySet(models.QuerySet):
@@ -184,6 +212,114 @@ class GeneratedContent(TimeStampedModel):
     def is_usable(self) -> bool:
         """Ready, and not rejected by the fact check."""
         return self.is_ready and self.validation_status in (
+            ValidationStatus.PASSED,
+            ValidationStatus.FLAGGED,
+        )
+
+    @property
+    def has_errors(self) -> bool:
+        return any(issue.get("severity") == "error" for issue in self.validation_issues)
+
+    @property
+    def usable_variant_count(self) -> int:
+        return sum(1 for variant in self.variants.all() if variant.is_usable)
+
+
+class ContentVariant(TimeStampedModel):
+    """One piece of copy from a generation, reviewed on its own.
+
+    Variants are rows rather than columns on ``GeneratedContent`` because each
+    is separately validated, separately editable and separately approved — an
+    agent can publish the Instagram caption while rejecting the LinkedIn one.
+    Columns would also mean a migration every time a platform is added.
+    """
+
+    generation = models.ForeignKey(
+        GeneratedContent, on_delete=models.CASCADE, related_name="variants"
+    )
+    kind = models.CharField(_("kind"), max_length=32, choices=VariantKind.choices)
+
+    #: Prose variants use ``text``; the hashtag variant uses ``items``.
+    text = models.TextField(_("text"), blank=True)
+    items = models.JSONField(_("items"), default=list, blank=True)
+
+    #: Set instead of text/items when this variant failed the fact check, so
+    #: rejected copy is never in the field the UI renders as publishable.
+    rejected_text = models.TextField(_("rejected text"), blank=True)
+    rejected_items = models.JSONField(_("rejected items"), default=list, blank=True)
+
+    validation_status = models.CharField(
+        _("validation status"),
+        max_length=16,
+        choices=ValidationStatus.choices,
+        default=ValidationStatus.PENDING,
+        db_index=True,
+    )
+    validation_issues = models.JSONField(_("validation issues"), default=list, blank=True)
+
+    review_status = models.CharField(
+        _("review status"),
+        max_length=16,
+        choices=ReviewStatus.choices,
+        default=ReviewStatus.DRAFT,
+        db_index=True,
+    )
+    reviewed_at = models.DateTimeField(_("reviewed at"), null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_variants",
+    )
+
+    #: True once an agent has changed the words themselves. Recorded because it
+    #: changes who is responsible for the claims in them — see `is_usable`.
+    is_edited = models.BooleanField(_("edited by agent"), default=False)
+    original_text = models.TextField(_("original text"), blank=True)
+    edited_at = models.DateTimeField(_("edited at"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("content variant")
+        verbose_name_plural = _("content variants")
+        ordering = ("generation_id", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["generation", "kind"], name="unique_variant_kind_per_generation"
+            )
+        ]
+        indexes = [models.Index(fields=["generation", "kind"])]
+
+    def __str__(self) -> str:
+        return f"{self.get_kind_display()} ({self.validation_status})"
+
+    @property
+    def is_hashtags(self) -> bool:
+        return self.kind == VariantKind.HASHTAGS
+
+    @property
+    def display_text(self) -> str:
+        """What to show, whether it passed or not."""
+        if self.is_hashtags:
+            items = self.items or self.rejected_items
+            return " ".join(items)
+        return self.text or self.rejected_text
+
+    @property
+    def is_usable(self) -> bool:
+        """May this variant be approved and published?
+
+        For MODEL output the rule is strict: a fact-check error blocks it. That
+        is the guarantee the whole pipeline exists to provide.
+
+        For AGENT-EDITED text it is advisory. The validator's job is to stop the
+        model inventing things, not to stop a licensed agent writing a sentence
+        — they may well know something the listing does not record. Warnings are
+        still shown, and ``is_edited`` records who the words belong to.
+        """
+        if self.is_edited:
+            return bool(self.display_text.strip())
+        return self.validation_status in (
             ValidationStatus.PASSED,
             ValidationStatus.FLAGGED,
         )

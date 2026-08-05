@@ -23,18 +23,45 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 
 #: JSON Schema handed to the API so the response is parseable rather than
 #: prose we have to scrape. `strict` mode means the model cannot add keys.
+#:
+#: All six variants come back from ONE call. Six separate calls would cost
+#: roughly six times as much — the facts block is re-sent each time and it is
+#: most of the prompt — and would let the variants drift, each independently
+#: picking a different fact to lead with.
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "caption": {
+        "instagram_caption": {
+            "type": "string",
+            "description": "2-3 short sentences. Punchy, visual. No hashtags inline.",
+        },
+        "facebook_caption": {
+            "type": "string",
+            "description": "3-5 sentences, conversational, a little more detail.",
+        },
+        "linkedin_caption": {
             "type": "string",
             "description": (
-                "Marketing caption for a social post. 2-4 short sentences. "
-                "Only facts from the provided list."
+                "2-4 sentences, professional and factual. No investment framing "
+                "of any kind."
+            ),
+        },
+        "sharing_message": {
+            "type": "string",
+            "description": (
+                "One or two sentences for a direct message or SMS. Plain, no "
+                "hashtags, no marketing voice."
+            ),
+        },
+        "property_description": {
+            "type": "string",
+            "description": (
+                "4-8 sentences for the property page. The longest variant. "
+                "Straightforward and descriptive, no hashtags."
             ),
         },
         "hashtags": {
@@ -42,7 +69,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "Between 4 and 10 hashtags, each starting with #, no spaces. "
-                "Only derived from the provided facts."
+                "One shared set, used with any of the captions."
             ),
         },
         "facts_used": {
@@ -54,12 +81,20 @@ RESPONSE_SCHEMA: dict[str, Any] = {
             ),
         },
     },
-    "required": ["caption", "hashtags", "facts_used"],
+    "required": [
+        "instagram_caption",
+        "facebook_caption",
+        "linkedin_caption",
+        "sharing_message",
+        "property_description",
+        "hashtags",
+        "facts_used",
+    ],
     "additionalProperties": False,
 }
 
 SYSTEM_PROMPT = """\
-You write short social media captions for real estate listings.
+You write marketing copy for real estate listings, in several formats at once.
 
 You will be given a numbered list of VERIFIED FACTS about one property. That \
 list is the complete and only set of things you may state. Treat anything not \
@@ -84,13 +119,34 @@ comparisons are not.
 7. If the facts are thin, write a shorter caption. A short honest caption is \
 correct. Padding it with plausible detail is not.
 
-Style: warm, concrete, professional. Australian/British spelling. No emoji in \
-the caption. Do not open with "Welcome to". Do not address the reader as \
-"you'll love". Avoid estate-agent cliche ("nestled", "boasts", "a rare find").
+Every rule above applies to EVERY field you return. A claim that is forbidden \
+in the Instagram caption is equally forbidden in the property description. \
+Longer formats are longer because they use MORE of the given facts and say \
+them more fully — never because they add new ones. If you run out of facts, \
+stop writing.
 
-Hashtags: 4-10, each starting with #, no spaces or punctuation inside, derived \
-only from the facts (property type, location, and the listing's own features). \
-Do not invent location hashtags.
+Style, applied to all formats: warm, concrete, professional. \
+Australian/British spelling. No emoji. Do not open with "Welcome to". Do not \
+address the reader as "you'll love". Avoid estate-agent cliche ("nestled", \
+"boasts", "a rare find", "must be seen").
+
+Write each format for its own context:
+
+- instagram_caption: 2-3 short sentences. Punchy and visual. No hashtags inline.
+- facebook_caption: 3-5 sentences. Conversational, a little more detail.
+- linkedin_caption: 2-4 sentences. Professional and factual. This is the format \
+where investment framing is most tempting and most forbidden — describe the \
+property, not the opportunity.
+- sharing_message: one or two sentences, as if texting it to someone. Plain \
+language, no marketing voice, no hashtags.
+- property_description: 4-8 sentences for the listing page. The longest format. \
+Straightforward and descriptive. No hashtags.
+- hashtags: 4-10, each starting with #, no spaces or punctuation inside, \
+derived only from the facts (property type, location, and the listing's own \
+features). Do not invent location hashtags. One shared set.
+
+The formats should not read as copies of each other. Vary which facts lead and \
+how they are phrased — while every one of them stays inside the same list.
 
 Return JSON matching the provided schema. In `facts_used`, list the ids of the \
 facts you actually used."""
@@ -173,7 +229,7 @@ VERIFIED FACTS — this list is complete. Anything not listed is unknown to you.
 
 {block}
 
-Write the caption and hashtags using only these facts.{extra}"""
+Write every format in the schema using only these facts.{extra}"""
 
 
 def build_messages(listing, *, tone: str = "") -> tuple[list[dict[str, str]], dict[str, Any]]:

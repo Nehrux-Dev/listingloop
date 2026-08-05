@@ -171,6 +171,22 @@ NUMBER_WORDS = {
 NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 HASHTAG_RE = re.compile(r"^#[A-Za-z0-9]+$")
 
+#: Matched as bare substrings inside a hashtag, where word boundaries do not
+#: exist. Kept short and unambiguous on purpose: these are words that carry a
+#: regulated claim no matter what they are glued to.
+HIGH_RISK_TAG_KEYWORDS: tuple[str, ...] = (
+    "yield",
+    "roi",
+    "investment",
+    "guaranteed",
+    "geared",
+    "approved",
+    "zoned",
+    "subdivid",
+    "freehold",
+    "leasehold",
+)
+
 
 def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").lower()).strip()
@@ -410,55 +426,164 @@ def _check_hashtags(hashtags: list[str], report: ValidationReport) -> None:
             )
 
 
-def validate_generation(payload: dict[str, Any], listing, facts: dict[str, Any]) -> ValidationReport:
-    """Check one parsed AI response against the listing it came from."""
+#: Length above which a variant gets a "this is long" warning. Per format,
+#: because a property-page description is meant to be longer than a text
+#: message and warning about it would be noise.
+MAX_LENGTHS: dict[str, int] = {
+    "instagram_caption": 900,
+    "facebook_caption": 1200,
+    "linkedin_caption": 1200,
+    "sharing_message": 400,
+    "property_description": 2500,
+}
+
+
+def validate_text(
+    text: str,
+    listing,
+    facts: dict[str, Any],
+    *,
+    label: str = "caption",
+    max_length: int | None = None,
+) -> ValidationReport:
+    """Run every fact check over one block of prose.
+
+    The single entry point for prose, whichever variant it is. Applying one
+    function to all of them is what stops a rule being enforced on the
+    Instagram caption and quietly forgotten on the property description — which
+    is the longest variant and therefore the one with the most room to invent.
+    """
     report = ValidationReport()
 
-    caption = payload.get("caption")
-    hashtags = payload.get("hashtags", [])
-
-    if not isinstance(caption, str) or not caption.strip():
+    if not isinstance(text, str) or not text.strip():
         report.add(
-            ValidationIssue("empty_caption", "error", "The response contained no caption.")
+            ValidationIssue(
+                "empty_text", "error", f"The response contained no {label.replace('_', ' ')}."
+            )
         )
         return report.finalise()
 
-    if len(caption) > 1200:
+    limit = max_length or MAX_LENGTHS.get(label, 1200)
+    if len(text) > limit:
         report.add(
             ValidationIssue(
-                "caption_too_long",
+                "text_too_long",
                 "warning",
-                f"The caption is {len(caption)} characters, which is long for a social post.",
+                f"This is {len(text)} characters, which is long for a "
+                f"{label.replace('_', ' ')} (guide: {limit}).",
             )
         )
 
     haystack = _listing_haystack(listing, facts)
     allowed = allowed_numbers(facts, listing)
-    tag_text = " ".join(tag for tag in hashtags if isinstance(tag, str))
-    combined = f"{caption} {tag_text}"
 
-    _check_numbers(caption, allowed, report, "caption")
-    _check_numbers(tag_text, allowed, report, "hashtags")
-    _check_number_words(_normalise(caption), allowed, report)
+    _check_numbers(text, allowed, report, label.replace("_", " "))
+    _check_number_words(_normalise(text), allowed, report)
 
     _check_patterns(
-        combined, INVESTMENT_PATTERNS, "investment_claim", "error", report,
+        text, INVESTMENT_PATTERNS, "investment_claim", "error", report,
         "The copy makes an investment claim ({label}): “{text}”. "
         "Investment claims cannot be derived from listing data.",
     )
     _check_patterns(
-        combined, LEGAL_PATTERNS, "legal_claim", "error", report,
+        text, LEGAL_PATTERNS, "legal_claim", "error", report,
         "The copy makes a legal or planning claim ({label}): “{text}”. "
         "These cannot be derived from listing data.",
     )
     _check_patterns(
-        combined, SUPERLATIVE_PATTERNS, "unverifiable_superlative", "warning", report,
+        text, SUPERLATIVE_PATTERNS, "unverifiable_superlative", "warning", report,
         "The copy makes a comparative claim ({label}): “{text}”, which cannot be "
         "checked against the listing.",
     )
 
-    _check_features(combined, haystack, report)
-    _check_locations(caption, listing, haystack, report)
+    _check_features(text, haystack, report)
+    _check_locations(text, listing, haystack, report)
+
+    return report.finalise()
+
+
+def validate_hashtags(hashtags: Any, listing, facts: dict[str, Any]) -> ValidationReport:
+    """The same checks, applied to the hashtag set.
+
+    Hashtags get validated too because "#8percentyield" is exactly as much a
+    claim as writing it in a sentence, and it is easier to overlook.
+    """
+    report = ValidationReport()
+
+    if not isinstance(hashtags, list):
+        report.add(ValidationIssue("malformed_hashtags", "error", "Hashtags were not a list."))
+        return report.finalise()
+
+    if not hashtags:
+        report.add(ValidationIssue("empty_hashtags", "error", "No hashtags were returned."))
+        return report.finalise()
+
+    tag_text = " ".join(tag for tag in hashtags if isinstance(tag, str))
+    # Split camel-case so "#OceanViewPool" is checked word by word rather than
+    # sailing through as one unrecognised token.
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tag_text).replace("#", " ")
+
+    # Camel-case splitting does not help an all-lowercase tag: "#7percentyield"
+    # has no word boundary before "yield", so the \b-anchored claim patterns
+    # miss it entirely. Hashtags are exactly where copy gets compressed into
+    # one token, so high-risk words are also matched as bare substrings.
+    for tag in hashtags:
+        if not isinstance(tag, str):
+            continue
+        lowered = tag.lower().lstrip("#")
+        for keyword in HIGH_RISK_TAG_KEYWORDS:
+            if keyword in lowered:
+                report.add(
+                    ValidationIssue(
+                        code="high_risk_hashtag",
+                        severity="error",
+                        message=(
+                            f"The hashtag “{tag}” contains “{keyword}”, which makes "
+                            f"a claim that cannot be derived from listing data."
+                        ),
+                        evidence=tag,
+                    )
+                )
+                break
+
+    haystack = _listing_haystack(listing, facts)
+    allowed = allowed_numbers(facts, listing)
+
+    _check_numbers(tag_text, allowed, report, "hashtags")
+    _check_patterns(
+        spaced, INVESTMENT_PATTERNS, "investment_claim", "error", report,
+        "A hashtag makes an investment claim ({label}): “{text}”.",
+    )
+    _check_patterns(
+        spaced, LEGAL_PATTERNS, "legal_claim", "error", report,
+        "A hashtag makes a legal or planning claim ({label}): “{text}”.",
+    )
+    _check_features(spaced, haystack, report)
     _check_hashtags(hashtags, report)
+
+    return report.finalise()
+
+
+def validate_generation(payload: dict[str, Any], listing, facts: dict[str, Any]) -> ValidationReport:
+    """Check a single caption + hashtags response.
+
+    Kept for the single-caption path and for callers that want one combined
+    report; the multi-variant pipeline validates each variant separately so an
+    agent can see which one is at fault.
+    """
+    report = validate_text(
+        payload.get("caption"), listing, facts, label="caption", max_length=1200
+    )
+    if report.issues and any(issue.code == "empty_text" for issue in report.issues):
+        # Preserve the original code so existing callers keep matching on it.
+        for issue in report.issues:
+            if issue.code == "empty_text":
+                issue.code = "empty_caption"
+                issue.message = "The response contained no caption."
+        return report
+
+    hashtag_report = validate_hashtags(payload.get("hashtags", []), listing, facts)
+    for issue in hashtag_report.issues:
+        report.add(issue)
 
     return report.finalise()

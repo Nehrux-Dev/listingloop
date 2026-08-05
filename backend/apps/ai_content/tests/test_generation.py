@@ -37,6 +37,7 @@ class SuccessfulGenerationTests(AIContentTestCase):
         self.assertIn("Manly", generation.caption)
         self.assertEqual(len(generation.hashtags), 5)
         self.assertEqual(generation.rejected_output, {})
+        self.assertEqual(generation.variants.count(), 6)
 
     def test_provenance_and_cost_are_recorded(self):
         generation = generate_for_listing(
@@ -44,7 +45,7 @@ class SuccessfulGenerationTests(AIContentTestCase):
         )
 
         self.assertEqual(generation.model_name, "gpt-4o-mini")
-        self.assertEqual(generation.prompt_version, "v1")
+        self.assertEqual(generation.prompt_version, "v2")
         self.assertEqual(generation.prompt_tokens, 420)
         self.assertEqual(generation.completion_tokens, 96)
         self.assertEqual(generation.total_tokens, 516)
@@ -115,22 +116,27 @@ class PoisonedResponseTests(AIContentTestCase):
         self.assertEqual(self.generation.caption, "")
         self.assertEqual(self.generation.hashtags, [])
         # Kept for debugging, but somewhere clearly labelled.
-        self.assertIn("swimming pool", self.generation.rejected_output["caption"])
+        self.assertIn(
+            "swimming pool", self.generation.rejected_output["instagram_caption"]
+        )
 
     def test_every_category_of_invention_is_caught(self):
         codes = {issue["code"] for issue in self.generation.validation_issues}
 
         self.assertIn("unverified_feature", codes)   # pool, wine cellar
-        self.assertIn("unverified_number", codes)    # 400 m, 6%, wrong price
+        self.assertIn("unverified_number", codes)    # 400 m, wrong price
         self.assertIn("investment_claim", codes)     # "smart investment", yield
         self.assertIn("legal_claim", codes)          # "council approved"
 
-    def test_the_issues_name_the_offending_text(self):
-        """An agent has to be able to see *what* was wrong, not just that it was."""
+    def test_the_issues_name_the_offending_text_and_variant(self):
+        """An agent has to see *what* was wrong and *where*, not just that it was."""
         evidence = " ".join(issue["evidence"] for issue in self.generation.validation_issues).lower()
 
         self.assertIn("pool", evidence)
         self.assertIn("council approved", evidence)
+        self.assertTrue(
+            all("variant" in issue for issue in self.generation.validation_issues)
+        )
 
     def test_the_invented_price_is_caught_specifically(self):
         """1,750,000 is plausible, wrong, and the most dangerous single error."""
@@ -169,6 +175,15 @@ class PromptTests(AIContentTestCase):
 
         self.assertNotIn("address", facts)
         self.assertNotIn("Harbour View Terrace", messages[1]["content"])
+
+    def test_the_rules_are_stated_as_applying_to_every_format(self):
+        """A rule enforced on one variant and forgotten on another is worse
+        than no rule, because it reads as covered."""
+        messages, _ = build_messages(self.listing)
+        system = messages[0]["content"]
+
+        self.assertIn("applies to EVERY field you return", system)
+        self.assertIn("never because they add new ones", system)
 
     def test_absent_fields_are_omitted_rather_than_sent_as_null(self):
         sparse = self.make_listing(

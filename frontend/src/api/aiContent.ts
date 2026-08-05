@@ -21,6 +21,38 @@ export type ValidationIssue = {
   evidence: string
 }
 
+export type VariantKind =
+  | 'instagram_caption'
+  | 'facebook_caption'
+  | 'linkedin_caption'
+  | 'sharing_message'
+  | 'property_description'
+  | 'hashtags'
+
+export type ContentVariant = {
+  id: number
+  generation: number
+  kind: VariantKind
+  kind_display: string
+  /** Prose variants use `text`; the hashtag variant uses `items`. */
+  text: string
+  items: string[]
+  rejected_text: string
+  rejected_items: string[]
+  /** Whichever of the above applies, joined — for display. */
+  display_text: string
+  validation_status: ValidationStatus
+  validation_issues: ValidationIssue[]
+  error_count: number
+  warning_count: number
+  review_status: ReviewStatus
+  reviewed_at: string | null
+  is_usable: boolean
+  is_edited: boolean
+  original_text: string
+  edited_at: string | null
+}
+
 export type GeneratedContent = {
   id: number
   listing: number
@@ -50,6 +82,8 @@ export type GeneratedContent = {
   duration_ms: number
   created_at: string
   updated_at: string
+  variants: ContentVariant[]
+  usable_variant_count: number
 }
 
 export type GenerationStatus = {
@@ -101,6 +135,41 @@ export function reviewContent(
   return apiRequest<GeneratedContent>(`/api/ai-content/${id}/review/`, {
     method: 'POST',
     body: { decision },
+  })
+}
+
+/** Apply one decision to every variant that can take it. Skips the rest. */
+export function reviewAllVariants(
+  id: number,
+  decision: 'approved' | 'rejected',
+): Promise<{ applied: number; skipped: number; generation: GeneratedContent }> {
+  return apiRequest(`/api/ai-content/${id}/review-all/`, {
+    method: 'POST',
+    body: { decision },
+  })
+}
+
+export function reviewVariant(
+  id: number,
+  decision: 'approved' | 'rejected',
+): Promise<ContentVariant> {
+  return apiRequest<ContentVariant>(`/api/ai-content-variants/${id}/review/`, {
+    method: 'POST',
+    body: { decision },
+  })
+}
+
+/**
+ * Rewrite one variant. The server re-validates and returns any issues, but an
+ * agent's own words are advisory rather than blocking — see `is_usable`.
+ */
+export function editVariant(
+  id: number,
+  payload: { text?: string; items?: string[] },
+): Promise<ContentVariant> {
+  return apiRequest<ContentVariant>(`/api/ai-content-variants/${id}/edit/`, {
+    method: 'POST',
+    body: payload,
   })
 }
 

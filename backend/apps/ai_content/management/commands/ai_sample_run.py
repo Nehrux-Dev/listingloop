@@ -55,25 +55,38 @@ def _offline_completion(messages, schema):
     price = fact("price")
     city = fact("city")
 
-    caption = "A considered home in a location worth knowing. "
-    if city:
-        caption = f"A considered home in {city}. "
-    if price:
-        caption += f"Guided at {price}. "
-    caption += "Enquiries welcome."
+    where = f" in {city}" if city else ""
+    guide = f" Guided at {price}." if price else ""
 
     payload = {
-        "caption": caption,
+        "instagram_caption": f"A considered home{where}.{guide} Enquiries welcome.",
+        "facebook_caption": (
+            f"A considered home{where}.{guide} Get in touch to arrange a time."
+        ),
+        "linkedin_caption": f"Now available{where}.{guide}",
+        "sharing_message": f"Thought of you — a home{where}.{guide}",
+        "property_description": (
+            f"This property is located{where}.{guide} Further details are "
+            f"available on request."
+        ),
         "hashtags": ["#realestate", "#property", "#forsale", "#home"],
         "facts_used": [name for name in ("city", "price") if fact(name)],
     }
+    written = " ".join(
+        value if isinstance(value, str) else " ".join(value)
+        for key, value in payload.items()
+        if key != "facts_used"
+    )
+    prompt_tokens = len(user_message.split())
+    completion_tokens = len(written.split())
+
     return CompletionResult(
         payload=payload,
         raw_text=json.dumps(payload),
         model="offline-stub",
-        prompt_tokens=len(user_message.split()),
-        completion_tokens=len(caption.split()),
-        total_tokens=len(user_message.split()) + len(caption.split()),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
         duration_ms=1,
     )
 
@@ -112,7 +125,7 @@ class Command(BaseCommand):
         samples = SAMPLE_LISTINGS[:limit] if limit else SAMPLE_LISTINGS
         completion_fn = _offline_completion if offline else None
 
-        rows = []
+        rows: list[dict] = []
         started = time.monotonic()
 
         # Everything below happens inside a transaction that is rolled back, so
@@ -139,6 +152,10 @@ class Command(BaseCommand):
                             "facts": facts,
                             "generation": generation,
                             "listing": listing,
+                            # Materialised INSIDE the transaction: the rollback
+                            # below removes the rows, so a lazy queryset
+                            # evaluated during rendering would come back empty.
+                            "variants": list(generation.variants.all()),
                         }
                     )
 
@@ -153,6 +170,14 @@ class Command(BaseCommand):
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS(f"Wrote {out_path} ({len(rows)} samples)."))
         self._summarise(rows)
+
+    def _all_variants(self, rows) -> list:
+        return [
+            variant
+            for row in rows
+            if row["generation"].job_status == "ready"
+            for variant in row["variants"]
+        ]
 
     # -- scratch fixtures ---------------------------------------------------
 
@@ -200,8 +225,12 @@ class Command(BaseCommand):
                 "Re-run without `--offline` to judge the prompt."
             )
         lines.append("")
-        lines.append("Read for: invented numbers, features the listing does not have, "
-                     "investment or legal claims, and whether the sparse listings stay short.")
+        lines.append(
+            "Read for: invented numbers, features the listing does not have, "
+            "investment or legal claims, and whether the sparse listings stay short. "
+            "Also check the six formats read differently from each other — if they "
+            "are near-identical, the prompt is not earning its variants."
+        )
         lines.append("")
         lines.append("---")
         lines.append("")
@@ -228,37 +257,35 @@ class Command(BaseCommand):
                 lines.append("")
                 continue
 
-            badge = {
-                ValidationStatus.PASSED: "PASSED",
-                ValidationStatus.FLAGGED: "FLAGGED",
-                ValidationStatus.REJECTED: "REJECTED",
-            }.get(generation.validation_status, generation.validation_status)
-
-            lines.append(f"**Validation: {badge}**")
+            variants = row["variants"]
+            usable = sum(1 for variant in variants if variant.is_usable)
+            lines.append(f"**{usable} of {len(variants)} variants usable**")
             lines.append("")
 
-            caption = generation.caption or (generation.rejected_output or {}).get("caption", "")
-            hashtags = generation.hashtags or (generation.rejected_output or {}).get("hashtags", [])
+            for variant in variants:
+                badge = {
+                    ValidationStatus.PASSED: "PASSED",
+                    ValidationStatus.FLAGGED: "FLAGGED",
+                    ValidationStatus.REJECTED: "REJECTED",
+                }.get(variant.validation_status, variant.validation_status)
 
-            if generation.validation_status == ValidationStatus.REJECTED:
-                lines.append("> Rejected copy, shown only for review — not stored as usable:")
+                lines.append(f"### {variant.get_kind_display()} — {badge}")
                 lines.append("")
 
-            lines.append("**Caption**")
-            lines.append("")
-            lines.append(f"> {caption or '(empty)'}")
-            lines.append("")
-            lines.append(f"**Hashtags:** {' '.join(hashtags) if hashtags else '(none)'}")
-            lines.append("")
+                if variant.validation_status == ValidationStatus.REJECTED:
+                    lines.append("> Rejected — shown for review, not stored as usable.")
+                    lines.append("")
 
-            if generation.validation_issues:
-                lines.append("**Validation issues**")
+                text = variant.display_text or "(empty)"
+                lines.append(f"> {text}")
                 lines.append("")
-                for issue in generation.validation_issues:
+
+                for issue in variant.validation_issues:
                     lines.append(
                         f"- `{issue['severity']}` **{issue['code']}** — {issue['message']}"
                     )
-                lines.append("")
+                if variant.validation_issues:
+                    lines.append("")
 
             lines.append(
                 f"*{generation.model_name} | {generation.total_tokens} tokens "
@@ -272,18 +299,29 @@ class Command(BaseCommand):
         ready = [row["generation"] for row in rows if row["generation"].job_status == "ready"]
         total_cost = sum(g.estimated_cost_usd for g in ready)
         total_tokens = sum(g.total_tokens for g in ready)
+        all_variants = [
+            variant
+            for row in rows
+            if row["generation"].job_status == "ready"
+            for variant in row["variants"]
+        ]
 
         lines.append("## Totals")
         lines.append("")
         lines.append(f"- Samples: {len(rows)} ({len(ready)} completed)")
         lines.append(
-            f"- Validation: "
-            f"{sum(1 for g in ready if g.validation_status == ValidationStatus.PASSED)} passed, "
-            f"{sum(1 for g in ready if g.validation_status == ValidationStatus.FLAGGED)} flagged, "
-            f"{sum(1 for g in ready if g.validation_status == ValidationStatus.REJECTED)} rejected"
+            f"- Variants: {len(all_variants)} "
+            f"({sum(1 for v in all_variants if v.validation_status == ValidationStatus.PASSED)} passed, "
+            f"{sum(1 for v in all_variants if v.validation_status == ValidationStatus.FLAGGED)} flagged, "
+            f"{sum(1 for v in all_variants if v.validation_status == ValidationStatus.REJECTED)} rejected)"
         )
         lines.append(f"- Tokens: {total_tokens:,}")
         lines.append(f"- Estimated cost: ${total_cost}")
+        if ready:
+            lines.append(
+                f"- Per listing: {total_tokens // len(ready):,} tokens for all six "
+                f"formats, from one request"
+            )
         lines.append("")
 
         return "\n".join(lines)
@@ -291,8 +329,10 @@ class Command(BaseCommand):
     def _summarise(self, rows) -> None:
         ready = [row["generation"] for row in rows if row["generation"].job_status == "ready"]
         counts = {status: 0 for status in (ValidationStatus.PASSED, ValidationStatus.FLAGGED, ValidationStatus.REJECTED)}
-        for generation in ready:
-            counts[generation.validation_status] = counts.get(generation.validation_status, 0) + 1
+        # Counted per variant, not per generation: one bad LinkedIn caption
+        # should not read as six failures.
+        for variant in self._all_variants(rows):
+            counts[variant.validation_status] = counts.get(variant.validation_status, 0) + 1
 
         self.stdout.write(
             f"  passed {counts[ValidationStatus.PASSED]} | "

@@ -8,7 +8,7 @@ Full-stack skeleton and local development environment.
 | Auth           | JWT (simplejwt), httpOnly refresh cookie, 3 roles    |
 | Uploads        | Django storage API, local filesystem (swappable)     |
 | Rendering      | Playwright/Chromium in its own container, warm browser |
-| AI content     | OpenAI (structured JSON output), validated, via Celery |
+| AI content     | OpenAI, one call → six validated variants, via Celery |
 | Database       | PostgreSQL 16                                        |
 | Background     | Celery 5.6 + Redis 7 (connection only, no tasks)     |
 | Frontend       | React 19, TypeScript, Vite, Tailwind v4, React Router|
@@ -449,10 +449,33 @@ with no affordance, colour allowlists render as swatches rather than a picker
 
 ---
 
-## AI caption generation
+## AI content generation
 
 Set `OPENAI_API_KEY` in `.env` and restart the backend **and the worker**.
 Without it the API fails cleanly rather than silently.
+
+### Six formats, one API call
+
+Each generation produces a full content pack:
+
+| Variant | Shape |
+| ------- | ----- |
+| Instagram caption | 2–3 short sentences, punchy |
+| Facebook caption | 3–5 sentences, conversational |
+| LinkedIn caption | 2–4 sentences, professional and factual |
+| Sharing message | one or two lines, as if texting it to someone |
+| Property page description | 4–8 sentences, the longest format |
+| Hashtags | 4–10, one shared set |
+
+**One request, not six.** The facts block is most of the prompt, so six calls
+would cost roughly six times as much and let the variants drift — each
+independently picking a different fact to lead with. The response is a single
+strict-schema JSON object; cost is recorded once for the whole pack.
+
+The system prompt states that every rule applies to *every* field, and that
+longer formats are longer because they use more of the given facts, never
+because they add new ones — the property description is the longest variant and
+therefore has the most room to invent.
 
 ### The key never reaches the browser
 
@@ -498,9 +521,20 @@ warnings, because a validator that cries wolf gets switched off. Shorthand is
 understood — `$1.85m` is the same fact as `$1,850,000` — and numbers appearing
 in the agent's own verified description count as verified.
 
-**On rejection the copy never lands in `caption`.** It goes to
-`rejected_output`, so an invented claim is not sitting in the field the UI
-renders as publishable text. It is kept, because debugging the prompt needs it.
+**Every variant is validated separately, by the same function.** A rule
+enforced on the Instagram caption and quietly forgotten on the property
+description would be worse than no rule, because it reads as covered. Hashtags
+get an extra pass: `#7percentyield` has no word boundary before "yield", so the
+sentence-level patterns miss it entirely and high-risk words are also matched as
+bare substrings inside a tag.
+
+**On rejection the copy never lands in the usable field.** It goes to
+`rejected_text` / `rejected_items`, so an invented claim is not sitting where
+the UI renders publishable text. It is kept, because debugging the prompt needs
+it.
+
+Variants fail independently — one bad LinkedIn caption does not spoil a good
+Instagram one, which is exactly why they are reviewed one at a time.
 
 ### Three independent statuses
 
@@ -511,6 +545,20 @@ A generation can be *ready* and validation-*rejected*, and it starts as a
 *draft* either way. Collapsing these would make "the model returned something"
 indistinguishable from "a person approved it". Content that failed the fact
 check **cannot be approved** at all.
+
+Validation and review live on each **variant**; the generation's own status is
+the worst of its variants, so a list can show "needs attention" without loading
+all six.
+
+### Editing
+
+An agent can rewrite any variant. The edit is re-validated and the issues are
+shown, but they **do not block** — the validator exists to stop the *model*
+inventing, not to stop a licensed agent writing a sentence they can stand
+behind, and they may well know something the listing does not record. The
+variant is marked `is_edited`, the original is kept for comparison, and it
+returns to *draft*: an approval that referred to different words than the ones
+now on screen would be worthless.
 
 ### Generation is never a side effect
 
@@ -531,8 +579,11 @@ survives for prompt comparison and audit.
 | GET | `/api/ai-content/?listing=N` | history for a listing |
 | GET | `/api/ai-content/{id}/` | full record, including the facts used |
 | GET | `/api/ai-content/{id}/status/` | small payload, for polling |
-| POST | `/api/ai-content/{id}/review/` | agent approves or discards |
+| POST | `/api/ai-content/{id}/review-all/` | one decision across variants; skips what failed |
 | GET | `/api/ai-content/usage/` | token and cost totals, scoped |
+| GET | `/api/ai-content-variants/?generation=N` | the individual variants |
+| POST | `/api/ai-content-variants/{id}/edit/` | rewrite one variant, re-validated |
+| POST | `/api/ai-content-variants/{id}/review/` | approve or discard one variant |
 
 Cost is recorded per generation — including for rejected ones, since they were
 still billed. Prices are configured in settings and overridable by env, because
@@ -551,10 +602,16 @@ docker compose exec backend python manage.py ai_sample_run --offline   # harness
 
 Runs 15 sample listings — chosen to probe the edges, including several
 deliberately sparse ones where a model is most tempted to invent — and writes
-`backend/ai_sample_run.md` for you to read. The sample listings are created in a
-transaction that is rolled back, so a review run leaves no rows behind.
-`--offline` uses a canned response to check the harness without a key or a bill;
-it tells you nothing about quality.
+`backend/ai_sample_run.md` for you to read: all six variants per listing, with
+their validation results. 90 pieces of copy in one file.
+
+Worth checking as you read: whether the six formats actually read differently
+from each other. If they are near-identical, the prompt is not earning its
+variants and the extra output tokens are wasted.
+
+The sample listings are created in a transaction that is rolled back, so a
+review run leaves no rows behind. `--offline` uses a canned response to check
+the harness without a key or a bill; it tells you nothing about quality.
 
 ### Token storage — the important part
 
@@ -750,7 +807,7 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-338 tests. The suite runs against a throwaway database, uses an in-memory
+375 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
 layer, the render tests stub the renderer service and the AI tests stub the
@@ -790,6 +847,9 @@ provider, so no test touches the network, needs a browser, or spends money.
   should pass and copy it should catch.
 - `ai_content/test_api.py` — job dispatch and polling, review, scoping, usage
   totals, and that reads never trigger generation.
+- `ai_content/test_variants.py` — one call producing all six formats, each rule
+  firing on the format it was poisoned in, per-variant review and editing, and
+  that one rejected variant does not spoil a good one.
 
 ### Celery
 

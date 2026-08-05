@@ -372,7 +372,10 @@ AUTH_COOKIE_DOMAIN = env("AUTH_COOKIE_DOMAIN", default="")
 OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
 OPENAI_MODEL = env("OPENAI_MODEL", default="gpt-4o-mini")
 OPENAI_TEMPERATURE = env.float("OPENAI_TEMPERATURE", default=0.7)
-OPENAI_MAX_OUTPUT_TOKENS = env.int("OPENAI_MAX_OUTPUT_TOKENS", default=700)
+# Sized for the full content pack (six formats in one response), not a single
+# caption. Too low and the JSON is truncated mid-object, which the client
+# rejects outright rather than storing half a sentence.
+OPENAI_MAX_OUTPUT_TOKENS = env.int("OPENAI_MAX_OUTPUT_TOKENS", default=1500)
 OPENAI_TIMEOUT_SECONDS = env.float("OPENAI_TIMEOUT_SECONDS", default=45.0)
 OPENAI_MAX_RETRIES = env.int("OPENAI_MAX_RETRIES", default=2)
 

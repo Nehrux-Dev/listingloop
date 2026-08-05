@@ -28,15 +28,20 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
-from apps.ai_content.models import GeneratedContent, ReviewStatus
-from apps.ai_content.permissions import GeneratedContentPermission
+from apps.ai_content.models import ContentVariant, GeneratedContent, ReviewStatus
+from apps.ai_content.permissions import (
+    ContentVariantPermission,
+    GeneratedContentPermission,
+)
 from apps.ai_content.serializers import (
+    ContentVariantSerializer,
     GeneratedContentSerializer,
     GeneratedContentStatusSerializer,
     GenerateRequestSerializer,
     ReviewSerializer,
+    VariantEditSerializer,
 )
-from apps.ai_content.services import create_generation
+from apps.ai_content.services import apply_variant_edit, create_generation
 from apps.ai_content.tasks import generate_content
 
 logger = logging.getLogger(__name__)
@@ -49,8 +54,10 @@ class GeneratedContentViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated, GeneratedContentPermission]
 
     def get_queryset(self) -> QuerySet[GeneratedContent]:
-        queryset = GeneratedContent.objects.for_user(self.request.user).select_related(
-            "listing", "listing__agent"
+        queryset = (
+            GeneratedContent.objects.for_user(self.request.user)
+            .select_related("listing", "listing__agent")
+            .prefetch_related("variants")
         )
 
         listing_id = self.request.query_params.get("listing")
@@ -139,6 +146,41 @@ class GeneratedContentViewSet(viewsets.ReadOnlyModelViewSet):
         )
         return Response(self.get_serializer(generation).data)
 
+    @action(detail=True, methods=["post"], url_path="review-all")
+    def review_all(self, request: Request, pk=None) -> Response:
+        """Apply one decision to every variant that can take it.
+
+        A convenience for "these are all fine", not a replacement for
+        per-variant review: variants that failed the fact check are skipped
+        rather than swept along, and the response says how many.
+        """
+        generation = self.get_object()
+        serializer = ReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        decision = serializer.validated_data["decision"]
+
+        applied, skipped = 0, 0
+        for variant in generation.variants.all():
+            if decision == ReviewStatus.APPROVED and not variant.is_usable:
+                skipped += 1
+                continue
+            variant.review_status = decision
+            variant.reviewed_at = timezone.now()
+            variant.reviewed_by = request.user
+            variant.save(
+                update_fields=["review_status", "reviewed_at", "reviewed_by", "updated_at"]
+            )
+            applied += 1
+
+        generation.refresh_from_db()
+        return Response(
+            {
+                "applied": applied,
+                "skipped": skipped,
+                "generation": self.get_serializer(generation).data,
+            }
+        )
+
     @action(detail=False, methods=["get"], url_path="usage")
     def usage(self, request: Request) -> Response:
         """Token and cost totals for whatever the caller can see."""
@@ -163,3 +205,87 @@ class GeneratedContentViewSet(viewsets.ReadOnlyModelViewSet):
                 },
             }
         )
+
+
+class ContentVariantViewSet(viewsets.ReadOnlyModelViewSet):
+    """Individual variants: read, edit, review.
+
+    Separate from the generation so an agent can act on one piece of copy at a
+    time — approve the Instagram caption, rewrite the LinkedIn one, discard the
+    property description — without touching the others.
+    """
+
+    serializer_class = ContentVariantSerializer
+    permission_classes = [IsAuthenticated, ContentVariantPermission]
+
+    def get_queryset(self) -> QuerySet[ContentVariant]:
+        generations = GeneratedContent.objects.for_user(self.request.user)
+        queryset = ContentVariant.objects.filter(
+            generation__in=generations
+        ).select_related("generation", "generation__listing", "generation__listing__agent")
+
+        generation_id = self.request.query_params.get("generation")
+        if generation_id and generation_id.isdigit():
+            queryset = queryset.filter(generation_id=int(generation_id))
+        return queryset
+
+    @action(detail=True, methods=["post"], url_path="edit")
+    def edit(self, request: Request, pk=None) -> Response:
+        """Rewrite one variant.
+
+        The edit is re-validated and any issues are returned, but they do not
+        block: the fact check exists to stop the model inventing, not to stop a
+        licensed agent writing a sentence they can stand behind. Editing also
+        returns the variant to draft — an approval that referred to different
+        words than the ones now on screen would be worthless.
+        """
+        variant = self.get_object()
+        serializer = VariantEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if variant.is_hashtags:
+            items = serializer.validated_data.get("items")
+            if items is None:
+                return Response(
+                    {"items": ["This variant is a hashtag list; send 'items'."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            apply_variant_edit(variant, items=items, user=request.user)
+        else:
+            text = serializer.validated_data.get("text")
+            if text is None:
+                return Response(
+                    {"text": ["This variant is prose; send 'text'."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            apply_variant_edit(variant, text=text, user=request.user)
+
+        return Response(self.get_serializer(variant).data)
+
+    @action(detail=True, methods=["post"], url_path="review")
+    def review(self, request: Request, pk=None) -> Response:
+        """Approve or discard this one variant."""
+        variant = self.get_object()
+        serializer = ReviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        decision = serializer.validated_data["decision"]
+
+        if decision == ReviewStatus.APPROVED and not variant.is_usable:
+            return Response(
+                {
+                    "detail": (
+                        "This variant cannot be approved: it failed the fact check "
+                        "against the listing. Edit it, or regenerate."
+                    ),
+                    "validation_issues": variant.validation_issues,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        variant.review_status = decision
+        variant.reviewed_at = timezone.now()
+        variant.reviewed_by = request.user
+        variant.save(
+            update_fields=["review_status", "reviewed_at", "reviewed_by", "updated_at"]
+        )
+        return Response(self.get_serializer(variant).data)

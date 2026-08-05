@@ -19,13 +19,24 @@ from apps.ai_content.client import (
 )
 from apps.ai_content.models import (
     ContentKind,
+    ContentVariant,
     GeneratedContent,
     JobStatus,
     ValidationStatus,
+    VariantKind,
+    VARIANT_ORDER,
 )
 from apps.ai_content.prompts import PROMPT_VERSION, RESPONSE_SCHEMA, build_messages
-from apps.ai_content.validation import validate_generation
+from apps.ai_content.validation import validate_hashtags, validate_text
 from apps.listings.models import Listing
+
+#: Worst-first, so a generation's headline status reflects its worst variant.
+_STATUS_SEVERITY = {
+    ValidationStatus.REJECTED: 3,
+    ValidationStatus.FLAGGED: 2,
+    ValidationStatus.PASSED: 1,
+    ValidationStatus.PENDING: 0,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +62,7 @@ def create_generation(listing: Listing, user, *, tone: str = "") -> GeneratedCon
     return GeneratedContent.objects.create(
         listing=listing,
         requested_by=user if getattr(user, "is_authenticated", False) else None,
-        kind=ContentKind.SOCIAL_CAPTION,
+        kind=ContentKind.CONTENT_PACK,
         job_status=JobStatus.QUEUED,
         prompt_version=PROMPT_VERSION,
         prompt_facts={"tone": tone} if tone else {},
@@ -107,41 +118,145 @@ def run_generation(generation: GeneratedContent, *, completion_fn=None) -> Gener
     generation.estimated_cost_usd = result.estimated_cost_usd
     generation.duration_ms = result.duration_ms
 
-    report = validate_generation(result.payload, listing, facts)
-    generation.validation_status = report.status
-    generation.validation_issues = report.as_list()
+    variants = _store_variants(generation, result.payload, listing, facts)
 
-    caption = (result.payload.get("caption") or "").strip()
-    hashtags = result.payload.get("hashtags") or []
+    # The generation's own status is the worst of its variants, so a listing
+    # index can show "needs attention" without loading every variant. Each
+    # variant is still independently usable — one bad LinkedIn caption does
+    # not spoil the Instagram one.
+    generation.validation_status = max(
+        (variant.validation_status for variant in variants),
+        key=lambda status: _STATUS_SEVERITY.get(status, 0),
+        default=ValidationStatus.PENDING,
+    )
+    generation.validation_issues = [
+        {**issue, "variant": variant.kind}
+        for variant in variants
+        for issue in variant.validation_issues
+    ]
 
-    if report.rejected:
-        # The words are kept for debugging but NOT in the fields the UI renders
-        # as copy, so an invented claim cannot be copied out by accident.
-        generation.caption = ""
-        generation.hashtags = []
-        generation.rejected_output = {
-            "caption": caption,
-            "hashtags": hashtags,
-            "facts_used": result.payload.get("facts_used", []),
-        }
-    else:
-        generation.caption = caption
-        generation.hashtags = [tag for tag in hashtags if isinstance(tag, str)]
-        generation.rejected_output = {}
+    # `caption` and `hashtags` on the parent mirror the Instagram variant and
+    # the hashtag set, for callers that just want the simple case. They follow
+    # the same rule as everywhere else: rejected copy never lands in them.
+    instagram = next(
+        (v for v in variants if v.kind == VariantKind.INSTAGRAM_CAPTION), None
+    )
+    tags = next((v for v in variants if v.kind == VariantKind.HASHTAGS), None)
 
+    generation.caption = instagram.text if instagram and instagram.is_usable else ""
+    generation.hashtags = list(tags.items) if tags and tags.is_usable else []
+    generation.rejected_output = {
+        variant.kind: variant.rejected_items if variant.is_hashtags else variant.rejected_text
+        for variant in variants
+        if variant.validation_status == ValidationStatus.REJECTED
+    }
+
+    generation.kind = ContentKind.CONTENT_PACK
     generation.job_status = JobStatus.READY
     generation.finished_at = timezone.now()
     generation.save()
 
     logger.info(
-        "Generation %s for listing %s: %s (%s tokens, $%s)",
+        "Generation %s for listing %s: %s, %s/%s variants usable (%s tokens, $%s)",
         generation.pk,
         listing.pk,
         generation.validation_status,
+        sum(1 for variant in variants if variant.is_usable),
+        len(variants),
         generation.total_tokens,
         generation.estimated_cost_usd,
     )
     return generation
+
+
+def _store_variants(generation, payload: dict, listing, facts: dict) -> list[ContentVariant]:
+    """Validate and persist every variant in one response.
+
+    Each variant is checked on its own, by the same rules, so a rejection names
+    the format that caused it rather than condemning the whole pack.
+    """
+    generation.variants.all().delete()  # regeneration replaces, never appends
+    variants: list[ContentVariant] = []
+
+    for kind in VARIANT_ORDER:
+        if kind == VariantKind.HASHTAGS:
+            raw = payload.get("hashtags") or []
+            report = validate_hashtags(raw, listing, facts)
+            items = [tag for tag in raw if isinstance(tag, str)]
+            variant = ContentVariant(
+                generation=generation,
+                kind=kind,
+                validation_status=report.status,
+                validation_issues=report.as_list(),
+            )
+            if report.rejected:
+                variant.items = []
+                variant.rejected_items = items
+            else:
+                variant.items = items
+        else:
+            text = (payload.get(kind) or "").strip()
+            report = validate_text(text, listing, facts, label=kind)
+            variant = ContentVariant(
+                generation=generation,
+                kind=kind,
+                validation_status=report.status,
+                validation_issues=report.as_list(),
+                original_text=text,
+            )
+            if report.rejected:
+                variant.text = ""
+                variant.rejected_text = text
+            else:
+                variant.text = text
+
+        variant.save()
+        variants.append(variant)
+
+    return variants
+
+
+def apply_variant_edit(variant: ContentVariant, *, text: str = "", items=None, user=None):
+    """Record an agent's edit and re-validate the result.
+
+    Re-validating an edit is advisory rather than blocking: the validator
+    exists to stop the *model* inventing things, and a licensed agent writing a
+    sentence may well know something the listing does not record. They still
+    see the warnings, and ``is_edited`` records whose words these now are.
+
+    Editing returns the variant to draft — an approval applied to different
+    words than the ones on screen would be worthless.
+    """
+    from django.utils import timezone as tz
+
+    listing = variant.generation.listing
+    facts = {
+        key: value
+        for key, value in (variant.generation.prompt_facts or {}).items()
+        if key != "tone"
+    }
+
+    if variant.is_hashtags:
+        items = [tag for tag in (items or []) if isinstance(tag, str)]
+        report = validate_hashtags(items, listing, facts)
+        variant.items = items
+        variant.rejected_items = []
+    else:
+        report = validate_text(text, listing, facts, label=variant.kind)
+        if not variant.original_text:
+            variant.original_text = variant.text or variant.rejected_text
+        variant.text = text
+        variant.rejected_text = ""
+
+    variant.validation_status = report.status
+    variant.validation_issues = report.as_list()
+    variant.is_edited = True
+    variant.edited_at = tz.now()
+    variant.review_status = "draft"
+    variant.reviewed_at = None
+    variant.reviewed_by = None
+    variant.save()
+    return variant
 
 
 def generate_for_listing(listing: Listing, user, *, tone: str = "", completion_fn=None):
@@ -162,6 +277,7 @@ def latest_usable_for_listing(listing: Listing) -> GeneratedContent | None:
 __all__ = [
     "ListingNotUsable",
     "ValidationStatus",
+    "apply_variant_edit",
     "create_generation",
     "generate_for_listing",
     "latest_usable_for_listing",

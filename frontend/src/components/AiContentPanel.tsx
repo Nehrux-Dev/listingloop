@@ -16,11 +16,13 @@ import {
   fetchContentForListing,
   fetchContentStatus,
   requestGeneration,
-  reviewContent,
+  reviewAllVariants,
+  type ContentVariant,
   type GeneratedContent,
 } from '../api/aiContent.ts'
 import { ApiError } from '../lib/apiClient.ts'
 import { Alert, Card } from './FormControls.tsx'
+import { VariantCard } from './VariantCard.tsx'
 
 const POLL_INTERVAL_MS = 2000
 const POLL_TIMEOUT_MS = 120000
@@ -30,13 +32,6 @@ const VALIDATION_BADGE: Record<string, string> = {
   flagged: 'bg-amber-50 text-amber-700 ring-amber-200',
   rejected: 'bg-rose-50 text-rose-700 ring-rose-200',
   pending: 'bg-slate-100 text-slate-600 ring-slate-200',
-}
-
-const VALIDATION_LABEL: Record<string, string> = {
-  passed: 'Fact check passed',
-  flagged: 'Passed with warnings',
-  rejected: 'Rejected — unverifiable claims',
-  pending: 'Not checked',
 }
 
 export function AiContentPanel({
@@ -117,10 +112,36 @@ export function AiContentPanel({
     }
   }
 
-  async function handleReview(id: number, decision: 'approved' | 'rejected') {
+  function handleVariantChanged(generationId: number, updated: ContentVariant) {
+    setItems((current) =>
+      current.map((item) =>
+        item.id === generationId
+          ? {
+              ...item,
+              variants: item.variants.map((variant) =>
+                variant.id === updated.id ? updated : variant,
+              ),
+              usable_variant_count: item.variants.filter((variant) =>
+                variant.id === updated.id ? updated.is_usable : variant.is_usable,
+              ).length,
+            }
+          : item,
+      ),
+    )
+  }
+
+  async function handleReviewAll(id: number, decision: 'approved' | 'rejected') {
     try {
-      const updated = await reviewContent(id, decision)
-      setItems((current) => current.map((item) => (item.id === id ? updated : item)))
+      const result = await reviewAllVariants(id, decision)
+      setItems((current) =>
+        current.map((item) => (item.id === id ? result.generation : item)),
+      )
+      if (result.skipped > 0) {
+        setError(
+          `${result.applied} approved. ${result.skipped} skipped — those failed the ` +
+            `fact check and need editing or regenerating.`,
+        )
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not record that decision.')
     }
@@ -177,7 +198,12 @@ export function AiContentPanel({
       </div>
 
       {items.map((item) => (
-        <GenerationCard key={item.id} item={item} onReview={handleReview} />
+        <GenerationCard
+          key={item.id}
+          item={item}
+          onVariantChanged={(variant) => handleVariantChanged(item.id, variant)}
+          onReviewAll={(decision) => void handleReviewAll(item.id, decision)}
+        />
       ))}
     </Card>
   )
@@ -185,15 +211,13 @@ export function AiContentPanel({
 
 function GenerationCard({
   item,
-  onReview,
+  onVariantChanged,
+  onReviewAll,
 }: {
   item: GeneratedContent
-  onReview: (id: number, decision: 'approved' | 'rejected') => void
+  onVariantChanged: (variant: ContentVariant) => void
+  onReviewAll: (decision: 'approved' | 'rejected') => void
 }) {
-  const rejected = item.validation_status === 'rejected'
-  const caption = item.caption || item.rejected_output?.caption || ''
-  const hashtags = item.hashtags.length > 0 ? item.hashtags : (item.rejected_output?.hashtags ?? [])
-
   if (item.job_status === 'queued' || item.job_status === 'running') {
     return (
       <div className="rounded-md border border-slate-200 p-3 text-sm text-slate-500">
@@ -210,73 +234,49 @@ function GenerationCard({
     )
   }
 
+  const usable = item.usable_variant_count
+  const total = item.variants.length
+
   return (
-    <div className="space-y-2 rounded-md border border-slate-200 p-3">
+    <div className="space-y-3 rounded-md border border-slate-200 p-3">
       <div className="flex flex-wrap items-center gap-2">
         <span
           className={`rounded-full px-2 py-0.5 text-xs font-medium ring-1 ${
             VALIDATION_BADGE[item.validation_status]
           }`}
         >
-          {VALIDATION_LABEL[item.validation_status]}
+          {usable} of {total} ready to use
         </span>
-        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-          {item.review_status}
+        <span className="text-[11px] text-slate-400">
+          {new Date(item.created_at).toLocaleString()}
         </span>
         <span className="ml-auto text-[11px] text-slate-400">
           {item.model_name} · {item.total_tokens} tokens · ${item.estimated_cost_usd}
         </span>
       </div>
 
-      {rejected && (
-        <p className="rounded-md bg-rose-50 px-2 py-1 text-xs text-rose-700">
-          This copy was not stored as usable. It is shown so you can see what went
-          wrong — do not publish it.
-        </p>
-      )}
+      {/* One call produced all of these — the cost above covers the whole pack. */}
+      <div className="space-y-2">
+        {item.variants.map((variant) => (
+          <VariantCard key={variant.id} variant={variant} onChanged={onVariantChanged} />
+        ))}
+      </div>
 
-      <p className={`text-sm ${rejected ? 'text-slate-400 line-through' : 'text-slate-800'}`}>
-        {caption || '(no caption)'}
-      </p>
-
-      {hashtags.length > 0 && (
-        <p className={`text-xs ${rejected ? 'text-slate-400' : 'text-slate-500'}`}>
-          {hashtags.join(' ')}
-        </p>
-      )}
-
-      {item.validation_issues.length > 0 && (
-        <ul className="space-y-1">
-          {item.validation_issues.map((issue, index) => (
-            <li
-              key={index}
-              className={`text-xs ${
-                issue.severity === 'error' ? 'text-rose-700' : 'text-amber-700'
-              }`}
-            >
-              <span className="font-medium uppercase">{issue.severity}</span> — {issue.message}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {item.review_status === 'draft' && (
-        <div className="flex gap-2">
+      {item.variants.some((variant) => variant.review_status === 'draft') && (
+        <div className="flex gap-2 border-t border-slate-100 pt-2">
           <button
             type="button"
-            disabled={!item.is_usable}
-            onClick={() => onReview(item.id, 'approved')}
-            title={item.is_usable ? undefined : 'Content that failed the fact check cannot be approved'}
-            className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => onReviewAll('approved')}
+            className="rounded-md border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 transition hover:bg-emerald-50"
           >
-            Approve
+            Approve all that passed
           </button>
           <button
             type="button"
-            onClick={() => onReview(item.id, 'rejected')}
+            onClick={() => onReviewAll('rejected')}
             className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-50"
           >
-            Discard
+            Discard all
           </button>
         </div>
       )}

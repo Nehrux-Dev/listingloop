@@ -4,8 +4,67 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
-from apps.ai_content.models import GeneratedContent
+from apps.ai_content.models import ContentVariant, GeneratedContent
 from apps.listings.models import Listing
+
+
+class ContentVariantSerializer(serializers.ModelSerializer):
+    """One reviewable piece of copy."""
+
+    kind_display = serializers.CharField(source="get_kind_display", read_only=True)
+    display_text = serializers.CharField(read_only=True)
+    is_usable = serializers.BooleanField(read_only=True)
+    error_count = serializers.SerializerMethodField()
+    warning_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ContentVariant
+        fields = (
+            "id",
+            "generation",
+            "kind",
+            "kind_display",
+            "text",
+            "items",
+            "rejected_text",
+            "rejected_items",
+            "display_text",
+            "validation_status",
+            "validation_issues",
+            "error_count",
+            "warning_count",
+            "review_status",
+            "reviewed_at",
+            "is_usable",
+            "is_edited",
+            "original_text",
+            "edited_at",
+        )
+        read_only_fields = fields
+
+    def get_error_count(self, obj: ContentVariant) -> int:
+        return sum(1 for issue in obj.validation_issues if issue.get("severity") == "error")
+
+    def get_warning_count(self, obj: ContentVariant) -> int:
+        return sum(1 for issue in obj.validation_issues if issue.get("severity") == "warning")
+
+
+class VariantEditSerializer(serializers.Serializer):
+    """An agent rewriting one variant.
+
+    ``text`` for prose variants, ``items`` for hashtags. The server picks based
+    on the variant's kind rather than trusting which field arrived.
+    """
+
+    text = serializers.CharField(required=False, allow_blank=True, max_length=4000)
+    items = serializers.ListField(
+        child=serializers.CharField(max_length=80), required=False, max_length=30
+    )
+
+    def validate(self, attrs: dict) -> dict:
+        if "text" not in attrs and "items" not in attrs:
+            raise serializers.ValidationError("Send either 'text' or 'items'.")
+        return attrs
 
 
 class GeneratedContentSerializer(serializers.ModelSerializer):
@@ -21,6 +80,8 @@ class GeneratedContentSerializer(serializers.ModelSerializer):
     listing_address = serializers.CharField(source="listing.full_address", read_only=True)
     error_count = serializers.SerializerMethodField()
     warning_count = serializers.SerializerMethodField()
+    variants = ContentVariantSerializer(many=True, read_only=True)
+    usable_variant_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = GeneratedContent
@@ -29,6 +90,8 @@ class GeneratedContentSerializer(serializers.ModelSerializer):
             "listing",
             "listing_address",
             "kind",
+            "variants",
+            "usable_variant_count",
             "job_status",
             "error_message",
             "caption",
