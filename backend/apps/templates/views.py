@@ -272,6 +272,8 @@ class DesignViewSet(viewsets.ModelViewSet):
         Used by the editor. Throttled because every call occupies a browser
         page, and the pool is intentionally small.
         """
+        # Preview deliberately does NOT require a complete profile: seeing what
+        # is missing is exactly why an agent previews. Export is the gate.
         design = self.get_object()
         dimension_key = request.data.get("dimension", DEFAULT_DIMENSION)
         if dimension_key not in SOCIAL_DIMENSIONS:
@@ -296,6 +298,25 @@ class DesignViewSet(viewsets.ModelViewSet):
         )
 
     preview.throttle_scope = "render"
+
+    @action(detail=True, methods=["get"], url_path="readiness")
+    def readiness(self, request: Request, pk=None) -> Response:
+        """What this design still needs, without trying to export it.
+
+        The editor calls this so an agent sees the gaps while they are working,
+        rather than meeting them at the export button.
+        """
+        from apps.templates.readiness import assess_design
+
+        design = self.get_object()
+        missing = assess_design(design, build_context(design))
+        return Response(
+            {
+                "ready": not missing,
+                "missing": [item.as_dict() for item in missing],
+                "steps": sorted({item.step for item in missing}),
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="compliance")
     def compliance(self, request: Request, pk=None) -> Response:
@@ -327,10 +348,21 @@ class DesignViewSet(viewsets.ModelViewSet):
         """
         from apps.compliance.engine import evaluate_and_store
         from apps.compliance.subjects import from_design
+        from apps.templates.readiness import DesignNotReadyError, require_design_ready
 
         design = self.get_object()
         serializer = DesignExportRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        # Before anything is rendered: an asset with a blank space where the
+        # brokerage logo belongs is worse than a clear refusal naming the
+        # missing field, because the blank one may not be noticed until it is
+        # published. Judged against THIS design's elements, so a template that
+        # never shows a logo is never blocked for the want of one.
+        try:
+            require_design_ready(design, build_context(design))
+        except DesignNotReadyError as exc:
+            return Response(exc.as_dict(), status=status.HTTP_409_CONFLICT)
 
         report, _evaluation = evaluate_and_store(from_design(design), design=design)
 

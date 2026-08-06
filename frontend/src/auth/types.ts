@@ -22,9 +22,17 @@ export const ROLE_LABELS: Record<Role, string> = {
 export type User = {
   id: number
   email: string
+  first_name: string
+  last_name: string
   full_name: string
   role: Role
   role_display: string
+  /**
+   * True when this user administers at least one brokerage — which an Agent
+   * does if they created their firm during onboarding. Separate from `role`
+   * on purpose: administering one brokerage is not a rank.
+   */
+  administers_brokerage: boolean
   is_active: boolean
   date_joined: string
 }

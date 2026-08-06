@@ -131,6 +131,16 @@ class ExportGateTests(TemplateAPITestCase):
         self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
         self.template = self.make_template()
         self.listing = self.make_verified_listing(self.profile, self.agent)
+        # The template marks its hero photo required, and the export readiness
+        # check refuses to render an element that would come out blank — so a
+        # listing used for export tests needs a photo, exactly as a real one
+        # would.
+        from apps.accounts.tests.base import make_image_file
+        from apps.listings.models import ListingPhoto
+
+        ListingPhoto.objects.create(
+            listing=self.listing, image=make_image_file("hero.png"), order=0
+        )
         self.design = self.make_design(self.template, self.profile, self.listing)
         self.authenticate_as(self.agent)
 

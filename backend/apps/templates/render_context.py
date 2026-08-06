@@ -59,46 +59,80 @@ def build_context(design) -> dict[str, Any]:
     Every value is plain data by the time it leaves here, so the HTML builder
     never touches the ORM and the whole context can be logged or cached.
     """
-    agent = design.agent
-    brokerage = agent.brokerage
-    listing = design.listing
+    # Thin wrapper: a Design is just an (agent, property) pair with overrides,
+    # so it unwraps to the shared resolver rather than duplicating it. Two
+    # implementations of "what data does a template get" would drift.
+    return build_template_context(design.agent, design.listing)
 
-    # An agent's own kit wins; the brokerage kit is the fallback so a design
-    # is never unbranded.
+
+def build_template_context(agent, listing=None) -> dict[str, Any]:
+    """Assemble template data from an agent and (optionally) a property.
+
+    The reusable entry point: templates never query the database themselves,
+    they are handed this. Callers are ``build_context`` (which has a Design and
+    unwraps it) and anything else that needs the same data without one.
+
+    Shape::
+
+        {"agent": {...}, "brokerage": {...}, "brand": {...}, "property": {...}}
+
+    ``brand`` falls back from the agent's own kit to their brokerage's, which
+    is what makes onboarding worth doing once: an agent who never sets personal
+    colours still gets branded material.
+
+    ``property`` is ``{}`` when no listing is given — seasonal and agent-led
+    templates have none, and every consumer already treats a missing key as
+    "not available" rather than an error.
+    """
+    brokerage = agent.brokerage
     brand_kit = getattr(agent, "brand_kit", None) or (
         getattr(brokerage, "brand_kit", None) if brokerage else None
     )
 
     context: dict[str, Any] = {
         "agent": {
-            "name": agent.name,
+            # full_name is the spec's placeholder name; `name` is what the
+            # existing templates already use. Both point at the same value
+            # rather than one becoming subtly stale.
+            "full_name": agent.name or agent.user.full_name,
+            "name": agent.name or agent.user.full_name,
+            "first_name": agent.user.first_name,
+            "last_name": agent.user.last_name,
             "job_title": agent.job_title,
             "phone": agent.phone,
-            "email": agent.email,
+            "email": agent.email or agent.user.email,
             "tagline": agent.tagline,
+            "licence_number": agent.licence_number,
             "photo": file_to_data_uri(agent.photo),
         },
         "brokerage": {
             "name": brokerage.name if brokerage else "",
             "phone": brokerage.phone if brokerage else "",
             "website": brokerage.website if brokerage else "",
+            "licence_number": brokerage.licence_number if brokerage else "",
+            # Both spellings: `disclaimer` is the spec's placeholder,
+            # `required_disclaimer` is the existing field name.
+            "disclaimer": brokerage.required_disclaimer if brokerage else "",
             "required_disclaimer": brokerage.required_disclaimer if brokerage else "",
             "logo": file_to_data_uri(brokerage.logo) if brokerage else None,
         },
-        "brand_kit": {
+        "brand": {
             "primary_color": brand_kit.primary_color if brand_kit else "#1F2937",
             "secondary_color": brand_kit.secondary_color if brand_kit else "#4B5563",
             "accent_color": brand_kit.accent_color if brand_kit else "#2563EB",
+            # `font` is the spec's single placeholder; the model distinguishes
+            # heading from body, and the heading face is the brand signature.
+            "font": brand_kit.heading_font if brand_kit else "Inter",
             "heading_font": brand_kit.heading_font if brand_kit else "Inter",
             "body_font": brand_kit.body_font if brand_kit else "Inter",
             "design_style": brand_kit.design_style if brand_kit else "modern",
         },
-        "listing": {},
+        "property": {},
     }
 
     if listing is not None:
         photos = list(listing.photos.all()[:6])
-        context["listing"] = {
+        context["property"] = {
             "address": listing.address,
             "city": listing.city,
             "state": listing.state,
@@ -112,13 +146,21 @@ def build_context(design) -> dict[str, Any]:
             "bedrooms": listing.bedrooms,
             "bathrooms": _decimal(listing.bathrooms),
             "square_footage": listing.square_footage,
-            "property_type": listing.get_property_type_display() if listing.property_type else "",
+            "property_type": (
+                listing.get_property_type_display() if listing.property_type else ""
+            ),
             "features": list(listing.features or []),
             "description": listing.description,
+            "main_photo": file_to_data_uri(photos[0].image) if photos else None,
             "photo": file_to_data_uri(photos[0].image) if photos else None,
             "photos": [file_to_data_uri(photo.image) for photo in photos],
         }
 
+    # `brand_kit` and `listing` are kept as aliases so templates authored
+    # against the original key names keep resolving. One dict, two names — not
+    # two dicts that can drift apart.
+    context["brand_kit"] = context["brand"]
+    context["listing"] = context["property"]
     return context
 
 

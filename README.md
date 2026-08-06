@@ -90,6 +90,10 @@ administrator, so every screen has something to show.
 Sign in at http://localhost:5173/login. The nav bar changes by role, and an
 Agent who types `/platform` into the address bar lands on `/forbidden`.
 
+To walk the new-agent path instead, register at
+http://localhost:5173/register — that leads into the onboarding wizard rather
+than straight to the dashboard.
+
 ---
 
 ## Authentication
@@ -126,6 +130,117 @@ out explicitly.
 
 ---
 
+## Agent registration and onboarding
+
+Sign-in already existed and was not touched. Registration is the path *to* it:
+
+```
+Register  →  Profile  →  Brokerage  →  Brand kit  →  Dashboard
+ step 1       step 2      step 3        step 4
+```
+
+Registration posts to the existing `/api/auth/register/` and returns a session,
+so the agent walks into step 2 already signed in rather than being bounced to
+the login form. Everything after step 1 writes through the profile endpoints
+from the section below — onboarding adds no second `User`, `AgentProfile`,
+`Brokerage` or `BrandKit` concept, and no second way to authenticate.
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| GET | `/api/onboarding/status/` | current step data plus what is missing |
+| GET | `/api/onboarding/brokerages/?search=` | directory lookup; **empty without a search term** |
+| POST | `/api/onboarding/brokerage/` | `{"brokerage": id}` to join, or `{"create": {...}}` |
+| POST | `/api/onboarding/complete/` | finish; creates the brand kit if skipped |
+| GET | `/api/onboarding/completion/` | just the numbers, for the dashboard badge |
+
+Frontend: [frontend/src/pages/RegisterPage.tsx](frontend/src/pages/RegisterPage.tsx)
+and [frontend/src/pages/OnboardingPage.tsx](frontend/src/pages/OnboardingPage.tsx)
+(`/register` is public; `/onboarding` sits inside `ProtectedRoute` but outside
+the app chrome, so the wizard is not competing with a nav bar).
+
+### Join before you create
+
+Step 3 searches the directory first and only offers "create a new brokerage"
+after that. Two rows for one firm would split its agents, its logo and its
+disclaimer between them, so a create whose name matches an existing one — after
+trimming and ignoring case — is refused rather than deduplicated later.
+
+The directory returns nothing without a search term. It is a lookup tool, and
+the payload is limited to name, logo and headcount: the things printed on a
+business card.
+
+Whoever creates a brokerage is added to its `admins`, because otherwise the
+firm exists with nobody able to maintain the logo and disclaimer its own
+exports are blocked on. They keep the Agent **role** — the grant is one
+brokerage, not a promotion. `/api/auth/me/` reports this as
+`administers_brokerage` so the nav and the `/brokerage` route guard can show
+them the screen; the server still checks `administers(user, brokerage)` on
+every write.
+
+### Completion is not readiness
+
+Two different questions, deliberately not conflated
+([backend/apps/accounts/onboarding.py](backend/apps/accounts/onboarding.py)):
+
+- **Completion** — a percentage across every field. Informational. Drives the
+  progress bar and the dashboard badge. Nothing is ever blocked by it.
+- **Readiness** — whether the specific things a marketing asset needs are
+  present. This one is a gate.
+
+An agent is allowed to finish onboarding with gaps and fill them in later from
+the settings pages. What they are not allowed to do is discover the gap for the
+first time in a published asset.
+
+### `build_template_context(agent, property)`
+
+One resolver builds what every template renders against
+([backend/apps/templates/render_context.py](backend/apps/templates/render_context.py)):
+
+```python
+{
+  "agent":     {name, job_title, phone, email, photo, tagline, licence_number},
+  "brokerage": {name, logo, required_disclaimer, phone, website},
+  "brand":     {primary_color, secondary_color, accent_color, fonts, style},
+  "property":  {address, price, bedrooms, ... } or None,
+}
+```
+
+`brand_kit` and `listing` are accepted as aliases and point at the same dicts,
+not copies. `property` is `None` for a seasonal card, which is why those work
+with no listing at all.
+
+Elements reference it either through `content_source` (`agent.phone`) or inline
+in text via `{{ agent.phone }}`. Both go through the same resolver, so an agent
+who fills in their profile once never types their own phone number into a
+template again.
+
+### The export gate
+
+Before an export renders, [backend/apps/templates/readiness.py](backend/apps/templates/readiness.py)
+walks that design's own elements and refuses with **409** if any would come out
+empty, naming the field and the step that fixes it:
+
+```json
+{
+  "detail": "This design is missing information it needs before it can be exported: Brokerage logo.",
+  "missing": [{"element": "brokerage_logo", "label": "Brokerage logo",
+               "step": "brokerage", "step_label": "Brokerage"}],
+  "steps": ["brokerage"]
+}
+```
+
+It is per-design, not per-profile, because the brief is *"if a template
+requires X"*. A profile-wide check would block a Diwali card for a missing
+listing photo and a listing card for a missing tagline — the kind of gate
+people learn to work around. A template that never shows a brokerage logo
+cannot be blocked for the want of one.
+
+`GET /api/designs/{id}/readiness/` answers the same question without
+exporting. **Preview is deliberately not gated** — seeing what is missing is
+exactly why an agent previews.
+
+---
+
 ## Profiles, brokerages and brand kits
 
 ### Models
@@ -141,7 +256,13 @@ and are re-exported from `apps.accounts.models`.
 
 Two relationships are deliberately kept separate: `AgentProfile.brokerage` is
 *membership*, `Brokerage.admins` is *administration*. A Brokerage Admin needs
-no agent profile, and an agent is not an admin of their own brokerage.
+no agent profile, and joining a brokerage does not make you an admin of it.
+
+Administration is a fact about one brokerage, not a rank. An agent who creates
+their firm during onboarding is added to that firm's `admins` and can maintain
+its logo and disclaimer — while keeping the Agent *role* and gaining nothing
+anywhere else. `BrokeragePermission` therefore checks `administers(user, obj)`
+per object rather than the caller's role.
 
 ### Endpoints
 
@@ -159,8 +280,9 @@ no agent profile, and an agent is not an admin of their own brokerage.
 | --- | --- | --- | --- |
 | Own profile | edit | — | edit any |
 | Colleagues' profiles | read | edit (own brokerage) | edit any |
-| Own brokerage | read | edit | edit any |
-| Create/delete a brokerage | no | no | yes |
+| Own brokerage | read (edit if they created it) | edit | edit any |
+| Create a brokerage | during onboarding only | no | yes |
+| Delete a brokerage | no | no | yes |
 | Own brand kit | edit | edit their agents' | edit any |
 | Brokerage brand kit | read | edit | edit any |
 
@@ -224,7 +346,7 @@ and any management command alike
 | ----- | --- | ---- |
 | `/profile` | agents | [ProfilePage.tsx](frontend/src/pages/ProfilePage.tsx) — details + photo upload |
 | `/brand-kit` | agents | [BrandKitPage.tsx](frontend/src/pages/BrandKitPage.tsx) — colours, fonts, style |
-| `/brokerage` | Brokerage Admin and above | [BrokeragePage.tsx](frontend/src/pages/BrokeragePage.tsx) — details, logo, disclaimer, agent list |
+| `/brokerage` | Brokerage Admin and above, plus any agent who administers one | [BrokeragePage.tsx](frontend/src/pages/BrokeragePage.tsx) — details, logo, disclaimer, agent list |
 
 The agent forms address `/me/` and `/mine/`, which resolve the record from the
 access token — there is no id in the URL or payload, so they structurally
@@ -938,6 +1060,8 @@ minutes.
 | [src/auth/tokenStore.ts](frontend/src/auth/tokenStore.ts) | in-memory access token |
 | [src/lib/apiClient.ts](frontend/src/lib/apiClient.ts) | fetch wrapper: bearer header, refresh-and-retry on 401 |
 | [src/pages/LoginPage.tsx](frontend/src/pages/LoginPage.tsx) | login form |
+| [src/pages/RegisterPage.tsx](frontend/src/pages/RegisterPage.tsx) | step 1; adopts the returned session and continues to `/onboarding` |
+| [src/pages/OnboardingPage.tsx](frontend/src/pages/OnboardingPage.tsx) | steps 2–4 wizard |
 
 Route guards decide what to *render*. They are not a security boundary — the
 server re-checks the role on every request.
@@ -999,6 +1123,8 @@ Notes:
 │       │   ├── serializers.py / profile_serializers.py
 │       │   ├── views.py         # register / login / refresh / logout / me
 │       │   ├── profile_views.py # brokerage / agent / brand-kit viewsets
+│       │   ├── onboarding.py    # completion vs readiness (two questions)
+│       │   ├── onboarding_views.py  # status / directory / brokerage / complete
 │       │   ├── signals.py       # profile provisioning, stored-file cleanup
 │       │   └── tests/
 │       ├── listings/        # property listings
@@ -1011,8 +1137,9 @@ Notes:
 │       ├── templates/       # template library, controlled editing, rendering
 │       │   ├── models.py        # Template, TemplateElement, Design, DesignExport
 │       │   ├── overrides.py     # permission enforcement (read this)
-│       │   ├── html_builder.py  # design -> HTML, fractional geometry
-│       │   ├── render_context.py# listing/agent/brand data for a design
+│       │   ├── html_builder.py  # design -> HTML, geometry, {{ placeholders }}
+│       │   ├── render_context.py# build_template_context(agent, property)
+│       │   ├── readiness.py     # per-design export gate (409 + which step)
 │       │   ├── rendering.py     # renderer client, export + storage
 │       │   ├── dimensions.py    # the four social sizes
 │       │   └── tests/
@@ -1043,8 +1170,9 @@ Notes:
         ├── auth/            # provider, guards, token store, API calls
         ├── components/      # AppLayout, shared form controls
         ├── lib/apiClient.ts # fetch wrapper: refresh-and-retry, multipart
-        └── pages/           # Login, Dashboard, Profile, BrandKit,
-                             #   Brokerage, Platform, Forbidden
+        └── pages/           # Login, Register, Onboarding, Dashboard,
+                             #   Profile, BrandKit, Brokerage, Listings,
+                             #   Templates, Designs, Platform, Forbidden
 ```
 
 Every domain app is wired up in
@@ -1100,7 +1228,7 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-556 tests. The suite runs against a throwaway database, uses an in-memory
+636 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
 layer, the render tests stub the renderer service and the AI tests stub the
@@ -1159,6 +1287,17 @@ provider, so no test touches the network, needs a browser, or spends money.
 - `ai_content/test_multilingual.py` — the fan-out, per-language storage, that
   numbers are still checked in every language, and that non-English output can
   never come back simply PASSED.
+- `accounts/test_onboarding.py` — registration with first/last names, the
+  join-or-create brokerage step including duplicate refusal, completion
+  arithmetic, and the permission boundary around a self-created brokerage: its
+  creator can maintain it, gains no role, and can touch nothing else.
+- `templates/test_readiness.py` — the export gate, weighted towards it *not*
+  over-firing: hidden and optional elements do not block, a template that never
+  shows a logo is not blocked for one, a seasonal design needs no listing, and
+  a missing listing photo is reported against the listing rather than the
+  brokerage.
+- `templates/test_template_context.py` — `build_template_context`, the alias
+  keys, `{{ placeholder }}` interpolation, and resolution with no listing.
 
 ### Celery
 

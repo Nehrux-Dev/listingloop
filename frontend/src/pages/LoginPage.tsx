@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth/AuthContext.tsx'
 import { ApiError } from '../lib/apiClient.ts'
@@ -103,6 +103,16 @@ export default function LoginPage() {
           >
             {submitting ? 'Signing in…' : 'Sign in'}
           </button>
+
+          <p className="text-center text-sm text-slate-500">
+            New here?{' '}
+            <Link
+              to="/register"
+              className="font-medium text-slate-800 underline underline-offset-2"
+            >
+              Register as an agent
+            </Link>
+          </p>
         </form>
       </div>
     </main>

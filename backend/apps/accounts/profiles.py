@@ -75,6 +75,12 @@ class Brokerage(TimeStampedModel):
     )
     website = models.URLField(_("website"), blank=True)
     phone = models.CharField(_("phone"), max_length=32, blank=True)
+    licence_number = models.CharField(
+        _("licence number"),
+        max_length=64,
+        blank=True,
+        help_text=_("Brokerage licence or registration number, where required."),
+    )
 
     admins = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
@@ -131,6 +137,15 @@ class AgentProfile(TimeStampedModel):
     email = models.EmailField(_("public email"), blank=True)
     job_title = models.CharField(_("job title"), max_length=120, blank=True)
     tagline = models.CharField(_("tagline"), max_length=255, blank=True)
+    #: Whether this is required is a jurisdiction question, not a code one, so
+    #: the field is optional here and the *completion* rules decide whether an
+    #: agent may generate marketing without it. See apps/accounts/onboarding.py.
+    licence_number = models.CharField(
+        _("licence number"),
+        max_length=64,
+        blank=True,
+        help_text=_("Agent licence or registration number, where required."),
+    )
 
     class Meta:
         verbose_name = _("agent profile")

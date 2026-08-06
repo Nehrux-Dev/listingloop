@@ -43,6 +43,13 @@ type AuthContextValue = {
   isAuthenticated: boolean
   login: (credentials: Credentials) => Promise<User>
   logout: () => Promise<void>
+  /**
+   * Adopt a session created outside `login` — registration, which returns a
+   * token and sets the refresh cookie itself. Without this the provider would
+   * still say 'unauthenticated' and the route guard would bounce a newly
+   * registered agent straight back to the sign-in page.
+   */
+  refresh: () => Promise<void>
   /** Exact-role check, for conditional UI. */
   hasRole: (...roles: Role[]) => boolean
   /** Hierarchical check, mirroring the backend's "or above" permissions. */
@@ -96,6 +103,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return loggedIn
   }, [])
 
+  const refresh = useCallback(async () => {
+    try {
+      const currentUser = await fetchCurrentUser()
+      setUser(currentUser)
+      setStatus('authenticated')
+    } catch {
+      clearAccessToken()
+      setUser(null)
+      setStatus('unauthenticated')
+    }
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       // Server-side revocation: blacklists the refresh token and expires the
@@ -117,6 +136,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isAuthenticated: status === 'authenticated' && user !== null,
       login,
       logout,
+      refresh,
       // Client-side role checks decide what to *render*. They are a UX
       // affordance, never a security boundary — the server re-checks the role
       // on every request, because anything in the browser can be edited.
@@ -124,7 +144,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       hasRoleAtLeast: (minimum: Role) =>
         user ? hasRoleAtLeast(user.role, minimum) : false,
     }),
-    [user, status, login, logout],
+    [user, status, login, logout, refresh],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

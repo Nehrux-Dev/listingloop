@@ -16,9 +16,11 @@ import ListingFormPage from './pages/ListingFormPage.tsx'
 import ListingImportPage from './pages/ListingImportPage.tsx'
 import ListingsPage from './pages/ListingsPage.tsx'
 import LoginPage from './pages/LoginPage.tsx'
+import OnboardingPage from './pages/OnboardingPage.tsx'
 import PlatformAdminPage from './pages/PlatformAdminPage.tsx'
 import ProfilePage from './pages/ProfilePage.tsx'
 import PublicListingPage from './pages/PublicListingPage.tsx'
+import RegisterPage from './pages/RegisterPage.tsx'
 import TemplateLibraryPage from './pages/TemplateLibraryPage.tsx'
 
 export default function App() {
@@ -32,11 +34,15 @@ export default function App() {
 
           {/* Public */}
           <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
           <Route path="/forbidden" element={<ForbiddenPage />} />
 
           {/* Everything below requires a session. Unauthenticated visitors are
               redirected to /login with the attempted path in location state. */}
           <Route element={<ProtectedRoute />}>
+            {/* Onboarding needs a session but not the app shell — it is the
+                bridge between registering and having a usable workspace. */}
+            <Route path="/onboarding" element={<OnboardingPage />} />
             <Route element={<AppLayout />}>
               <Route index element={<DashboardPage />} />
 
@@ -60,8 +66,18 @@ export default function App() {
               <Route path="designs" element={<DesignsPage />} />
               <Route path="designs/:id" element={<DesignEditorPage />} />
 
-              {/* Hierarchical guard: Brokerage Admins and Nehrux Admins. */}
-              <Route element={<RequireRole minimumRole={ROLES.BROKERAGE_ADMIN} />}>
+              {/* Hierarchical guard: Brokerage Admins and Nehrux Admins —
+                  plus any agent who created their own firm during onboarding
+                  and therefore administers it. The server independently checks
+                  `administers(user, brokerage)` on every write. */}
+              <Route
+                element={
+                  <RequireRole
+                    minimumRole={ROLES.BROKERAGE_ADMIN}
+                    orBrokerageAdministrator
+                  />
+                }
+              >
                 <Route path="brokerage" element={<BrokeragePage />} />
               </Route>
 

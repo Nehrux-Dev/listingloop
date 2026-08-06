@@ -51,6 +51,14 @@ type RequireRoleProps = {
   roles?: Role[]
   /** Lowest role allowed, following the role hierarchy. */
   minimumRole?: Role
+  /**
+   * Also admit anyone who administers a brokerage, whatever their role.
+   *
+   * Needed for /brokerage: an agent who created their firm during onboarding
+   * may edit it, but holds the Agent role. Without this the export gate would
+   * tell them to fix the brokerage logo on a screen they are bounced off.
+   */
+  orBrokerageAdministrator?: boolean
   children?: ReactNode
 }
 
@@ -60,7 +68,12 @@ type RequireRoleProps = {
  * wrong role get /forbidden — the distinction matters, since bouncing a
  * logged-in user to the login page is confusing and looks like a bug.
  */
-export function RequireRole({ roles, minimumRole, children }: RequireRoleProps) {
+export function RequireRole({
+  roles,
+  minimumRole,
+  orBrokerageAdministrator = false,
+  children,
+}: RequireRoleProps) {
   const { status, user, hasRole, hasRoleAtLeast } = useAuth()
   const location = useLocation()
 
@@ -70,11 +83,13 @@ export function RequireRole({ roles, minimumRole, children }: RequireRoleProps) 
     return <Navigate to="/login" replace state={{ from: location }} />
   }
 
-  const allowed = minimumRole
+  const byRole = minimumRole
     ? hasRoleAtLeast(minimumRole)
     : roles
       ? hasRole(...roles)
       : false
+  const allowed =
+    byRole || (orBrokerageAdministrator && user.administers_brokerage)
 
   if (!allowed) {
     return <Navigate to="/forbidden" replace />

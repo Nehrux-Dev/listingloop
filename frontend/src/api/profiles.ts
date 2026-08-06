@@ -27,6 +27,7 @@ export type Brokerage = {
   required_disclaimer: string
   website: string
   phone: string
+  licence_number: string
   agent_count: number
   created_at: string
   updated_at: string
@@ -45,6 +46,8 @@ export type AgentProfile = {
   email: string
   job_title: string
   tagline: string
+  /** Where the agent's jurisdiction requires it on marketing material. */
+  licence_number: string
   created_at: string
   updated_at: string
 }

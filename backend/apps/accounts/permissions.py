@@ -161,8 +161,15 @@ class BrokeragePermission(BasePermission):
             return True
         if view.action == "create":
             return user.is_nehrux_admin
-        # Object-level checks decide the rest.
-        return user.has_role_at_least(Role.BROKERAGE_ADMIN)
+        # Everything else is decided per object, by ``administers()`` below.
+        #
+        # Checking the *role* here too would be wrong, and subtly so: an agent
+        # who sets up their own firm during onboarding administers it without
+        # holding a platform-wide Brokerage Admin role. Gating on the role
+        # locked them out of the logo and disclaimer their own exports require,
+        # with no way to supply either. Administering a brokerage is a fact
+        # about that brokerage, not a rank.
+        return True
 
     def has_object_permission(self, request, view, obj) -> bool:
         user = _active_user(request)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from typing import Any
 
 from apps.templates.dimensions import Dimension
@@ -51,6 +52,48 @@ def _format_value(value: Any, fmt: str | None) -> str:
     return str(value)
 
 
+#: `{{ agent.full_name }}` — with optional whitespace and an optional filter,
+#: e.g. `{{ property.price | currency }}`.
+PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*(?:\[\d+\])?)\s*(?:\|\s*(\w+)\s*)?\}\}")
+
+
+def interpolate(text: str, context: dict) -> str:
+    """Substitute ``{{ path }}`` placeholders from the template context.
+
+    Runs over literal template text, so a designer can write
+
+        "Presented by {{ agent.full_name }} at {{ brokerage.name }}"
+
+    instead of needing one element per field.
+
+    An unresolved placeholder becomes an empty string rather than being left on
+    the canvas: a rendered image reading "Presented by {{ agent.full_name }}"
+    is worse than one reading "Presented by" — and the profile-completion gate
+    is what stops that second case reaching a render at all.
+    """
+    if not text or "{{" not in text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        value = resolve_path(context, match.group(1))
+        if value is None:
+            return ""
+        return _format_value(value, match.group(2))
+
+    return PLACEHOLDER_RE.sub(replace, text)
+
+
+def unresolved_placeholders(text: str, context: dict) -> list[str]:
+    """Which placeholders in ``text`` have no value. Used by the readiness check."""
+    if not text or "{{" not in text:
+        return []
+    return [
+        match.group(1)
+        for match in PLACEHOLDER_RE.finditer(text)
+        if resolve_path(context, match.group(1)) in (None, "", [])
+    ]
+
+
 def resolve_element_content(element, override: dict, context: dict) -> Any:
     """Override wins, then the element's content source, then its default."""
     if element.element_type in (ElementType.IMAGE, ElementType.LOGO):
@@ -61,13 +104,16 @@ def resolve_element_content(element, override: dict, context: dict) -> Any:
             return resolve_path(context, element.content_source)
         return element.default_content or None
 
+    # Placeholders are interpolated in all three cases, so an agent's own
+    # override text can use them too — "Call {{ agent.phone }}" works whether
+    # the designer wrote it or the agent did.
     if "text" in override:
-        return override["text"]
+        return interpolate(override["text"], context)
     if element.content_source:
         value = resolve_path(context, element.content_source)
         if value not in (None, "", []):
             return _format_value(value, element.style_properties.get("format"))
-    return element.default_content
+    return interpolate(element.default_content, context)
 
 
 def _merged_style(element, override: dict) -> dict:

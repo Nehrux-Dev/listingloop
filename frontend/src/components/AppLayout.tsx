@@ -59,7 +59,8 @@ export default function AppLayout() {
             {/* Nav links are filtered by role purely so users are not shown
                 doors they cannot open. The routes themselves are guarded, and
                 the API enforces the real boundary. */}
-            {hasRoleAtLeast(ROLES.BROKERAGE_ADMIN) && (
+            {(hasRoleAtLeast(ROLES.BROKERAGE_ADMIN) ||
+              user?.administers_brokerage) && (
               <NavLink to="/brokerage" className={linkClass}>
                 Brokerage
               </NavLink>

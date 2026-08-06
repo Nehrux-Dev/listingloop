@@ -92,7 +92,19 @@ class User(AbstractBaseUser, PermissionsMixin):
     """
 
     email = models.EmailField(_("email address"), unique=True)
-    full_name = models.CharField(_("full name"), max_length=255, blank=True)
+
+    # Registration collects first and last name separately, which is what a
+    # person expects to type. `full_name` is kept because it is what the rest
+    # of the system already reads, and is DERIVED in save() rather than being a
+    # second thing to keep in step — set the parts, and the whole follows.
+    first_name = models.CharField(_("first name"), max_length=120, blank=True)
+    last_name = models.CharField(_("last name"), max_length=120, blank=True)
+    full_name = models.CharField(
+        _("full name"),
+        max_length=255,
+        blank=True,
+        help_text=_("Derived from first and last name when those are set."),
+    )
     role = models.CharField(
         _("role"),
         max_length=32,
@@ -131,7 +143,18 @@ class User(AbstractBaseUser, PermissionsMixin):
     def save(self, *args, **kwargs):
         # Keep e-mails canonical so logins are effectively case-insensitive.
         self.email = self.__class__.objects.normalize_email(self.email).lower()
+
+        # One source of truth: the parts win when they are present. An account
+        # created before this field existed keeps whatever full_name it had.
+        parts = " ".join(part for part in (self.first_name, self.last_name) if part).strip()
+        if parts:
+            self.full_name = parts
+
         return super().save(*args, **kwargs)
+
+    @property
+    def display_name(self) -> str:
+        return self.full_name or self.email
 
     # -- Role helpers -------------------------------------------------------
 

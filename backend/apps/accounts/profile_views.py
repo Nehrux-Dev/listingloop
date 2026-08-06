@@ -61,8 +61,11 @@ class BrokerageViewSet(viewsets.ModelViewSet):
         if user.is_brokerage_admin:
             return queryset.filter(admins=user).distinct()
 
-        # Agents see only their own brokerage.
-        return queryset.filter(agents__user=user).distinct()
+        # Agents see the brokerage they belong to, plus any they administer.
+        # An agent who created their own firm during onboarding is both, and
+        # without the second clause the visibility layer would 404 a record the
+        # mutation layer would happily have let them edit.
+        return queryset.filter(Q(agents__user=user) | Q(admins=user)).distinct()
 
 
 class AgentProfileViewSet(viewsets.ModelViewSet):

@@ -64,6 +64,7 @@ class BrokerageSerializer(serializers.ModelSerializer):
             "required_disclaimer",
             "website",
             "phone",
+            "licence_number",
             "agent_count",
             "created_at",
             "updated_at",
@@ -74,6 +75,70 @@ class BrokerageSerializer(serializers.ModelSerializer):
 
     def get_logo_url(self, obj: Brokerage) -> str | None:
         return _file_url(obj.logo, self.context.get("request"))
+
+
+class BrokerageDirectorySerializer(serializers.ModelSerializer):
+    """What an onboarding agent sees when searching for their brokerage.
+
+    Minimal on purpose: enough to recognise the right one, and nothing about
+    its internals. This is the only brokerage data visible to someone who is
+    not yet a member of anything.
+    """
+
+    agent_count = serializers.IntegerField(source="agents.count", read_only=True)
+    logo_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Brokerage
+        fields = ("id", "name", "logo_url", "agent_count")
+        read_only_fields = fields
+
+    def get_logo_url(self, obj: Brokerage) -> str | None:
+        return _file_url(obj.logo, self.context.get("request"))
+
+
+class BrokerageOnboardingSerializer(serializers.ModelSerializer):
+    """Create or join a brokerage during onboarding.
+
+    Name matching is case- and whitespace-insensitive, because "Acme Realty"
+    and "acme  realty" are the same firm and two rows for one brokerage would
+    split its agents, its logo and its disclaimer across both.
+    """
+
+    logo = ValidatedImageField(required=False, allow_null=True, write_only=True)
+    logo_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Brokerage
+        fields = (
+            "id",
+            "name",
+            "logo",
+            "logo_url",
+            "required_disclaimer",
+            "website",
+            "phone",
+            "licence_number",
+        )
+        read_only_fields = ("id", "logo_url")
+
+    def get_logo_url(self, obj: Brokerage) -> str | None:
+        return _file_url(obj.logo, self.context.get("request"))
+
+    def validate_name(self, value: str) -> str:
+        value = " ".join(value.split())
+        if len(value) < 2:
+            raise serializers.ValidationError("Please give the brokerage name.")
+
+        existing = Brokerage.objects.filter(name__iexact=value)
+        if self.instance is not None:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError(
+                "A brokerage with this name already exists. Search for it and "
+                "join it instead of creating a second record."
+            )
+        return value
 
 
 class AgentProfileSerializer(serializers.ModelSerializer):
@@ -105,6 +170,7 @@ class AgentProfileSerializer(serializers.ModelSerializer):
             "email",
             "job_title",
             "tagline",
+            "licence_number",
             "created_at",
             "updated_at",
         )
