@@ -38,6 +38,7 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Any, Iterable
 
+from apps.ai_content.languages import SOURCE_LANGUAGE, get_language
 from apps.ai_content.models import ValidationStatus
 
 
@@ -438,6 +439,33 @@ MAX_LENGTHS: dict[str, int] = {
 }
 
 
+def _note_partial_coverage(report: ValidationReport, language) -> None:
+    """Record, in the report, which checks could not run for this language.
+
+    Without this a Spanish caption comes back PASSED because the English
+    patterns matched nothing, and an agent reasonably concludes it was checked.
+    Saying so turns a silent gap into a visible one, and forces the variant to
+    FLAGGED so it cannot be approved without someone reading it.
+    """
+    if language.is_fully_covered:
+        return
+
+    missing = ", ".join(check.replace("_", " ") for check in language.missing_checks)
+    report.add(
+        ValidationIssue(
+            code="partial_language_coverage",
+            severity="warning",
+            message=(
+                f"Automatic fact-checking for {language.name} is partial: "
+                f"{missing} could not be checked, because those rules only exist "
+                f"in English. Numbers and prices were still verified. Please read "
+                f"this through before approving it."
+            ),
+            evidence=language.code,
+        )
+    )
+
+
 def validate_text(
     text: str,
     listing,
@@ -445,15 +473,23 @@ def validate_text(
     *,
     label: str = "caption",
     max_length: int | None = None,
+    language_code: str = SOURCE_LANGUAGE,
 ) -> ValidationReport:
-    """Run every fact check over one block of prose.
+    """Run every applicable fact check over one block of prose.
 
-    The single entry point for prose, whichever variant it is. Applying one
-    function to all of them is what stops a rule being enforced on the
-    Instagram caption and quietly forgotten on the property description — which
-    is the longest variant and therefore the one with the most room to invent.
+    The single entry point for prose, whichever variant and whichever language.
+    Applying one function to all of them is what stops a rule being enforced on
+    the Instagram caption and quietly forgotten on the property description —
+    which is the longest variant and therefore has the most room to invent.
+
+    For a language whose vocabulary does not exist, the language-specific
+    checks are skipped and *said to be skipped*. See ``languages.py``.
     """
     report = ValidationReport()
+    try:
+        language = get_language(language_code)
+    except ValueError:
+        language = get_language(SOURCE_LANGUAGE)
 
     if not isinstance(text, str) or not text.strip():
         report.add(
@@ -477,38 +513,66 @@ def validate_text(
     haystack = _listing_haystack(listing, facts)
     allowed = allowed_numbers(facts, listing)
 
+    # -- language-agnostic ---------------------------------------------------
+    # Digits are digits everywhere, and an invented price is the single most
+    # damaging error, so this runs for every language. Most of the real
+    # protection lives right here.
     _check_numbers(text, allowed, report, label.replace("_", " "))
-    _check_number_words(_normalise(text), allowed, report)
 
-    _check_patterns(
-        text, INVESTMENT_PATTERNS, "investment_claim", "error", report,
-        "The copy makes an investment claim ({label}): “{text}”. "
-        "Investment claims cannot be derived from listing data.",
-    )
-    _check_patterns(
-        text, LEGAL_PATTERNS, "legal_claim", "error", report,
-        "The copy makes a legal or planning claim ({label}): “{text}”. "
-        "These cannot be derived from listing data.",
-    )
-    _check_patterns(
-        text, SUPERLATIVE_PATTERNS, "unverifiable_superlative", "warning", report,
-        "The copy makes a comparative claim ({label}): “{text}”, which cannot be "
-        "checked against the listing.",
-    )
+    # -- language-specific ---------------------------------------------------
+    covered = language.covered_checks
 
-    _check_features(text, haystack, report)
-    _check_locations(text, listing, haystack, report)
+    if "number_words" in covered:
+        _check_number_words(_normalise(text), allowed, report)
+
+    if "investment_claims" in covered:
+        _check_patterns(
+            text, INVESTMENT_PATTERNS, "investment_claim", "error", report,
+            "The copy makes an investment claim ({label}): “{text}”. "
+            "Investment claims cannot be derived from listing data.",
+        )
+    if "legal_claims" in covered:
+        _check_patterns(
+            text, LEGAL_PATTERNS, "legal_claim", "error", report,
+            "The copy makes a legal or planning claim ({label}): “{text}”. "
+            "These cannot be derived from listing data.",
+        )
+        _check_patterns(
+            text, SUPERLATIVE_PATTERNS, "unverifiable_superlative", "warning", report,
+            "The copy makes a comparative claim ({label}): “{text}”, which cannot be "
+            "checked against the listing.",
+        )
+
+    if "feature_vocabulary" in covered:
+        _check_features(text, haystack, report)
+        # Place-name detection keys off capitalisation, which does not exist in
+        # Chinese or Arabic and works differently in German. Restricted to
+        # languages with a declared vocabulary rather than producing confident
+        # nonsense elsewhere.
+        _check_locations(text, listing, haystack, report)
+
+    _note_partial_coverage(report, language)
 
     return report.finalise()
 
 
-def validate_hashtags(hashtags: Any, listing, facts: dict[str, Any]) -> ValidationReport:
+def validate_hashtags(
+    hashtags: Any,
+    listing,
+    facts: dict[str, Any],
+    *,
+    language_code: str = SOURCE_LANGUAGE,
+) -> ValidationReport:
     """The same checks, applied to the hashtag set.
 
     Hashtags get validated too because "#8percentyield" is exactly as much a
     claim as writing it in a sentence, and it is easier to overlook.
     """
     report = ValidationReport()
+    try:
+        language = get_language(language_code)
+    except ValueError:
+        language = get_language(SOURCE_LANGUAGE)
 
     if not isinstance(hashtags, list):
         report.add(ValidationIssue("malformed_hashtags", "error", "Hashtags were not a list."))
@@ -549,17 +613,31 @@ def validate_hashtags(hashtags: Any, listing, facts: dict[str, Any]) -> Validati
     haystack = _listing_haystack(listing, facts)
     allowed = allowed_numbers(facts, listing)
 
+    # Language-agnostic: numbers and hashtag shape apply everywhere. Note that
+    # the high-risk keyword scan above is also unconditional — those words
+    # ("yield", "roi") are borrowed into most languages' marketing copy, so
+    # scanning for them outside English costs nothing and occasionally helps.
     _check_numbers(tag_text, allowed, report, "hashtags")
-    _check_patterns(
-        spaced, INVESTMENT_PATTERNS, "investment_claim", "error", report,
-        "A hashtag makes an investment claim ({label}): “{text}”.",
-    )
-    _check_patterns(
-        spaced, LEGAL_PATTERNS, "legal_claim", "error", report,
-        "A hashtag makes a legal or planning claim ({label}): “{text}”.",
-    )
-    _check_features(spaced, haystack, report)
     _check_hashtags(hashtags, report)
+
+    covered = language.covered_checks
+    if "investment_claims" in covered:
+        _check_patterns(
+            spaced, INVESTMENT_PATTERNS, "investment_claim", "error", report,
+            "A hashtag makes an investment claim ({label}): “{text}”.",
+        )
+    if "legal_claims" in covered:
+        _check_patterns(
+            spaced, LEGAL_PATTERNS, "legal_claim", "error", report,
+            "A hashtag makes a legal or planning claim ({label}): “{text}”.",
+        )
+    if "feature_vocabulary" in covered:
+        _check_features(spaced, haystack, report)
+
+    # Hashtags need this as much as prose does. Without it a French pack came
+    # back with five FLAGGED variants and one PASSED one — the hashtags — which
+    # is precisely the false green tick this whole design exists to avoid.
+    _note_partial_coverage(report, language)
 
     return report.finalise()
 

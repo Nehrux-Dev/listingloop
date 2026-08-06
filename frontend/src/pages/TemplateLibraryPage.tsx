@@ -150,21 +150,29 @@ export default function TemplateLibraryPage() {
         <div className="sticky bottom-4 rounded-lg border border-slate-300 bg-white p-4 shadow-lg">
           <p className="text-sm font-medium text-slate-800">{chosen.name}</p>
           <div className="mt-3 flex flex-wrap items-end gap-3">
-            <label className="text-sm">
-              <span className="block text-xs font-medium text-slate-600">Listing</span>
-              <select
-                value={listingId}
-                onChange={(event) => setListingId(event.target.value)}
-                className="mt-1 w-64 rounded-md border border-slate-300 px-3 py-2 text-sm"
-              >
-                <option value="">No listing (agent or market template)</option>
-                {listings.map((listing) => (
-                  <option key={listing.id} value={listing.id}>
-                    {listing.full_address || `Listing #${listing.id}`}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {/* A seasonal or agent-led template has nothing to attach, so the
+                picker is not shown at all rather than shown-and-ignored. */}
+            {chosen.requires_listing ? (
+              <label className="text-sm">
+                <span className="block text-xs font-medium text-slate-600">Listing</span>
+                <select
+                  value={listingId}
+                  onChange={(event) => setListingId(event.target.value)}
+                  className="mt-1 w-64 rounded-md border border-slate-300 px-3 py-2 text-sm"
+                >
+                  <option value="">Choose a verified listing…</option>
+                  {listings.map((listing) => (
+                    <option key={listing.id} value={listing.id}>
+                      {listing.full_address || `Listing #${listing.id}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <p className="text-xs text-slate-500">
+                This template needs no listing.
+              </p>
+            )}
 
             <button
               type="button"
@@ -182,9 +190,11 @@ export default function TemplateLibraryPage() {
               Cancel
             </button>
           </div>
-          {listings.length === 0 && (
+          {chosen.requires_listing && listings.length === 0 && (
             <p className="mt-2 text-xs text-amber-700">
-              You have no verified listings yet — verify one to use listing templates.
+              You have no verified listings yet. Verify one to use this template, or
+              try the <a href="/calendar" className="underline">content calendar</a> —
+              those templates need no property.
             </p>
           )}
         </div>

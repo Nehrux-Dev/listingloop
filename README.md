@@ -73,6 +73,7 @@ Seed one account per role (refuses to run unless `DEBUG=True`):
 docker compose exec backend python manage.py seed_dev_users
 docker compose exec backend python manage.py seed_templates
 docker compose exec backend python manage.py seed_compliance_rules   # PLACEHOLDERS
+docker compose exec backend python manage.py seed_calendar           # festival dates
 ```
 
 | Email                 | Role            |
@@ -711,6 +712,100 @@ prefix so the URLconf shows which routes serve anonymous requests.
 
 ---
 
+## Content calendar
+
+Seasonal and festival templates an agent can use with **no property attached** —
+Christmas, Diwali, Eid, Lunar New Year, Canada Day and the rest. Same template
+and design system as everything else; the only difference is that `Design.listing`
+stays null.
+
+`Template.requires_listing` is **derived from the category**, not stored: a
+"Just Sold" card with no property has nothing to say, and a Diwali card has
+nothing to do with one. Deriving it means a new seasonal category cannot forget
+to set a flag. The API publishes it, so the library stops asking for a listing
+on a festival card, and the serializer rejects a listing-led template that
+arrives without one.
+
+### Dates are data, not a formula
+
+Christmas and Canada Day are fixed. Diwali, Eid, Lunar New Year, Easter and
+Hanukkah follow lunar or lunisolar calendars — and Eid depends on local moon
+sighting, so two countries can legitimately observe it on different days.
+Thanksgiving and Mother's Day are nth-weekday rules.
+
+**None of these are computed.** Every occurrence is an explicit row, seeded a
+few years ahead by `manage.py seed_calendar`, and anything that moves is flagged
+`needs_date_review` so it is visible when the seeded years run out rather than
+the calendar quietly going empty. Shipping an approximation and being wrong
+about somebody's religious holiday is not a trade worth making.
+
+> The moving dates in the seed are **best-effort** and should be confirmed
+> against an authoritative source for your market before launch.
+
+| Endpoint | Notes |
+| -------- | ----- |
+| `GET /api/calendar-events/` | `?within_days=` `?include_past=true` `?category=` |
+| `GET /api/calendar-events/{id}/templates/` | the templates for one occasion |
+| `GET /api/templates/?seasonal=true` | festival templates |
+| `GET /api/templates/?no_listing_required=true` | everything usable between listings |
+
+The calendar is read-only over the API — getting Eid wrong for somebody is not
+a thing to leave to a free-text field in the app.
+
+---
+
+## Multilingual content
+
+`POST /api/ai-content/generate/` takes `languages: [...]` and **fans out to one
+job per language**, each producing the full six-variant pack. Not one call
+returning every language: six languages × six variants is a very long response,
+truncation would silently lose the last one, and a single failure would take
+them all down. Separate jobs also mean each language is costed on its own.
+
+Every language is stored as its own `GeneratedContent` row, so "approve the
+French copy" is expressible.
+
+### ⚠ The fact-checker only speaks English
+
+This is the thing to know about this feature. The Step 6 validator is
+English-specific in three of its five rules — the investment and legal claim
+patterns, the feature vocabulary, and the written-out number words are all
+English strings. Point it at Spanish output and it finds nothing, **not because
+the copy is clean but because it cannot read it**.
+
+That failure mode is worse than having no validator, because the report would
+come back "passed" and an agent would reasonably believe the copy was checked.
+
+So coverage is declared per language in
+[languages.py](backend/apps/ai_content/languages.py), and the checks split:
+
+| | Runs in | Catches |
+| --- | --- | --- |
+| **Language-agnostic** | every language | invented numbers and prices, hashtag shape, length |
+| **Language-specific** | only where a vocabulary exists | claim phrases, feature vocabulary, number words |
+
+Most of the real protection is in the first row — an invented price is the most
+damaging error and a digit is a digit everywhere.
+
+**A language with partial coverage can never come back PASSED.** It is FLAGGED,
+with an issue naming exactly which checks did not run and confirming that
+numbers were still verified. The UI says so on the language picker *before* the
+agent commits, not in a warning afterwards. Publishing in a language the system
+cannot fully verify is a legitimate decision; making it uninformed is not.
+
+An unrecognised language code **falls back to full English checking** rather
+than none — fail closed.
+
+Adding a language to `AI_CONTENT_LANGUAGES` makes it selectable. Giving it real
+fact-check coverage means adding its vocabulary in code, which is deliberate:
+the config change must not silently look like the safety change.
+
+```bash
+AI_CONTENT_LANGUAGES=en,fr,es,zh-hans,pa,ar    # the launch set — yours to decide
+```
+
+---
+
 ## Compliance
 
 A **data-driven rules engine**, not business logic. The actual requirements are
@@ -1005,7 +1100,7 @@ pick up code changes without a rebuild.
 docker compose exec backend python manage.py test
 ```
 
-498 tests. The suite runs against a throwaway database, uses an in-memory
+556 tests. The suite runs against a throwaway database, uses an in-memory
 cache instead of Redis, a fast password hasher and a temporary `MEDIA_ROOT`,
 so it needs nothing beyond a running Postgres. The import tests stub the fetch
 layer, the render tests stub the renderer service and the AI tests stub the
@@ -1058,6 +1153,12 @@ provider, so no test touches the network, needs a browser, or spends money.
 - `listings/test_public_pages.py` — public rendering of a verified listing,
   enquiry submission and storage, every spam layer, the enquiry inbox scoping,
   and that unverified, draft and withdrawn listings are all unreachable.
+- `templates/test_calendar.py` — the whole design flow with no listing
+  attached (create, resolve, render, export), that listing-led templates still
+  demand one, calendar filtering, and that no seeded event is a dead end.
+- `ai_content/test_multilingual.py` — the fan-out, per-language storage, that
+  numbers are still checked in every language, and that non-English output can
+  never come back simply PASSED.
 
 ### Celery
 

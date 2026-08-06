@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from apps.templates.models import Design
+from apps.templates.models import Design, TemplateCategory
 from apps.templates.tests.base import TemplateAPITestCase
 
 
@@ -144,10 +144,16 @@ class DesignRoundTripTests(TemplateAPITestCase):
         self.assertFalse(Design.objects.filter(pk=design.pk).exists())
 
     def test_a_design_needs_no_listing(self):
-        """Agent-introduction and market-update templates have no property."""
+        """Agent-introduction, market-update and seasonal templates have no
+        property. A listing-led template still demands one — see
+        test_calendar.DesignWithoutListingTests."""
+        agent_template = self.make_template(
+            name="About me", slug="about-me", category="agent_introduction"
+        )
+
         response = self.client.post(
             self.designs_url,
-            {"name": "About me", "template": self.template.pk},
+            {"name": "About me", "template": agent_template.pk},
             format="json",
         )
 
@@ -332,8 +338,13 @@ class TemplateLibraryTests(TemplateAPITestCase):
         self.assertEqual(categories["new_listing"], 2)
         self.assertEqual(categories["just_sold"], 1)
         self.assertEqual(styles["bold"], 1)
-        self.assertEqual(len(response.data["categories"]), 10)
+        # Every category is offered, including the seasonal ones added for the
+        # content calendar — the facet list is the full vocabulary, with counts.
+        self.assertEqual(
+            len(response.data["categories"]), len(TemplateCategory.choices)
+        )
         self.assertEqual(len(response.data["styles"]), 6)
+        self.assertEqual(categories["diwali"], 0)
 
     def test_templates_are_read_only_over_the_api(self):
         """Templates are product content, authored in the admin."""

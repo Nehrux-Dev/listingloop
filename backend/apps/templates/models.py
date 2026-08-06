@@ -35,16 +35,70 @@ from apps.core.storage import design_export_upload_to
 
 
 class TemplateCategory(models.TextChoices):
+    # -- listing-led ---------------------------------------------------------
     NEW_LISTING = "new_listing", _("New Listing")
     COMING_SOON = "coming_soon", _("Coming Soon")
     OPEN_HOUSE = "open_house", _("Open House")
     JUST_SOLD = "just_sold", _("Just Sold")
     PRICE_REDUCED = "price_reduced", _("Price Reduced")
     LEASED = "leased", _("Leased")
+
+    # -- agent-led -----------------------------------------------------------
     AGENT_INTRODUCTION = "agent_introduction", _("Agent Introduction")
     TESTIMONIAL = "testimonial", _("Testimonial")
     MARKET_UPDATE = "market_update", _("Market Update")
     NEIGHBOURHOOD_GUIDE = "neighbourhood_guide", _("Neighbourhood Guide")
+
+    # -- seasonal and festival ----------------------------------------------
+    # These never reference a property. An agent posts them to stay visible
+    # between listings, which is the whole point of a content calendar.
+    CHRISTMAS = "christmas", _("Christmas")
+    NEW_YEAR = "new_year", _("New Year")
+    LUNAR_NEW_YEAR = "lunar_new_year", _("Lunar New Year")
+    DIWALI = "diwali", _("Diwali")
+    EID = "eid", _("Eid")
+    HANUKKAH = "hanukkah", _("Hanukkah")
+    EASTER = "easter", _("Easter")
+    THANKSGIVING = "thanksgiving", _("Thanksgiving")
+    CANADA_DAY = "canada_day", _("Canada Day")
+    AUSTRALIA_DAY = "australia_day", _("Australia Day")
+    MOTHERS_DAY = "mothers_day", _("Mother's Day")
+    FATHERS_DAY = "fathers_day", _("Father's Day")
+    SEASONAL = "seasonal", _("Seasonal (general)")
+
+
+#: Categories that are about the calendar rather than a property. Used to
+#: decide which templates appear in the content calendar and which may be used
+#: with no listing attached.
+SEASONAL_CATEGORIES: frozenset[str] = frozenset(
+    {
+        TemplateCategory.CHRISTMAS,
+        TemplateCategory.NEW_YEAR,
+        TemplateCategory.LUNAR_NEW_YEAR,
+        TemplateCategory.DIWALI,
+        TemplateCategory.EID,
+        TemplateCategory.HANUKKAH,
+        TemplateCategory.EASTER,
+        TemplateCategory.THANKSGIVING,
+        TemplateCategory.CANADA_DAY,
+        TemplateCategory.AUSTRALIA_DAY,
+        TemplateCategory.MOTHERS_DAY,
+        TemplateCategory.FATHERS_DAY,
+        TemplateCategory.SEASONAL,
+    }
+)
+
+#: Categories that describe a specific property and are meaningless without one.
+LISTING_CATEGORIES: frozenset[str] = frozenset(
+    {
+        TemplateCategory.NEW_LISTING,
+        TemplateCategory.COMING_SOON,
+        TemplateCategory.OPEN_HOUSE,
+        TemplateCategory.JUST_SOLD,
+        TemplateCategory.PRICE_REDUCED,
+        TemplateCategory.LEASED,
+    }
+)
 
 
 class TemplateStyle(models.TextChoices):
@@ -108,6 +162,21 @@ class Template(TimeStampedModel):
 
     def __str__(self) -> str:
         return self.name
+
+    @property
+    def is_seasonal(self) -> bool:
+        return self.category in SEASONAL_CATEGORIES
+
+    @property
+    def requires_listing(self) -> bool:
+        """Whether a design on this template needs a property attached.
+
+        Derived from the category rather than stored: a "Just Sold" template
+        with no listing has nothing to say, and a Diwali card has nothing to do
+        with one. Deriving it means a new seasonal category cannot forget to
+        set the flag.
+        """
+        return self.category in LISTING_CATEGORIES
 
     @property
     def permission_map(self) -> dict[str, str]:
@@ -203,6 +272,78 @@ class TemplateElement(models.Model):
         return self.permission == ElementPermission.FREE
 
 
+class CalendarEvent(TimeStampedModel):
+    """One dated occasion an agent might post about.
+
+    DATES ARE STORED, NOT COMPUTED
+    ------------------------------
+    Christmas and Canada Day are fixed, but Diwali, Eid, Lunar New Year, Easter
+    and Hanukkah all move — they follow lunar and lunisolar calendars, and Eid
+    in particular depends on local moon sighting, so two countries can observe
+    it on different days.
+
+    Computing those from a rule would mean shipping an approximation and being
+    quietly wrong for somebody's religious holiday. Each occurrence is therefore
+    a row with an explicit date, seeded a few years ahead and maintained
+    deliberately. ``needs_date_review`` marks the ones that cannot be
+    extrapolated, so it is visible when the seeded years run out rather than
+    the calendar just going quiet.
+    """
+
+    name = models.CharField(_("name"), max_length=120)
+    slug = models.SlugField(_("slug"), max_length=140)
+    category = models.CharField(
+        _("template category"),
+        max_length=32,
+        choices=TemplateCategory.choices,
+        db_index=True,
+        help_text=_("Which templates this event surfaces."),
+    )
+    date = models.DateField(_("date"), db_index=True)
+    description = models.TextField(_("description"), blank=True)
+
+    #: Where the event is observed, as a hint for who should see it. Blank
+    #: means everywhere. Not enforced — an agent in any market may have clients
+    #: who celebrate anything, and filtering them out by geography would be
+    #: both presumptuous and wrong.
+    regions = models.JSONField(_("regions"), default=list, blank=True)
+
+    needs_date_review = models.BooleanField(
+        _("date needs review"),
+        default=False,
+        help_text=_(
+            "Set for any event whose date is not fixed — lunar and lunisolar "
+            "festivals, and nth-weekday holidays like Thanksgiving. None of "
+            "them are calculated here, so each year's date must be confirmed."
+        ),
+    )
+    is_active = models.BooleanField(_("active"), default=True, db_index=True)
+
+    class Meta:
+        verbose_name = _("calendar event")
+        verbose_name_plural = _("calendar events")
+        ordering = ("date", "name")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["slug", "date"], name="unique_calendar_event_occurrence"
+            )
+        ]
+        indexes = [models.Index(fields=["date", "is_active"])]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.date})"
+
+    @property
+    def days_away(self) -> int:
+        from django.utils import timezone as tz
+
+        return (self.date - tz.localdate()).days
+
+    @property
+    def is_past(self) -> bool:
+        return self.days_away < 0
+
+
 class DesignQuerySet(models.QuerySet):
     def for_user(self, user):
         """Same scoping rule as listings: own work, or the brokerage's."""
@@ -232,9 +373,18 @@ class Design(TimeStampedModel):
         null=True,
         blank=True,
         help_text=_(
-            "Optional: agent-introduction and market-update templates need no "
-            "listing. When set, it must be a verified listing."
+            "Optional: agent-introduction, market-update and seasonal templates "
+            "need no listing. When set, it must be a verified listing."
         ),
+    )
+    #: Optional link to the occasion this design was made for, so the content
+    #: calendar can show what has already been produced for Diwali this year.
+    calendar_event = models.ForeignKey(
+        "templates.CalendarEvent",
+        on_delete=models.SET_NULL,
+        related_name="designs",
+        null=True,
+        blank=True,
     )
 
     overrides = models.JSONField(
@@ -264,6 +414,15 @@ class Design(TimeStampedModel):
         if self.listing_id and not self.listing.is_usable_for_content:
             raise ValidationError(
                 {"listing": _("Only verified listings can be used in a design.")}
+            )
+        if self.template_id and self.template.requires_listing and not self.listing_id:
+            raise ValidationError(
+                {
+                    "listing": _(
+                        "This template describes a specific property, so it needs "
+                        "a listing."
+                    )
+                }
             )
 
 

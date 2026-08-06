@@ -28,6 +28,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
+from apps.ai_content.languages import SOURCE_LANGUAGE, enabled_languages
 from apps.ai_content.models import ContentVariant, GeneratedContent, ReviewStatus
 from apps.ai_content.permissions import (
     ContentVariantPermission,
@@ -68,7 +69,32 @@ class GeneratedContentViewSet(viewsets.ReadOnlyModelViewSet):
         if job_status:
             queryset = queryset.filter(job_status=job_status)
 
+        language = self.request.query_params.get("language")
+        if language:
+            queryset = queryset.filter(language=language)
+
         return queryset
+
+    @action(detail=False, methods=["get"], url_path="languages")
+    def languages(self, request: Request) -> Response:
+        """The languages this deployment offers, and how well each is checked.
+
+        ``fully_validated`` is published rather than hidden: an agent choosing
+        a language deserves to know up front that the automatic fact check will
+        only partly understand the result.
+        """
+        return Response(
+            [
+                {
+                    "code": language.code,
+                    "name": language.name,
+                    "rtl": language.rtl,
+                    "fully_validated": language.is_fully_covered,
+                    "unchecked": language.missing_checks,
+                }
+                for language in enabled_languages()
+            ]
+        )
 
     @action(
         detail=False,
@@ -89,20 +115,26 @@ class GeneratedContentViewSet(viewsets.ReadOnlyModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         listing = serializer.validated_data["listing"]
-        generation = create_generation(
-            listing, request.user, tone=serializer.validated_data.get("tone", "")
-        )
+        tone = serializer.validated_data.get("tone", "")
+        languages = serializer.validated_data.get("languages") or [SOURCE_LANGUAGE]
 
-        # Queued after the row is committed, so the worker cannot look for a
-        # record that is not there yet.
-        generate_content.delay(generation.pk)
+        generations = []
+        for language in languages:
+            generation = create_generation(
+                listing, request.user, tone=tone, language=language
+            )
+            # Queued after the row is committed, so the worker cannot look for
+            # a record that is not there yet.
+            generate_content.delay(generation.pk)
+            generations.append(generation)
 
         logger.info(
-            "Queued generation %s for listing %s by user %s",
-            generation.pk, listing.pk, request.user.pk,
+            "Queued %s generation(s) for listing %s by user %s: %s",
+            len(generations), listing.pk, request.user.pk, ", ".join(languages),
         )
         return Response(
-            self.get_serializer(generation).data, status=status.HTTP_202_ACCEPTED
+            self.get_serializer(generations, many=True).data,
+            status=status.HTTP_202_ACCEPTED,
         )
 
     generate.throttle_scope = "ai_generate"

@@ -53,6 +53,23 @@ export type ContentVariant = {
   edited_at: string | null
 }
 
+export type ContentLanguage = {
+  code: string
+  name: string
+  rtl: boolean
+  /**
+   * False when the automatic fact check only partly understands this language.
+   * Published rather than hidden — an agent picking a language deserves to
+   * know before they pick it, not after.
+   */
+  fully_validated: boolean
+  unchecked: string[]
+}
+
+export function fetchContentLanguages(): Promise<ContentLanguage[]> {
+  return apiRequest<ContentLanguage[]>('/api/ai-content/languages/')
+}
+
 export type GeneratedContent = {
   id: number
   listing: number
@@ -84,6 +101,10 @@ export type GeneratedContent = {
   updated_at: string
   variants: ContentVariant[]
   usable_variant_count: number
+  language: string
+  language_name: string
+  /** True when the fact check could not fully read this language. */
+  has_partial_validation: boolean
 }
 
 export type GenerationStatus = {
@@ -121,10 +142,18 @@ export function fetchContentStatus(id: number): Promise<GenerationStatus> {
  * The ONLY call that starts a generation. Returns 202 immediately with a
  * queued record; the OpenAI call happens in a worker.
  */
-export function requestGeneration(listing: number, tone?: string): Promise<GeneratedContent> {
-  return apiRequest<GeneratedContent>('/api/ai-content/generate/', {
+export function requestGeneration(
+  listing: number,
+  options: { tone?: string; languages?: string[] } = {},
+): Promise<GeneratedContent[]> {
+  // Returns one queued job per language — the endpoint fans out rather than
+  // packing every language into a single response.
+  const body: Record<string, unknown> = { listing }
+  if (options.tone) body.tone = options.tone
+  if (options.languages?.length) body.languages = options.languages
+  return apiRequest<GeneratedContent[]>('/api/ai-content/generate/', {
     method: 'POST',
-    body: tone ? { listing, tone } : { listing },
+    body,
   })
 }
 

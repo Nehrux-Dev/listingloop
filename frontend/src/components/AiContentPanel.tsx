@@ -14,9 +14,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   fetchContent,
   fetchContentForListing,
+  fetchContentLanguages,
   fetchContentStatus,
   requestGeneration,
   reviewAllVariants,
+  type ContentLanguage,
   type ContentVariant,
   type GeneratedContent,
 } from '../api/aiContent.ts'
@@ -47,6 +49,13 @@ export function AiContentPanel({
   const [pollingId, setPollingId] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const timers = useRef<number[]>([])
+  const [available, setAvailable] = useState<ContentLanguage[]>([])
+  const [languages, setLanguages] = useState<string[]>(['en'])
+
+  useEffect(() => {
+    // Reading the language list does not start anything.
+    fetchContentLanguages().then(setAvailable).catch(() => setAvailable([]))
+  }, [])
 
   const load = useCallback(async () => {
     // Reads existing records only. Nothing here starts a job.
@@ -101,10 +110,17 @@ export function AiContentPanel({
     setBusy(true)
     setError(null)
     try {
-      const queued = await requestGeneration(listingId, tone.trim() || undefined)
-      setItems((current) => [queued, ...current])
-      setPollingId(queued.id)
-      poll(queued.id, Date.now())
+      const queued = await requestGeneration(listingId, {
+        tone: tone.trim() || undefined,
+        languages,
+      })
+      setItems((current) => [...queued, ...current])
+      // One job per language; poll the first and refresh the rest when it
+      // lands, rather than running several timers against the same endpoint.
+      if (queued[0]) {
+        setPollingId(queued[0].id)
+        poll(queued[0].id, Date.now())
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not start generation.')
     } finally {
@@ -176,9 +192,18 @@ export function AiContentPanel({
           onChange={(event) => setTone(event.target.value)}
           className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-900 focus:ring-1 focus:ring-slate-900"
         />
+
+        {available.length > 1 && (
+          <LanguagePicker
+            available={available}
+            selected={languages}
+            onChange={setLanguages}
+          />
+        )}
+
         <button
           type="button"
-          disabled={busy || pollingId !== null}
+          disabled={busy || pollingId !== null || languages.length === 0}
           onClick={() => void handleGenerate()}
           className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:opacity-50"
         >
@@ -186,9 +211,9 @@ export function AiContentPanel({
             ? 'Generating…'
             : busy
               ? 'Starting…'
-              : hasAny
-                ? 'Regenerate'
-                : 'Generate caption'}
+              : `${hasAny ? 'Regenerate' : 'Generate'}${
+                  languages.length > 1 ? ` in ${languages.length} languages` : ''
+                }`}
         </button>
         {pollingId !== null && (
           <p className="text-xs text-slate-500">
@@ -206,6 +231,81 @@ export function AiContentPanel({
         />
       ))}
     </Card>
+  )
+}
+
+/**
+ * Language selector.
+ *
+ * Languages whose fact check is only partial say so *here*, before the agent
+ * commits, rather than in a warning after the copy arrives. Choosing to
+ * publish in a language the system cannot fully verify is a legitimate
+ * decision — making it uninformed is not.
+ */
+function LanguagePicker({
+  available,
+  selected,
+  onChange,
+}: {
+  available: ContentLanguage[]
+  selected: string[]
+  onChange: (codes: string[]) => void
+}) {
+  const partial = available.filter(
+    (language) => selected.includes(language.code) && !language.fully_validated,
+  )
+
+  function toggle(code: string) {
+    onChange(
+      selected.includes(code)
+        ? selected.filter((item) => item !== code)
+        : [...selected, code],
+    )
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs font-medium text-slate-600">Languages</p>
+      <div className="flex flex-wrap gap-1.5">
+        {available.map((language) => {
+          const active = selected.includes(language.code)
+          return (
+            <button
+              key={language.code}
+              type="button"
+              onClick={() => toggle(language.code)}
+              className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                active
+                  ? 'bg-slate-900 text-white'
+                  : 'border border-slate-200 text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              {language.name}
+              {!language.fully_validated && (
+                <span
+                  title="The automatic fact check only partly understands this language"
+                  className={active ? 'ml-1 text-amber-300' : 'ml-1 text-amber-600'}
+                >
+                  ●
+                </span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      {partial.length > 0 && (
+        <p className="text-[11px] text-amber-700">
+          Numbers and prices are checked in every language. For{' '}
+          {partial.map((language) => language.name).join(', ')}, the claim and
+          feature checks do not run — read that copy through before approving it.
+        </p>
+      )}
+
+      <p className="text-[11px] text-slate-400">
+        Each language is a separate request and is billed separately.
+      </p>
+    </div>
   )
 }
 
@@ -247,6 +347,17 @@ function GenerationCard({
         >
           {usable} of {total} ready to use
         </span>
+        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
+          {item.language_name}
+        </span>
+        {item.has_partial_validation && (
+          <span
+            title="Claim and feature checks do not run in this language"
+            className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-700 ring-1 ring-amber-200"
+          >
+            Partly checked
+          </span>
+        )}
         <span className="text-[11px] text-slate-400">
           {new Date(item.created_at).toLocaleString()}
         </span>

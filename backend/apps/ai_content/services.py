@@ -26,6 +26,7 @@ from apps.ai_content.models import (
     VariantKind,
     VARIANT_ORDER,
 )
+from apps.ai_content.languages import SOURCE_LANGUAGE, is_enabled
 from apps.ai_content.prompts import PROMPT_VERSION, RESPONSE_SCHEMA, build_messages
 from apps.ai_content.validation import validate_hashtags, validate_text
 from apps.listings.models import Listing
@@ -45,7 +46,9 @@ class ListingNotUsable(ValueError):
     """The listing cannot be used for generation."""
 
 
-def create_generation(listing: Listing, user, *, tone: str = "") -> GeneratedContent:
+def create_generation(
+    listing: Listing, user, *, tone: str = "", language: str = SOURCE_LANGUAGE
+) -> GeneratedContent:
     """Create the queued record. Does not call the API.
 
     Separated from ``run_generation`` so the API can return a job id
@@ -59,10 +62,16 @@ def create_generation(listing: Listing, user, *, tone: str = "") -> GeneratedCon
             "before generating content from it."
         )
 
+    if not is_enabled(language):
+        raise ListingNotUsable(
+            f"'{language}' is not an enabled content language."
+        )
+
     return GeneratedContent.objects.create(
         listing=listing,
         requested_by=user if getattr(user, "is_authenticated", False) else None,
         kind=ContentKind.CONTENT_PACK,
+        language=language,
         job_status=JobStatus.QUEUED,
         prompt_version=PROMPT_VERSION,
         prompt_facts={"tone": tone} if tone else {},
@@ -92,7 +101,9 @@ def run_generation(generation: GeneratedContent, *, completion_fn=None) -> Gener
     generation.started_at = timezone.now()
     generation.save(update_fields=["job_status", "started_at", "updated_at"])
 
-    messages, facts = build_messages(listing, tone=tone)
+    messages, facts = build_messages(
+        listing, tone=tone, language_code=generation.language
+    )
 
     try:
         result = completion_fn(messages, RESPONSE_SCHEMA)
@@ -118,7 +129,9 @@ def run_generation(generation: GeneratedContent, *, completion_fn=None) -> Gener
     generation.estimated_cost_usd = result.estimated_cost_usd
     generation.duration_ms = result.duration_ms
 
-    variants = _store_variants(generation, result.payload, listing, facts)
+    variants = _store_variants(
+        generation, result.payload, listing, facts, language=generation.language
+    )
 
     # The generation's own status is the worst of its variants, so a listing
     # index can show "needs attention" without loading every variant. Each
@@ -198,7 +211,9 @@ def _run_compliance(generation, variants) -> None:
             )
 
 
-def _store_variants(generation, payload: dict, listing, facts: dict) -> list[ContentVariant]:
+def _store_variants(
+    generation, payload: dict, listing, facts: dict, *, language: str = SOURCE_LANGUAGE
+) -> list[ContentVariant]:
     """Validate and persist every variant in one response.
 
     Each variant is checked on its own, by the same rules, so a rejection names
@@ -210,7 +225,7 @@ def _store_variants(generation, payload: dict, listing, facts: dict) -> list[Con
     for kind in VARIANT_ORDER:
         if kind == VariantKind.HASHTAGS:
             raw = payload.get("hashtags") or []
-            report = validate_hashtags(raw, listing, facts)
+            report = validate_hashtags(raw, listing, facts, language_code=language)
             items = [tag for tag in raw if isinstance(tag, str)]
             variant = ContentVariant(
                 generation=generation,
@@ -225,7 +240,9 @@ def _store_variants(generation, payload: dict, listing, facts: dict) -> list[Con
                 variant.items = items
         else:
             text = (payload.get(kind) or "").strip()
-            report = validate_text(text, listing, facts, label=kind)
+            report = validate_text(
+                text, listing, facts, label=kind, language_code=language
+            )
             variant = ContentVariant(
                 generation=generation,
                 kind=kind,
@@ -265,13 +282,17 @@ def apply_variant_edit(variant: ContentVariant, *, text: str = "", items=None, u
         if key != "tone"
     }
 
+    language = variant.generation.language
+
     if variant.is_hashtags:
         items = [tag for tag in (items or []) if isinstance(tag, str)]
-        report = validate_hashtags(items, listing, facts)
+        report = validate_hashtags(items, listing, facts, language_code=language)
         variant.items = items
         variant.rejected_items = []
     else:
-        report = validate_text(text, listing, facts, label=variant.kind)
+        report = validate_text(
+            text, listing, facts, label=variant.kind, language_code=language
+        )
         if not variant.original_text:
             variant.original_text = variant.text or variant.rejected_text
         variant.text = text
@@ -288,9 +309,16 @@ def apply_variant_edit(variant: ContentVariant, *, text: str = "", items=None, u
     return variant
 
 
-def generate_for_listing(listing: Listing, user, *, tone: str = "", completion_fn=None):
-    """Synchronous convenience wrapper: create then run. Used by Part A."""
-    generation = create_generation(listing, user, tone=tone)
+def generate_for_listing(
+    listing: Listing,
+    user,
+    *,
+    tone: str = "",
+    language: str = SOURCE_LANGUAGE,
+    completion_fn=None,
+):
+    """Synchronous convenience wrapper: create then run."""
+    generation = create_generation(listing, user, tone=tone, language=language)
     return run_generation(generation, completion_fn=completion_fn)
 
 

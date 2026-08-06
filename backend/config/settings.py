@@ -406,6 +406,15 @@ COMPLIANCE_BLOCK_EXPORTS = env.bool("COMPLIANCE_BLOCK_EXPORTS", default=True)
 # ---------------------------------------------------------------------------
 
 OPENAI_API_KEY = env("OPENAI_API_KEY", default="")
+
+#: Languages the app offers for generated content. English is always included
+#: — it is the language the fact-checker actually speaks and the one the source
+#: facts are written in. Adding a code here makes it selectable; giving it real
+#: fact-check coverage means adding its vocabulary in
+#: apps/ai_content/languages.py, which is a code change on purpose.
+AI_CONTENT_LANGUAGES = env.list(
+    "AI_CONTENT_LANGUAGES", default=["en", "fr", "es", "zh-hans", "pa", "ar"]
+)
 OPENAI_MODEL = env("OPENAI_MODEL", default="gpt-4o-mini")
 OPENAI_TEMPERATURE = env.float("OPENAI_TEMPERATURE", default=0.7)
 # Sized for the full content pack (six formats in one response), not a single

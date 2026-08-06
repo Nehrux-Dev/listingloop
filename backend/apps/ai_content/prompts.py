@@ -232,13 +232,54 @@ VERIFIED FACTS — this list is complete. Anything not listed is unknown to you.
 Write every format in the schema using only these facts.{extra}"""
 
 
-def build_messages(listing, *, tone: str = "") -> tuple[list[dict[str, str]], dict[str, Any]]:
+def language_instruction(language_code: str) -> str:
+    """The instruction appended when writing in something other than English.
+
+    Written as a *composition* instruction rather than a translation one. Asking
+    a model to "translate the caption" invites it to translate English idiom
+    word-for-word; asking it to write natively in the language, from the same
+    facts, produces copy a native speaker would actually publish.
+
+    The rules are restated rather than assumed to carry over. They are stated
+    in English above, and a language switch is exactly the moment a model is
+    most likely to treat earlier instructions as scene-setting.
+    """
+    from apps.ai_content.languages import SOURCE_LANGUAGE, get_language
+
+    if language_code == SOURCE_LANGUAGE:
+        return ""
+
+    language = get_language(language_code)
+    return f"""
+
+WRITE IN {language.prompt_name.upper()}.
+
+Every field you return must be written in {language.prompt_name}, as a native \
+speaker of {language.prompt_name} would write it — not translated word for \
+word from English. Use the conventions of that language for numbers, currency \
+and address order.
+
+The facts above are given in English. Render them naturally in \
+{language.prompt_name}, but do NOT change any of them: a price is the same \
+price, a bedroom count is the same count. Every rule you were given still \
+applies in full — inventing a feature is exactly as forbidden in \
+{language.prompt_name} as it is in English.
+
+Hashtags may stay in English where that is the convention on the platform, or \
+be written in {language.prompt_name} where that reads better. Either way they \
+must derive only from the facts."""
+
+
+def build_messages(
+    listing, *, tone: str = "", language_code: str = "en"
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Return ``(messages, facts)`` ready for the API call."""
     facts = build_facts(listing)
+    user_prompt = build_user_prompt(facts, tone=tone) + language_instruction(language_code)
     return (
         [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(facts, tone=tone)},
+            {"role": "user", "content": user_prompt},
         ],
         facts,
     )

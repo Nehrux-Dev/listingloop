@@ -77,12 +77,44 @@ export type TemplateSummary = {
   style: TemplateStyle
   style_display: string
   element_count: number
+  /** False for seasonal and agent-led templates — those need no property. */
+  requires_listing: boolean
+  is_seasonal: boolean
   layout_definition: Record<string, unknown>
 }
 
 export type TemplateDetail = TemplateSummary & {
   elements: TemplateElement[]
   permission_map: Record<string, ElementPermission>
+}
+
+export type CalendarEvent = {
+  id: number
+  name: string
+  slug: string
+  category: TemplateCategory
+  category_display: string
+  date: string
+  days_away: number
+  is_past: boolean
+  description: string
+  regions: string[]
+  /** True for lunar/lunisolar dates, which are maintained by hand. */
+  needs_date_review: boolean
+  template_count: number
+}
+
+export function fetchCalendarEvents(
+  params?: Record<string, string>,
+): Promise<CalendarEvent[]> {
+  const query = params ? `?${new URLSearchParams(params).toString()}` : ''
+  return apiRequest<CalendarEvent[]>(`/api/calendar-events/${query}`)
+}
+
+export function fetchEventTemplates(
+  id: number,
+): Promise<{ event: CalendarEvent; templates: TemplateSummary[] }> {
+  return apiRequest(`/api/calendar-events/${id}/templates/`)
 }
 
 export type Facet = { value: string; label: string; count: number }
@@ -201,6 +233,8 @@ export function createDesign(payload: {
   name: string
   template: number
   listing?: number | null
+  /** Ties a seasonal design to the occasion it was made for. */
+  calendar_event?: number | null
   overrides?: Overrides
 }): Promise<Design> {
   return apiRequest<Design>('/api/designs/', { method: 'POST', body: payload })

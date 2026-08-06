@@ -82,6 +82,10 @@ class GeneratedContentSerializer(serializers.ModelSerializer):
     warning_count = serializers.SerializerMethodField()
     variants = ContentVariantSerializer(many=True, read_only=True)
     usable_variant_count = serializers.IntegerField(read_only=True)
+    language_name = serializers.CharField(read_only=True)
+    #: Surfaced so the UI can say the fact check only partly understood this
+    #: language, rather than leaving an agent to assume a full check ran.
+    has_partial_validation = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = GeneratedContent
@@ -90,6 +94,9 @@ class GeneratedContentSerializer(serializers.ModelSerializer):
             "listing",
             "listing_address",
             "kind",
+            "language",
+            "language_name",
+            "has_partial_validation",
             "variants",
             "usable_variant_count",
             "job_status",
@@ -143,7 +150,14 @@ class GeneratedContentStatusSerializer(serializers.ModelSerializer):
 
 
 class GenerateRequestSerializer(serializers.Serializer):
-    """Input for an explicit Generate / Regenerate action."""
+    """Input for an explicit Generate / Regenerate action.
+
+    ``languages`` fans out to one job — and therefore one API call and one
+    stored pack — per language. Not one call returning every language: six
+    languages of six variants would be a very long response, and truncation
+    would lose the last language silently. Separate jobs also mean one language
+    failing does not take the others with it, and each is costed on its own.
+    """
 
     listing = serializers.PrimaryKeyRelatedField(queryset=Listing.objects.all())
     tone = serializers.CharField(
@@ -152,6 +166,31 @@ class GenerateRequestSerializer(serializers.Serializer):
         allow_blank=True,
         help_text="Optional style note. Adds no facts and relaxes no rule.",
     )
+    languages = serializers.ListField(
+        child=serializers.CharField(max_length=16),
+        required=False,
+        allow_empty=False,
+        max_length=8,
+        help_text="Language codes. Defaults to English only.",
+    )
+
+    def validate_languages(self, value: list[str]) -> list[str]:
+        from apps.ai_content.languages import enabled_codes
+
+        allowed = enabled_codes()
+        unknown = [code for code in value if code not in allowed]
+        if unknown:
+            raise serializers.ValidationError(
+                f"Not enabled: {', '.join(unknown)}. Available: {', '.join(allowed)}."
+            )
+
+        # Preserve order, drop duplicates — asking for French twice is a client
+        # slip, not a reason to pay for it twice.
+        seen: list[str] = []
+        for code in value:
+            if code not in seen:
+                seen.append(code)
+        return seen
 
     def validate_listing(self, value: Listing) -> Listing:
         request = self.context.get("request")

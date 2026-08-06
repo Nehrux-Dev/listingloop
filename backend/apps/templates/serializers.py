@@ -8,6 +8,7 @@ from apps.accounts.models import AgentProfile
 from apps.listings.models import Listing
 from apps.templates.dimensions import SOCIAL_DIMENSIONS
 from apps.templates.models import (
+    CalendarEvent,
     Design,
     DesignExport,
     ExportFormat,
@@ -57,6 +58,9 @@ class TemplateListSerializer(serializers.ModelSerializer):
     category_display = serializers.CharField(source="get_category_display", read_only=True)
     style_display = serializers.CharField(source="get_style_display", read_only=True)
     element_count = serializers.IntegerField(source="elements.count", read_only=True)
+    #: Published so the library can stop asking for a listing on a Diwali card.
+    requires_listing = serializers.BooleanField(read_only=True)
+    is_seasonal = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Template
@@ -70,6 +74,8 @@ class TemplateListSerializer(serializers.ModelSerializer):
             "style",
             "style_display",
             "element_count",
+            "requires_listing",
+            "is_seasonal",
             "layout_definition",
         )
         read_only_fields = fields
@@ -85,6 +91,39 @@ class TemplateDetailSerializer(TemplateListSerializer):
 
     def get_permission_map(self, obj: Template) -> dict[str, str]:
         return obj.permission_map
+
+
+class CalendarEventSerializer(serializers.ModelSerializer):
+    """One dated occasion, with the templates that suit it."""
+
+    category_display = serializers.CharField(source="get_category_display", read_only=True)
+    days_away = serializers.IntegerField(read_only=True)
+    is_past = serializers.BooleanField(read_only=True)
+    template_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CalendarEvent
+        fields = (
+            "id",
+            "name",
+            "slug",
+            "category",
+            "category_display",
+            "date",
+            "days_away",
+            "is_past",
+            "description",
+            "regions",
+            "needs_date_review",
+            "template_count",
+        )
+        read_only_fields = fields
+
+    def get_template_count(self, obj: CalendarEvent) -> int:
+        counts = self.context.get("template_counts")
+        if counts is not None:
+            return counts.get(obj.category, 0)
+        return Template.objects.filter(category=obj.category, is_active=True).count()
 
 
 class DesignExportSerializer(serializers.ModelSerializer):
@@ -135,6 +174,7 @@ class DesignSerializer(serializers.ModelSerializer):
             "agent",
             "listing",
             "listing_address",
+            "calendar_event",
             "overrides",
             "exports",
             "created_at",
@@ -198,6 +238,19 @@ class DesignSerializer(serializers.ModelSerializer):
         template = attrs.get("template") or getattr(self.instance, "template", None)
         if template is None:
             raise serializers.ValidationError({"template": "A template is required."})
+
+        # A seasonal template needs no property; a "Just Sold" one is
+        # meaningless without it and would render with empty fields.
+        listing = attrs.get("listing", getattr(self.instance, "listing", None))
+        if template.requires_listing and listing is None:
+            raise serializers.ValidationError(
+                {
+                    "listing": (
+                        f"“{template.name}” describes a specific property, so it "
+                        f"needs a listing."
+                    )
+                }
+            )
 
         if "overrides" in attrs:
             attrs["overrides"] = validate_overrides(template, attrs["overrides"])

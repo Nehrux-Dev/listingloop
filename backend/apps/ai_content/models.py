@@ -94,6 +94,9 @@ class GeneratedContentQuerySet(models.QuerySet):
             return self.filter(listing__agent__brokerage__admins=user).distinct()
         return self.filter(listing__agent__user=user)
 
+    def in_language(self, code: str):
+        return self.filter(language=code)
+
     def usable(self):
         """Content an agent may actually publish."""
         return self.filter(
@@ -123,6 +126,12 @@ class GeneratedContent(TimeStampedModel):
         max_length=32,
         choices=ContentKind.choices,
         default=ContentKind.SOCIAL_CAPTION,
+    )
+    #: One generation per language, so each language's pack is stored, reviewed
+    #: and costed on its own. A single row holding six languages would make
+    #: "approve the French copy" impossible to express.
+    language = models.CharField(
+        _("language"), max_length=16, default="en", db_index=True
     )
 
     # -- job lifecycle ------------------------------------------------------
@@ -199,6 +208,7 @@ class GeneratedContent(TimeStampedModel):
         indexes = [
             models.Index(fields=["listing", "-created_at"]),
             models.Index(fields=["job_status", "-created_at"]),
+            models.Index(fields=["listing", "language", "-created_at"]),
         ]
 
     def __str__(self) -> str:
@@ -223,6 +233,21 @@ class GeneratedContent(TimeStampedModel):
     @property
     def usable_variant_count(self) -> int:
         return sum(1 for variant in self.variants.all() if variant.is_usable)
+
+    @property
+    def language_name(self) -> str:
+        from apps.ai_content.languages import KNOWN_LANGUAGES
+
+        known = KNOWN_LANGUAGES.get(self.language)
+        return known.name if known else self.language
+
+    @property
+    def has_partial_validation(self) -> bool:
+        """True when the fact-check could not fully read this language."""
+        from apps.ai_content.languages import KNOWN_LANGUAGES
+
+        known = KNOWN_LANGUAGES.get(self.language)
+        return bool(known and not known.is_fully_covered)
 
 
 class ContentVariant(TimeStampedModel):

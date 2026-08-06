@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import logging
 
+from datetime import timedelta
+
 from django.conf import settings
-from django.db.models import QuerySet
+from django.db.models import Count, QuerySet
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -27,6 +30,9 @@ from rest_framework.throttling import ScopedRateThrottle
 from apps.templates.dimensions import DEFAULT_DIMENSION, SOCIAL_DIMENSIONS, get_dimension
 from apps.templates.html_builder import describe_design
 from apps.templates.models import (
+    LISTING_CATEGORIES,
+    SEASONAL_CATEGORIES,
+    CalendarEvent,
     Design,
     DesignExport,
     ExportFormat,
@@ -38,6 +44,7 @@ from apps.templates.permissions import DesignPermission
 from apps.templates.render_context import build_context
 from apps.templates.rendering import export_design_bundle, render_design
 from apps.templates.serializers import (
+    CalendarEventSerializer,
     DesignDuplicateSerializer,
     DesignExportRequestSerializer,
     DesignExportSerializer,
@@ -60,6 +67,13 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
 
     permission_classes = [IsAuthenticated]
 
+    def get_serializer_class(self):
+        return (
+            TemplateDetailSerializer
+            if self.action == "retrieve"
+            else TemplateListSerializer
+        )
+
     def get_queryset(self) -> QuerySet[Template]:
         queryset = Template.objects.filter(is_active=True).prefetch_related("elements")
 
@@ -76,14 +90,18 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
         if search:
             queryset = queryset.filter(name__icontains=search)
 
-        return queryset
+        # `seasonal=true` is how the content calendar asks for the templates an
+        # agent can use with no property attached.
+        seasonal = params.get("seasonal")
+        if seasonal == "true":
+            queryset = queryset.filter(category__in=SEASONAL_CATEGORIES)
+        elif seasonal == "false":
+            queryset = queryset.exclude(category__in=SEASONAL_CATEGORIES)
 
-    def get_serializer_class(self):
-        return (
-            TemplateDetailSerializer
-            if self.action == "retrieve"
-            else TemplateListSerializer
-        )
+        if params.get("no_listing_required") == "true":
+            queryset = queryset.exclude(category__in=LISTING_CATEGORIES)
+
+        return queryset
 
     @action(detail=False, methods=["get"], url_path="facets")
     def facets(self, request: Request) -> Response:
@@ -107,6 +125,68 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
                     }
                     for value, label in TemplateStyle.choices
                 ],
+            }
+        )
+
+
+class CalendarEventViewSet(viewsets.ReadOnlyModelViewSet):
+    """The content calendar.
+
+    Read-only: dates for moving festivals are maintained deliberately in the
+    admin, not edited by agents. Getting Eid wrong for somebody is not a thing
+    to leave to a free-text field in the app.
+    """
+
+    serializer_class = CalendarEventSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = None
+
+    def get_queryset(self) -> QuerySet[CalendarEvent]:
+        queryset = CalendarEvent.objects.filter(is_active=True)
+
+        params = self.request.query_params
+        # Default to what is still ahead: a calendar of past festivals is a
+        # history lesson, not a planning tool.
+        if params.get("include_past") != "true":
+            queryset = queryset.filter(date__gte=timezone.localdate())
+
+        within = params.get("within_days")
+        if within and within.isdigit():
+            queryset = queryset.filter(
+                date__lte=timezone.localdate() + timedelta(days=int(within))
+            )
+
+        category = params.get("category")
+        if category:
+            queryset = queryset.filter(category=category)
+
+        return queryset.order_by("date")
+
+    def get_serializer_context(self) -> dict:
+        context = super().get_serializer_context()
+        # Counted once for the whole page rather than per row.
+        context["template_counts"] = {
+            row["category"]: row["total"]
+            for row in Template.objects.filter(is_active=True)
+            .values("category")
+            .annotate(total=Count("id"))
+        }
+        return context
+
+    @action(detail=True, methods=["get"], url_path="templates")
+    def templates_for_event(self, request: Request, pk=None) -> Response:
+        """The templates an agent can use for this occasion.
+
+        None of them need a listing — that is the point of the calendar.
+        """
+        event = self.get_object()
+        templates = Template.objects.filter(category=event.category, is_active=True)
+        return Response(
+            {
+                "event": self.get_serializer(event).data,
+                "templates": TemplateListSerializer(
+                    templates, many=True, context=self.get_serializer_context()
+                ).data,
             }
         )
 

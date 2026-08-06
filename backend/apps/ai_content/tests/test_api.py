@@ -38,8 +38,11 @@ class GenerateEndpointTests(AIContentTestCase):
         )
 
         self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.data["job_status"], JobStatus.QUEUED)
-        self.assertEqual(response.data["caption"], "")
+        # A list, because one request can ask for several languages. English
+        # only, here.
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["job_status"], JobStatus.QUEUED)
+        self.assertEqual(response.data[0]["caption"], "")
 
         generation = GeneratedContent.objects.get()
         # Queued rather than executed inline: the request does not wait on
