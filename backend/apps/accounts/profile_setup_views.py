@@ -1,16 +1,18 @@
-"""Onboarding endpoints — steps 2 to 4 of agent registration.
+"""Profile setup — the parts of Settings that the CRUD endpoints do not cover.
 
-    GET  /api/onboarding/status/             what is done, what is missing
-    GET  /api/onboarding/brokerages/         search the directory before creating
-    POST /api/onboarding/brokerage/          join an existing one, or create one
-    POST /api/onboarding/complete/           finish and report readiness
+    GET  /api/profile/completeness/    what is filled in, what is missing, where
+    GET  /api/profile/brokerages/      search the directory before creating
+    POST /api/profile/brokerage/       join an existing one, or create one
 
-Step 1 (the account itself) is ``/api/auth/register/``, which already existed —
-onboarding does not create a second way to make an account.
+Registration is ``/api/auth/register/`` and asks for a name, an email and a
+password. Nothing here is a step in a sequence and nothing here is required:
+an agent may use the product indefinitely without ever calling any of it. The
+export path is the only thing that insists, and only for the specific fields
+the design it is rendering actually shows.
 
-These are thin: they orchestrate the models and serializers built in earlier
-steps rather than introducing parallel ones. The only genuinely new capability
-is letting an agent set up a brokerage at all, which the admin-only create rule
+These are thin: they orchestrate models and serializers that already existed
+rather than introducing parallel ones. The only genuinely new capability is
+letting an agent set up a brokerage at all, which the admin-only create rule
 previously made impossible.
 """
 
@@ -26,11 +28,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from apps.accounts.models import AgentProfile, BrandKit, Brokerage, Role
-from apps.accounts.onboarding import assess_profile
+from apps.accounts.completeness import assess_profile
+from apps.accounts.models import AgentProfile, Brokerage
 from apps.accounts.profile_serializers import (
-    AgentProfileSerializer,
-    BrandKitSerializer,
     BrokerageDirectorySerializer,
     BrokerageOnboardingSerializer,
     BrokerageSerializer,
@@ -83,52 +83,16 @@ class JoinBrokerageSerializer(serializers.Serializer):
         return attrs
 
 
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def onboarding_status(request: Request) -> Response:
-    """Where the agent is up to, and what is still missing.
-
-    Drives both the onboarding wizard and the dashboard's completion badge —
-    one source of truth, so the two cannot disagree about whether the profile
-    is finished.
-    """
-    profile = _profile_for(request.user)
-    assessment = assess_profile(profile)
-
-    return Response(
-        {
-            "role": request.user.role,
-            "has_profile": profile is not None,
-            "profile": AgentProfileSerializer(
-                profile, context={"request": request}
-            ).data
-            if profile
-            else None,
-            "brokerage": BrokerageSerializer(
-                profile.brokerage, context={"request": request}
-            ).data
-            if profile and profile.brokerage
-            else None,
-            "brand_kit": BrandKitSerializer(
-                getattr(profile, "brand_kit", None), context={"request": request}
-            ).data
-            if profile and getattr(profile, "brand_kit", None)
-            else None,
-            **assessment,
-        }
-    )
-
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def set_brokerage(request: Request) -> Response:
-    """Step 3 — associate the agent with a brokerage.
+    """Associate the agent with a brokerage — join an existing one, or add it.
 
     An agent may create a brokerage *here*, which the general Brokerage
     endpoint reserves for platform admins. The difference is scope: this only
     ever attaches the result to the caller's own profile, and refuses a
-    duplicate name outright. Without it a new agent could not finish onboarding
-    at all, because there would be nobody to create their firm.
+    duplicate name outright. Without it the first agent at a firm could never
+    record who they work for, because there would be nobody to create it.
     """
     profile = _profile_for(request.user)
     if profile is None:
@@ -153,8 +117,7 @@ def set_brokerage(request: Request) -> Response:
             # exists with nobody able to maintain its logo or disclaimer.
             brokerage.admins.add(request.user)
             logger.info(
-                "User %s created brokerage %s during onboarding",
-                request.user.pk, brokerage.pk,
+                "User %s created brokerage %s", request.user.pk, brokerage.pk
             )
 
         profile.brokerage = brokerage
@@ -166,40 +129,15 @@ def set_brokerage(request: Request) -> Response:
     )
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def complete_onboarding(request: Request) -> Response:
-    """Step 5 — finish.
-
-    Does not *enforce* completeness: an agent is allowed to finish onboarding
-    with gaps and fill them in later from the settings pages. What it does is
-    report exactly what is still missing, so the dashboard can say so and the
-    export gate is never the first time they hear about it.
-    """
-    profile = _profile_for(request.user)
-    if profile is None:
-        return Response(
-            {"detail": "No agent profile found for this account."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-
-    # A brand kit is created on demand with the model defaults, so an agent who
-    # skipped step 4 still has a branded (if unremarkable) starting point
-    # rather than a null the renderer has to guess around.
-    BrandKit.objects.get_or_create(agent=profile)
-
-    assessment = assess_profile(profile)
-    logger.info(
-        "User %s completed onboarding at %s%% (ready=%s)",
-        request.user.pk, assessment["completion_percent"], assessment["ready_for_marketing"],
-    )
-    return Response(assessment)
-
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def profile_completion(request: Request) -> Response:
-    """Just the numbers, for the dashboard badge."""
+def profile_completeness(request: Request) -> Response:
+    """What is filled in, what is missing, and where each gap is fixed.
+
+    Feeds the dashboard prompt. Reporting only — an agent who ignores it
+    forever keeps a working account; the export path is what insists, and only
+    about the fields the design being exported actually shows.
+    """
     assessment = assess_profile(_profile_for(request.user))
     return Response(
         {
@@ -207,6 +145,7 @@ def profile_completion(request: Request) -> Response:
             "is_complete": assessment["is_complete"],
             "ready_for_marketing": assessment["ready_for_marketing"],
             "missing_required": assessment["missing_required"],
+            "missing_optional": assessment["missing_optional"],
             "by_step": assessment["by_step"],
         }
     )

@@ -138,8 +138,8 @@ class AgentProfile(TimeStampedModel):
     job_title = models.CharField(_("job title"), max_length=120, blank=True)
     tagline = models.CharField(_("tagline"), max_length=255, blank=True)
     #: Whether this is required is a jurisdiction question, not a code one, so
-    #: the field is optional here and the *completion* rules decide whether an
-    #: agent may generate marketing without it. See apps/accounts/onboarding.py.
+    #: the field is optional here and the completeness rules decide whether an
+    #: agent may generate marketing without it. See accounts/completeness.py.
     licence_number = models.CharField(
         _("licence number"),
         max_length=64,

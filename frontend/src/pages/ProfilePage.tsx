@@ -1,10 +1,11 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 
 import {
   fetchMyProfile,
   updateMyProfile,
   type AgentProfile,
 } from '../api/profiles.ts'
+import BrokerageSetupCard from '../components/BrokerageSetupCard.tsx'
 import {
   Alert,
   Card,
@@ -21,9 +22,17 @@ type Form = {
   email: string
   job_title: string
   tagline: string
+  licence_number: string
 }
 
-const EMPTY: Form = { name: '', phone: '', email: '', job_title: '', tagline: '' }
+const EMPTY: Form = {
+  name: '',
+  phone: '',
+  email: '',
+  job_title: '',
+  tagline: '',
+  licence_number: '',
+}
 
 /**
  * An agent editing their own profile.
@@ -41,24 +50,33 @@ export default function ProfilePage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
-  useEffect(() => {
-    fetchMyProfile()
-      .then((data) => {
-        setProfile(data)
-        setForm({
-          name: data.name,
-          phone: data.phone,
-          email: data.email,
-          job_title: data.job_title,
-          tagline: data.tagline,
+  // Also called after the brokerage card changes anything, so the read-only
+  // view of it below reflects the join or create without a page reload.
+  const reload = useCallback(
+    () =>
+      fetchMyProfile()
+        .then((data) => {
+          setProfile(data)
+          setForm({
+            name: data.name,
+            phone: data.phone,
+            email: data.email,
+            job_title: data.job_title,
+            tagline: data.tagline,
+            licence_number: data.licence_number,
+          })
         })
-      })
-      .catch((error: unknown) =>
-        setLoadError(
-          error instanceof ApiError ? error.message : 'Could not load your profile.',
+        .catch((error: unknown) =>
+          setLoadError(
+            error instanceof ApiError ? error.message : 'Could not load your profile.',
+          ),
         ),
-      )
-  }, [])
+    [],
+  )
+
+  useEffect(() => {
+    void reload()
+  }, [reload])
 
   function update<K extends keyof Form>(key: K, value: Form[K]) {
     setForm((current) => ({ ...current, [key]: value }))
@@ -157,33 +175,24 @@ export default function ProfilePage() {
             error={errors.tagline}
             maxLength={255}
           />
-        </Card>
-
-        <Card
-          title="Brokerage"
-          description="Set by your brokerage administrator — contact them to change it."
-        >
-          <div className="flex items-center gap-3">
-            {profile.brokerage_detail?.logo_url && (
-              <img
-                src={profile.brokerage_detail.logo_url}
-                alt=""
-                className="size-10 rounded object-contain"
-              />
-            )}
-            <p className="text-sm text-slate-700">
-              {profile.brokerage_detail?.name ?? 'Not assigned to a brokerage yet.'}
-            </p>
-          </div>
-          {profile.brokerage_detail?.required_disclaimer && (
-            <p className="rounded-md bg-slate-50 p-3 text-xs text-slate-500">
-              {profile.brokerage_detail.required_disclaimer}
-            </p>
-          )}
+          <TextField
+            label="Licence number"
+            value={form.licence_number}
+            onChange={(value) => update('licence_number', value)}
+            error={errors.licence_number}
+            hint="Where your jurisdiction requires it on marketing material."
+          />
         </Card>
 
         <SubmitButton saving={saving} />
       </form>
+
+      {/* Outside the form above: creating a brokerage submits its own, and a
+          nested <form> is invalid HTML. */}
+      <BrokerageSetupCard
+        brokerage={profile.brokerage_detail ?? null}
+        onChanged={reload}
+      />
     </div>
   )
 }

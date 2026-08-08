@@ -54,9 +54,9 @@ type RequireRoleProps = {
   /**
    * Also admit anyone who administers a brokerage, whatever their role.
    *
-   * Needed for /brokerage: an agent who created their firm during onboarding
-   * may edit it, but holds the Agent role. Without this the export gate would
-   * tell them to fix the brokerage logo on a screen they are bounced off.
+   * Needed for /brokerage: an agent who added their firm from Settings may
+   * edit it, but holds the Agent role. Without this the export gate would tell
+   * them to fix the brokerage logo on a screen they are bounced off.
    */
   orBrokerageAdministrator?: boolean
   children?: ReactNode

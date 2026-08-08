@@ -1,19 +1,25 @@
 import { useState, type FormEvent } from 'react'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
 
-import { registerAgent } from '../api/onboarding.ts'
+import { registerAgent } from '../api/profileSetup.ts'
 import { useAuth } from '../auth/AuthContext.tsx'
 import { ApiError } from '../lib/apiClient.ts'
 
 /**
- * Step 1 of agent registration.
+ * Create an account: name, email, password. That is the whole of it.
+ *
+ * No brokerage, no licence number, no brand kit, and no wizard afterwards.
+ * Those are real requirements, but they are requirements of *publishing*, not
+ * of having an account — so they are collected in Settings and enforced at
+ * export. An agent who wants to look around first, or who has not yet
+ * convinced their brokerage to pay for this, is not stopped on day one.
  *
  * Deliberately matches LoginPage: same card, same field styling, same
  * button — this is the other half of one front door, not a different product.
  *
  * On success the API returns a session (access token + httpOnly refresh
- * cookie), so onboarding continues straight into step 2 rather than bouncing
- * the new agent to a sign-in form they just implicitly passed.
+ * cookie), so the new agent goes straight to the dashboard rather than being
+ * bounced to a sign-in form they just implicitly passed.
  */
 export default function RegisterPage() {
   const { status, refresh } = useAuth()
@@ -30,7 +36,7 @@ export default function RegisterPage() {
   const [submitting, setSubmitting] = useState(false)
 
   if (status === 'authenticated') {
-    return <Navigate to="/onboarding" replace />
+    return <Navigate to="/" replace />
   }
 
   function update(key: keyof typeof form, value: string) {
@@ -56,7 +62,7 @@ export default function RegisterPage() {
     try {
       await registerAgent(form)
       await refresh()
-      void navigate('/onboarding', { replace: true })
+      void navigate('/', { replace: true })
     } catch (error) {
       if (error instanceof ApiError && error.data && typeof error.data === 'object') {
         const parsed: Record<string, string> = {}
@@ -78,7 +84,7 @@ export default function RegisterPage() {
           Create your agent account
         </h1>
         <p className="mt-1 text-sm text-slate-500">
-          Step 1 of 4 — we'll set up your profile and branding next.
+          Takes a minute. You can add your brokerage and branding later.
         </p>
 
         <form

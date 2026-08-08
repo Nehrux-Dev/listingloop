@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import {
   deleteDesign,
@@ -23,6 +23,15 @@ import { CompliancePanel } from '../components/CompliancePanel.tsx'
 import { Alert, Card } from '../components/FormControls.tsx'
 import { ElementControls } from '../components/ElementControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
+
+/** A field this design needs, and the screen that fills it in. */
+type MissingField = {
+  element: string
+  label: string
+  step: string
+  step_label: string
+  fix_path: string
+}
 
 export default function DesignEditorPage() {
   const { id } = useParams<{ id: string }>()
@@ -48,6 +57,7 @@ export default function DesignEditorPage() {
   const [exportDims, setExportDims] = useState<string[]>(['instagram_post'])
   const [exportFormat, setExportFormat] = useState<'png' | 'jpg'>('png')
   const [compliance, setCompliance] = useState<ComplianceReport | null>(null)
+  const [notReady, setNotReady] = useState<MissingField[]>([])
   const [checkingCompliance, setCheckingCompliance] = useState(true)
 
   const checkCompliance = useCallback(async () => {
@@ -159,6 +169,7 @@ export default function DesignEditorPage() {
     if (exportDims.length === 0) return
     setBusy(true)
     setErrors({})
+    setNotReady([])
     setMessage(null)
     try {
       const result = await exportDesign(designId, exportDims, exportFormat)
@@ -166,15 +177,27 @@ export default function DesignEditorPage() {
       setCompliance(result.compliance)
       setMessage(`Exported ${exportDims.length} image${exportDims.length === 1 ? '' : 's'}.`)
     } catch (error) {
-      // A 409 means compliance stopped it. The report comes back in the error
-      // body, so the agent is told which rule and why rather than just "no".
+      // Two different 409s, and telling an agent the wrong one wastes their
+      // time: either a rule flagged the copy, or a field the design needs is
+      // simply empty. The readiness body carries `missing`; the compliance one
+      // carries `compliance`.
       if (error instanceof ApiError && error.status === 409) {
-        const data = error.data as { compliance?: ComplianceReport } | null
-        if (data?.compliance) setCompliance(data.compliance)
-        setErrors({
-          detail:
-            'This design does not meet the compliance rules yet — see the flags below.',
-        })
+        const data = error.data as {
+          compliance?: ComplianceReport
+          missing?: MissingField[]
+          detail?: string
+        } | null
+
+        if (data?.missing?.length) {
+          setNotReady(data.missing)
+          setErrors({ detail: data.detail ?? 'This design is missing information.' })
+        } else {
+          if (data?.compliance) setCompliance(data.compliance)
+          setErrors({
+            detail:
+              'This design does not meet the compliance rules yet — see the flags below.',
+          })
+        }
       } else {
         setErrors({
           detail: error instanceof ApiError ? error.message : 'Could not export this design.',
@@ -240,6 +263,28 @@ export default function DesignEditorPage() {
 
       {message && <Alert kind="success">{message}</Alert>}
       {errors.detail && <Alert kind="error">{errors.detail}</Alert>}
+
+      {/* The requirement is real, but this is the first moment it is real —
+          so it arrives with the way to satisfy it, not just a refusal. */}
+      {notReady.length > 0 && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 p-4">
+          <p className="text-sm font-medium text-amber-900">
+            Fill these in and the export will go through:
+          </p>
+          <ul className="mt-3 flex flex-wrap gap-2">
+            {notReady.map((field) => (
+              <li key={field.element}>
+                <Link
+                  to={field.fix_path}
+                  className="inline-block rounded-md border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-900 transition hover:border-amber-500"
+                >
+                  {field.label} — {field.step_label} →
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {Object.keys(errors).some((key) => key !== 'detail') && (
         <Alert kind="error">
           Some changes were rejected. See the highlighted elements below.

@@ -10,7 +10,7 @@ urlpatterns = [
     path("api/", include("apps.core.urls")),
     path("api/auth/", include("apps.accounts.urls")),
     path("api/admin/", include("apps.accounts.admin_urls")),
-    path("api/onboarding/", include("apps.accounts.onboarding_urls")),
+    path("api/profile/", include("apps.accounts.profile_setup_urls")),
     path("api/", include("apps.accounts.profile_urls")),
     path("api/", include("apps.listings.urls")),
     path("api/", include("apps.templates.urls")),

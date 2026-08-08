@@ -29,7 +29,7 @@ export type User = {
   role_display: string
   /**
    * True when this user administers at least one brokerage — which an Agent
-   * does if they created their firm during onboarding. Separate from `role`
+   * does if they added their firm from Settings. Separate from `role`
    * on purpose: administering one brokerage is not a rank.
    */
   administers_brokerage: boolean

@@ -18,8 +18,14 @@ WHAT COUNTS AS BLOCKING
 An element blocks the export when it resolves to nothing AND either:
 
   * it is marked ``required`` in the template's own constraints, or
-  * it draws on agent / brokerage / brand data — the reusable information
-    onboarding exists to collect.
+  * it draws on agent / brokerage / brand data — the reusable information the
+    profile exists to hold.
+
+This is where a missing disclaimer is actually caught. Not at sign-up: an
+agent who has not yet named their brokerage can still create an account, add
+listings and explore the template library. The requirement only bites at the
+moment it becomes real, which is the moment something is about to be published,
+and it arrives with a link to the screen that fixes it.
 
 Elements drawing on *listing* data are deliberately excluded. A listing with no
 photo is a listing problem, and the verification gate from Step 4 already
@@ -33,12 +39,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from apps.accounts.completeness import fix_path_for
 from apps.templates.html_builder import (
     resolve_element_content,
     unresolved_placeholders,
 )
 
-#: content_source prefix -> (label shown to the agent, onboarding step)
+#: content_source prefix -> (label shown to the agent, Settings area)
 SOURCE_LABELS: dict[str, tuple[str, str]] = {
     "agent.photo": ("Profile photo", "profile"),
     "agent.name": ("Your name", "profile"),
@@ -74,6 +81,9 @@ class MissingElement:
     element_key: str
     label: str
     step: str
+    #: Where to send the agent. Carried per item rather than derived by the
+    #: caller, because the brokerage case depends on whether they have one yet.
+    fix_path: str = "/profile"
 
     def as_dict(self) -> dict:
         return {
@@ -81,6 +91,7 @@ class MissingElement:
             "label": self.label,
             "step": self.step,
             "step_label": STEP_LABELS.get(self.step, self.step),
+            "fix_path": self.fix_path,
         }
 
 
@@ -105,6 +116,18 @@ def _describe(source: str, element) -> tuple[str, str]:
         # No source at all — a required element with only literal content.
         step = "profile"
     return label, step
+
+
+def _fix_path(step: str, design) -> str:
+    """The screen that fixes a gap, as a link the refusal can offer directly.
+
+    "The required disclaimer is missing" is not actionable on its own — the
+    agent has to work out which of four screens owns it. The listing case
+    resolves to that listing's own editor rather than the list.
+    """
+    if step == "listing":
+        return f"/listings/{design.listing_id}" if design.listing_id else "/listings"
+    return fix_path_for(step, getattr(design, "agent", None))
 
 
 def assess_design(design, context: dict) -> list[MissingElement]:
@@ -132,7 +155,9 @@ def assess_design(design, context: dict) -> list[MissingElement]:
             if label in seen:
                 continue
             seen.add(label)
-            missing.append(MissingElement(element.key, label, step))
+            missing.append(
+                MissingElement(element.key, label, step, _fix_path(step, design))
+            )
             continue
 
         # A partly-resolved placeholder is its own failure: "Call " with no
@@ -145,7 +170,9 @@ def assess_design(design, context: dict) -> list[MissingElement]:
                 if label in seen:
                     continue
                 seen.add(label)
-                missing.append(MissingElement(element.key, label, step))
+                missing.append(
+                    MissingElement(element.key, label, step, _fix_path(step, design))
+                )
 
     return missing
 

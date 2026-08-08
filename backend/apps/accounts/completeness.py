@@ -1,4 +1,17 @@
-"""Profile completion, and the gate before marketing assets are generated.
+"""Profile completeness — one reusable check, enforced where it matters.
+
+=============================================================================
+NOTHING HERE IS COLLECTED AT SIGN-UP
+=============================================================================
+
+Registration asks for a name, an email and a password. Every field below is
+optional, nullable, and filled in from Settings whenever the agent gets round
+to it. An agent evaluating the product — or waiting on their brokerage to
+approve the spend — is not stopped on day one by a licence-number box.
+
+The rest is collected contextually: this module says what is missing, the
+dashboard offers it as a dismissible prompt, and the export path is the only
+thing that actually insists (see apps/templates/readiness.py).
 
 =============================================================================
 WHY THIS IS NOT JUST A PROGRESS BAR
@@ -8,7 +21,7 @@ Two different questions, and conflating them is how an agent ends up with a
 listing card that has a blank rectangle where their brokerage logo should be:
 
   COMPLETION  — how much of the reusable profile is filled in. A percentage,
-                shown on the dashboard, purely informational.
+                shown on the dashboard, purely informational. Dismissible.
 
   READINESS   — whether the specific fields a marketing asset *needs* are
                 present. A hard check, run before rendering, that names what is
@@ -23,8 +36,8 @@ WHAT COUNTS AS REQUIRED IS DATA, NOT CODE
 ``REQUIRED_FOR_MARKETING`` is a list of checks. Adding a requirement means
 adding an entry, not editing a rendering path — the same reasoning as the
 compliance engine. Each entry knows how to find its value, what to call it in a
-message, and which onboarding step fixes it, so the UI can link straight to the
-right place instead of saying "something is missing".
+message, and which Settings screen fixes it, so every message can link straight
+there instead of saying "something is missing".
 """
 
 from __future__ import annotations
@@ -37,7 +50,7 @@ from typing import Any, Callable
 class ProfileField:
     key: str
     label: str
-    #: Which onboarding step collects it, so the UI can deep-link the fix.
+    #: Which Settings area owns it, so every message can deep-link the fix.
     step: str
     getter: Callable[[Any], Any]
     #: Required to generate marketing, as opposed to merely nice to have.
@@ -77,9 +90,9 @@ def _brand_kit(profile):
     return getattr(brokerage, "brand_kit", None) if brokerage else None
 
 
-#: Everything onboarding collects. Order matters: it is the order shown.
+#: Everything the profile can hold. Order matters: it is the order shown.
 PROFILE_FIELDS: tuple[ProfileField, ...] = (
-    # -- Step 2: professional profile ---------------------------------------
+    # -- Settings > Your profile ---------------------------------------------
     ProfileField(
         "agent_name", "Your name", "profile",
         lambda p: p.name or p.user.full_name,
@@ -110,7 +123,7 @@ PROFILE_FIELDS: tuple[ProfileField, ...] = (
         required_for_marketing=False,
         hint="Where your jurisdiction requires it on marketing material.",
     ),
-    # -- Step 3: brokerage ---------------------------------------------------
+    # -- Settings > Brokerage ------------------------------------------------
     ProfileField(
         "brokerage", "Brokerage", "brokerage",
         lambda p: _brokerage(p),
@@ -125,7 +138,7 @@ PROFILE_FIELDS: tuple[ProfileField, ...] = (
         lambda p: _brokerage(p).required_disclaimer if _brokerage(p) else None,
         hint="The compliance text that must appear on your material.",
     ),
-    # -- Step 4: brand kit ---------------------------------------------------
+    # -- Settings > Brand kit ------------------------------------------------
     ProfileField(
         "brand_colours", "Brand colours", "brand",
         lambda p: (_brand_kit(p).primary_color if _brand_kit(p) else None),
@@ -152,6 +165,30 @@ STEP_LABELS = {
     "brand": "Brand kit",
 }
 
+#: Which Settings screen fixes each area. These are frontend routes, which is a
+#: small coupling accepted on purpose: "the required disclaimer is missing" is
+#: not actionable, and every caller that reports a gap would otherwise have to
+#: reinvent the same mapping.
+STEP_PATHS = {
+    "profile": "/profile",
+    "brokerage": "/brokerage",
+    "brand": "/brand-kit",
+}
+
+
+def fix_path_for(step: str, profile=None) -> str:
+    """Where to send someone to fill in a missing field.
+
+    The brokerage case is not a constant. An agent with no brokerage at all
+    cannot go to /brokerage — that screen administers a brokerage you are
+    already in, and the guard would bounce them. Joining or creating one lives
+    on the profile screen, so that is where the link has to point until they
+    have one.
+    """
+    if step == "brokerage" and (profile is None or profile.brokerage_id is None):
+        return STEP_PATHS["profile"]
+    return STEP_PATHS.get(step, "/profile")
+
 
 def assess_profile(profile) -> dict:
     """Completion and readiness for one agent profile."""
@@ -175,6 +212,7 @@ def assess_profile(profile) -> dict:
                 "label": field.label,
                 "step": field.step,
                 "step_label": STEP_LABELS.get(field.step, field.step),
+                "fix_path": fix_path_for(field.step, profile),
                 "present": present,
                 "required_for_marketing": field.required_for_marketing,
                 "hint": field.hint,

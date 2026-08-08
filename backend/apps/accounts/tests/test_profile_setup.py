@@ -1,9 +1,10 @@
-"""Agent registration and onboarding.
+"""Registration and profile setup.
 
-Step 1 (the account) already existed and is covered in ``test_auth.py``. What
-is tested here is what onboarding adds: first/last names, the brokerage
-join-or-create path, profile completion, and the gate that stops a marketing
-asset rendering with a hole in it.
+Registration asks for a name, an email and a password, and lands the agent in
+the product rather than in a wizard. Everything else is optional and lives in
+Settings, so a good deal of what is tested here is that the optional parts
+really are optional: an account with an empty profile works, and the only
+thing that ever insists is the export path.
 """
 
 from __future__ import annotations
@@ -14,24 +15,22 @@ import tempfile
 from django.test import override_settings
 from django.urls import reverse
 
-from apps.accounts.models import AgentProfile, BrandKit, Brokerage, Role, User
-from apps.accounts.onboarding import (
+from apps.accounts.completeness import (
     ProfileIncompleteError,
     assess_profile,
     require_marketing_ready,
 )
+from apps.accounts.models import AgentProfile, BrandKit, Brokerage, Role, User
 from apps.accounts.tests.base import PASSWORD, AuthAPITestCase, make_image_file
 
-MEDIA_ROOT = tempfile.mkdtemp(prefix="real-estate-onboarding-media-")
+MEDIA_ROOT = tempfile.mkdtemp(prefix="real-estate-profile-setup-media-")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class OnboardingTestCase(AuthAPITestCase):
-    status_url = reverse("onboarding:status")
-    completion_url = reverse("onboarding:completion")
-    directory_url = reverse("onboarding:brokerage-directory")
-    set_brokerage_url = reverse("onboarding:set-brokerage")
-    complete_url = reverse("onboarding:complete")
+class ProfileSetupTestCase(AuthAPITestCase):
+    completeness_url = reverse("profile_setup:completeness")
+    directory_url = reverse("profile_setup:brokerage-directory")
+    set_brokerage_url = reverse("profile_setup:set-brokerage")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -59,7 +58,7 @@ class OnboardingTestCase(AuthAPITestCase):
         profile.refresh_from_db()
 
 
-class RegistrationTests(OnboardingTestCase):
+class RegistrationTests(ProfileSetupTestCase):
     def test_registering_with_first_and_last_name(self):
         response = self.client.post(
             self.register_url,
@@ -142,7 +141,8 @@ class RegistrationTests(OnboardingTestCase):
         self.assertFalse(hasattr(user, "password_confirm"))
 
     def test_registration_creates_the_agent_profile(self):
-        """So step 2 has something to fill in rather than having to create it."""
+        """Empty, but present — so Settings has something to edit rather than
+        the agent having to create their own profile before using one."""
         self.client.post(
             self.register_url,
             {
@@ -157,7 +157,8 @@ class RegistrationTests(OnboardingTestCase):
         self.assertEqual(profile.name, "New Agent")
 
     def test_registration_returns_a_session(self):
-        """Onboarding continues straight into step 2 without a second sign-in."""
+        """A new agent lands in the dashboard, not on a sign-in form they just
+        implicitly passed."""
         response = self.client.post(
             self.register_url,
             {
@@ -172,7 +173,7 @@ class RegistrationTests(OnboardingTestCase):
         self.assertIn("refresh_token", response.cookies)
 
 
-class BrokerageStepTests(OnboardingTestCase):
+class BrokerageStepTests(ProfileSetupTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.agent = self.make_agent("agent@example.com")
@@ -418,7 +419,7 @@ class BrokerageStepTests(OnboardingTestCase):
         self.assertEqual(response.status_code, 403)
 
 
-class CompletionTests(OnboardingTestCase):
+class CompletionTests(ProfileSetupTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.agent = self.make_agent("agent@example.com")
@@ -453,7 +454,7 @@ class CompletionTests(OnboardingTestCase):
         self.assertLess(assessment["completion_percent"], 100)
         self.assertTrue(assessment["ready_for_marketing"])
 
-    def test_each_missing_field_names_the_step_that_fixes_it(self):
+    def test_each_missing_field_names_the_screen_that_fixes_it(self):
         """"Something is missing" is not an actionable message."""
         assessment = assess_profile(self.profile)
 
@@ -461,6 +462,28 @@ class CompletionTests(OnboardingTestCase):
             with self.subTest(field=row["key"]):
                 self.assertIn(row["step"], {"profile", "brokerage", "brand"})
                 self.assertTrue(row["label"])
+                self.assertTrue(row["fix_path"].startswith("/"))
+
+    def test_an_agent_with_no_brokerage_is_sent_somewhere_they_can_go(self):
+        """/brokerage administers a brokerage you are already in.
+
+        Pointing an agent who has none at that screen would bounce them off a
+        route guard, so the link has to be the profile screen — which is where
+        joining or creating one lives — until they have one.
+        """
+        rows = {row["key"]: row for row in assess_profile(self.profile)["fields"]}
+
+        self.assertEqual(rows["brokerage"]["fix_path"], "/profile")
+
+    def test_once_they_have_one_the_link_moves_to_the_brokerage_screen(self):
+        self.fully_complete(self.profile)
+        self.profile.brokerage.required_disclaimer = ""
+        self.profile.brokerage.save()
+        self.profile.refresh_from_db()
+
+        rows = {row["key"]: row for row in assess_profile(self.profile)["fields"]}
+
+        self.assertEqual(rows["brokerage_disclaimer"]["fix_path"], "/brokerage")
 
     def test_a_brokerage_brand_kit_counts_as_branding(self):
         """Matches how the renderer resolves branding, so completion cannot
@@ -478,18 +501,10 @@ class CompletionTests(OnboardingTestCase):
         self.assertEqual(assessment["completion_percent"], 0)
         self.assertFalse(assessment["ready_for_marketing"])
 
-    def test_the_status_endpoint_reports_progress(self):
-        response = self.client.get(self.status_url)
+    def test_the_completeness_endpoint_reports_without_demanding(self):
+        response = self.client.get(self.completeness_url)
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.data["has_profile"])
-        self.assertIn("completion_percent", response.data)
-        self.assertIn("by_step", response.data)
-        self.assertEqual(set(response.data["by_step"]), {"profile", "brokerage", "brand"})
-
-    def test_the_completion_endpoint_is_small(self):
-        response = self.client.get(self.completion_url)
-
         self.assertEqual(
             set(response.data),
             {
@@ -497,43 +512,88 @@ class CompletionTests(OnboardingTestCase):
                 "is_complete",
                 "ready_for_marketing",
                 "missing_required",
+                "missing_optional",
                 "by_step",
             },
         )
-
-    def test_completing_onboarding_creates_a_brand_kit(self):
-        """An agent who skipped step 4 still gets a branded starting point."""
-        self.assertFalse(BrandKit.objects.filter(agent=self.profile).exists())
-
-        response = self.client.post(self.complete_url, {}, format="json")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(BrandKit.objects.filter(agent=self.profile).exists())
-
-    def test_completing_with_gaps_is_allowed_but_reported(self):
-        """Gaps are filled in later from settings, not by registering again."""
-        response = self.client.post(self.complete_url, {}, format="json")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.data["ready_for_marketing"])
-        self.assertTrue(response.data["missing_required"])
+        self.assertEqual(set(response.data["by_step"]), {"profile", "brokerage", "brand"})
 
     def test_another_agents_progress_is_not_visible(self):
         other = self.make_agent("other@example.com")
         self.fully_complete(other.agent_profile)
 
-        response = self.client.get(self.status_url)
+        response = self.client.get(self.completeness_url)
 
         # Own profile only — bare, not the complete one belonging to someone else.
         self.assertFalse(response.data["ready_for_marketing"])
 
-    def test_status_requires_authentication(self):
+    def test_completeness_requires_authentication(self):
         self.client.credentials()
 
-        self.assertEqual(self.client.get(self.status_url).status_code, 401)
+        self.assertEqual(self.client.get(self.completeness_url).status_code, 401)
 
 
-class MarketingGateTests(OnboardingTestCase):
+class NothingIsRequiredUpFrontTests(ProfileSetupTestCase):
+    """The point of the refactor: an empty profile is a working account.
+
+    An agent evaluating the product, or waiting on their brokerage to approve
+    the spend, must be able to get value out of it before they have a licence
+    number or a firm to name.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agent = self.make_agent("agent@example.com")
+        self.profile = self.agent.agent_profile
+        self.authenticate_as(self.agent)
+
+    def test_registration_asks_for_nothing_beyond_name_email_password(self):
+        response = self.client.post(
+            self.register_url,
+            {
+                "first_name": "Minimal", "last_name": "Signup",
+                "email": "minimal@example.com",
+                "password": PASSWORD, "password_confirm": PASSWORD,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        profile = AgentProfile.objects.get(user__email="minimal@example.com")
+        self.assertIsNone(profile.brokerage)
+        self.assertEqual(profile.licence_number, "")
+        self.assertFalse(BrandKit.objects.filter(agent=profile).exists())
+
+    def test_an_agent_with_no_brokerage_can_still_use_the_product(self):
+        """No brokerage, no brand kit, no licence — and every screen works."""
+        for url in (self.agent_me_url, self.brand_kit_mine_url, self.completeness_url):
+            with self.subTest(url=url):
+                self.assertIn(self.client.get(url).status_code, (200, 201))
+
+    def test_the_brand_kit_is_created_on_demand_not_at_signup(self):
+        self.assertFalse(BrandKit.objects.filter(agent=self.profile).exists())
+
+        response = self.client.get(self.brand_kit_mine_url)
+
+        self.assertIn(response.status_code, (200, 201))
+        self.assertTrue(BrandKit.objects.filter(agent=self.profile).exists())
+
+    def test_a_bare_profile_reports_gaps_without_erroring(self):
+        """The prompt is advice. Nothing about it is a failure state."""
+        response = self.client.get(self.completeness_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data["ready_for_marketing"])
+        self.assertTrue(response.data["missing_required"])
+
+    def test_the_wizard_endpoints_are_gone(self):
+        """Nothing should be able to put an agent back into a forced sequence."""
+        for path in ("/api/onboarding/status/", "/api/onboarding/complete/"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 404)
+
+
+class MarketingGateTests(ProfileSetupTestCase):
     """The check that stops an asset rendering with a hole in it."""
 
     def setUp(self) -> None:

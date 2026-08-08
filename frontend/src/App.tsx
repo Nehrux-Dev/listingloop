@@ -16,7 +16,6 @@ import ListingFormPage from './pages/ListingFormPage.tsx'
 import ListingImportPage from './pages/ListingImportPage.tsx'
 import ListingsPage from './pages/ListingsPage.tsx'
 import LoginPage from './pages/LoginPage.tsx'
-import OnboardingPage from './pages/OnboardingPage.tsx'
 import PlatformAdminPage from './pages/PlatformAdminPage.tsx'
 import ProfilePage from './pages/ProfilePage.tsx'
 import PublicListingPage from './pages/PublicListingPage.tsx'
@@ -40,10 +39,10 @@ export default function App() {
           {/* Everything below requires a session. Unauthenticated visitors are
               redirected to /login with the attempted path in location state. */}
           <Route element={<ProtectedRoute />}>
-            {/* Onboarding needs a session but not the app shell — it is the
-                bridge between registering and having a usable workspace. */}
-            <Route path="/onboarding" element={<OnboardingPage />} />
             <Route element={<AppLayout />}>
+              {/* Registration lands here. There is no setup wizard in between:
+                  the profile, brokerage and brand kit are all optional, live in
+                  Settings, and are enforced at export instead. */}
               <Route index element={<DashboardPage />} />
 
               {/* Any authenticated user with an agent profile. Both pages
@@ -67,8 +66,8 @@ export default function App() {
               <Route path="designs/:id" element={<DesignEditorPage />} />
 
               {/* Hierarchical guard: Brokerage Admins and Nehrux Admins —
-                  plus any agent who created their own firm during onboarding
-                  and therefore administers it. The server independently checks
+                  plus any agent who added their own firm from Settings and
+                  therefore administers it. The server independently checks
                   `administers(user, brokerage)` on every write. */}
               <Route
                 element={

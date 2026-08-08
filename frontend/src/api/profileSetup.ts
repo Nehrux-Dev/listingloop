@@ -1,8 +1,8 @@
-/** Agent registration and onboarding. */
+/** Registration, and the Settings operations the CRUD endpoints do not cover. */
 
 import { apiRequest } from '../lib/apiClient.ts'
 import { setAccessToken } from '../auth/tokenStore.ts'
-import type { AgentProfile, Brokerage, BrandKit } from './profiles.ts'
+import type { Brokerage } from './profiles.ts'
 import type { User } from '../auth/types.ts'
 
 export type RegisterInput = {
@@ -14,11 +14,11 @@ export type RegisterInput = {
 }
 
 /**
- * Step 1. Uses the SAME endpoint the app has always had — onboarding does not
- * introduce a second way to create an account.
+ * Create an account. Name, email, password — nothing else.
  *
- * The response carries an access token and sets the httpOnly refresh cookie,
- * so onboarding continues straight into step 2 without a second sign-in.
+ * Uses the SAME endpoint the app has always had. The response carries an
+ * access token and sets the httpOnly refresh cookie, so the new agent lands in
+ * the dashboard rather than on a sign-in form they just implicitly passed.
  */
 export async function registerAgent(
   input: RegisterInput,
@@ -34,11 +34,14 @@ export async function registerAgent(
   return data
 }
 
-export type CompletionField = {
+export type CompletenessField = {
   key: string
   label: string
   step: 'profile' | 'brokerage' | 'brand'
   step_label: string
+  /** Route that fixes this field — resolved server-side, so callers don't
+   *  each reinvent the mapping (and get the no-brokerage-yet case wrong). */
+  fix_path: string
   present: boolean
   required_for_marketing: boolean
   hint: string
@@ -51,32 +54,21 @@ export type StepProgress = {
   complete: boolean
 }
 
-export type OnboardingStatus = {
-  role: string
-  has_profile: boolean
-  profile: AgentProfile | null
-  brokerage: Brokerage | null
-  brand_kit: BrandKit | null
+/**
+ * What is filled in and what is not. Advisory: an agent who never acts on it
+ * keeps a perfectly working account. The export path is what insists.
+ */
+export type ProfileCompleteness = {
   completion_percent: number
   is_complete: boolean
   ready_for_marketing: boolean
-  fields: CompletionField[]
-  missing_required: CompletionField[]
-  missing_optional: CompletionField[]
+  missing_required: CompletenessField[]
+  missing_optional: CompletenessField[]
   by_step: Record<string, StepProgress>
 }
 
-export function fetchOnboardingStatus(): Promise<OnboardingStatus> {
-  return apiRequest<OnboardingStatus>('/api/onboarding/status/')
-}
-
-export type ProfileCompletion = Pick<
-  OnboardingStatus,
-  'completion_percent' | 'is_complete' | 'ready_for_marketing' | 'missing_required' | 'by_step'
->
-
-export function fetchProfileCompletion(): Promise<ProfileCompletion> {
-  return apiRequest<ProfileCompletion>('/api/onboarding/completion/')
+export function fetchProfileCompleteness(): Promise<ProfileCompleteness> {
+  return apiRequest<ProfileCompleteness>('/api/profile/completeness/')
 }
 
 export type BrokerageMatch = {
@@ -89,12 +81,12 @@ export type BrokerageMatch = {
 /** Search before creating, so two rows never end up describing one firm. */
 export function searchBrokerages(search: string): Promise<BrokerageMatch[]> {
   return apiRequest<BrokerageMatch[]>(
-    `/api/onboarding/brokerages/?search=${encodeURIComponent(search)}`,
+    `/api/profile/brokerages/?search=${encodeURIComponent(search)}`,
   )
 }
 
 export function joinBrokerage(brokerageId: number): Promise<Brokerage> {
-  return apiRequest<Brokerage>('/api/onboarding/brokerage/', {
+  return apiRequest<Brokerage>('/api/profile/brokerage/', {
     method: 'POST',
     body: { brokerage: brokerageId },
   })
@@ -107,12 +99,8 @@ export function createBrokerage(fields: {
   website?: string
   licence_number?: string
 }): Promise<Brokerage> {
-  return apiRequest<Brokerage>('/api/onboarding/brokerage/', {
+  return apiRequest<Brokerage>('/api/profile/brokerage/', {
     method: 'POST',
     body: { create: fields },
   })
-}
-
-export function completeOnboarding(): Promise<OnboardingStatus> {
-  return apiRequest<OnboardingStatus>('/api/onboarding/complete/', { method: 'POST' })
 }
