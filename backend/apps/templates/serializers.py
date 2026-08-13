@@ -5,6 +5,7 @@ from __future__ import annotations
 from rest_framework import serializers
 
 from apps.accounts.models import AgentProfile
+from apps.core.fields import ValidatedImageField
 from apps.listings.models import Listing
 from apps.templates.dimensions import SOCIAL_DIMENSIONS
 from apps.templates.models import (
@@ -15,18 +16,17 @@ from apps.templates.models import (
     Template,
     TemplateElement,
 )
-from apps.templates.overrides import validate_overrides
+from apps.templates.document import elements_from_template, validate_document
 
 
 class TemplateElementSerializer(serializers.ModelSerializer):
-    """An element and, crucially, what may be done to it.
+    """One element of a template, as the library preview shows it.
 
-    ``permission`` and ``constraints`` are part of the public payload so the
-    editor can build the right controls. They are also re-checked on every
-    write — the client is being told the rules, not trusted to apply them.
+    Read-only, and thinner than it used to be: `permission` and
+    `editable_fields` are gone with the permission model, and nothing consumes
+    `constraints` any more either — a design owns its elements outright, so a
+    template no longer states what may be done to them.
     """
-
-    editable_fields = serializers.SerializerMethodField()
 
     class Meta:
         model = TemplateElement
@@ -35,21 +35,13 @@ class TemplateElementSerializer(serializers.ModelSerializer):
             "key",
             "label",
             "element_type",
-            "permission",
-            "editable_fields",
             "geometry",
             "style_properties",
-            "constraints",
             "content_source",
             "default_content",
             "z_index",
         )
         read_only_fields = fields
-
-    def get_editable_fields(self, obj: TemplateElement) -> list[str]:
-        from apps.templates.overrides import ALLOWED_FIELDS
-
-        return sorted(ALLOWED_FIELDS.get(obj.permission, frozenset()))
 
 
 class TemplateListSerializer(serializers.ModelSerializer):
@@ -76,6 +68,8 @@ class TemplateListSerializer(serializers.ModelSerializer):
             "element_count",
             "requires_listing",
             "is_seasonal",
+            "allows_added_elements",
+            "default_dimension",
             "layout_definition",
         )
         read_only_fields = fields
@@ -83,14 +77,10 @@ class TemplateListSerializer(serializers.ModelSerializer):
 
 class TemplateDetailSerializer(TemplateListSerializer):
     elements = TemplateElementSerializer(many=True, read_only=True)
-    permission_map = serializers.SerializerMethodField()
 
     class Meta(TemplateListSerializer.Meta):
-        fields = TemplateListSerializer.Meta.fields + ("elements", "permission_map")
+        fields = TemplateListSerializer.Meta.fields + ("elements",)
         read_only_fields = fields
-
-    def get_permission_map(self, obj: Template) -> dict[str, str]:
-        return obj.permission_map
 
 
 class CalendarEventSerializer(serializers.ModelSerializer):
@@ -175,7 +165,7 @@ class DesignSerializer(serializers.ModelSerializer):
             "listing",
             "listing_address",
             "calendar_event",
-            "overrides",
+            "elements",
             "exports",
             "created_at",
             "updated_at",
@@ -232,9 +222,8 @@ class DesignSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs: dict) -> dict:
-        # Overrides are validated against the template's permission map. The
-        # template may be arriving in this same request, so resolve it from the
-        # payload first and only then fall back to the stored instance.
+        # The template may be arriving in this same request, so resolve it from
+        # the payload first and only then fall back to the stored instance.
         template = attrs.get("template") or getattr(self.instance, "template", None)
         if template is None:
             raise serializers.ValidationError({"template": "A template is required."})
@@ -252,11 +241,19 @@ class DesignSerializer(serializers.ModelSerializer):
                 }
             )
 
-        if "overrides" in attrs:
-            attrs["overrides"] = validate_overrides(template, attrs["overrides"])
-        elif self.instance is not None and attrs.get("template") not in (None, self.instance.template):
-            # Switching template invalidates overrides keyed to the old one.
-            attrs["overrides"] = {}
+        # The whole canvas arrives in one autosave and is re-checked in full.
+        # Not for permission — there is none — but because every value here is
+        # about to be interpolated into HTML and handed to a real browser. See
+        # document.validate_document.
+        if "elements" in attrs:
+            attrs["elements"] = validate_document(attrs["elements"])
+        elif self.instance is not None and attrs.get("template") not in (
+            None,
+            self.instance.template,
+        ):
+            # Switching template replaces the canvas: the old elements were
+            # copied from a template this design no longer uses.
+            attrs["elements"] = elements_from_template(attrs["template"])
 
         return attrs
 
@@ -269,6 +266,16 @@ class DesignSerializer(serializers.ModelSerializer):
                     {"agent": "You need an agent profile before creating designs."}
                 )
             validated_data["agent"] = profile
+
+        # THE COPY. Opening a template for editing gives the agent their own
+        # elements, there and then — not a reference to the template's, and not
+        # an empty canvas to be filled in lazily on first edit. Everything
+        # after this point mutates the design; the Template is never written to
+        # again by anything an agent can reach.
+        if not validated_data.get("elements"):
+            validated_data["elements"] = elements_from_template(
+                validated_data["template"]
+            )
         return super().create(validated_data)
 
 
@@ -278,6 +285,20 @@ class DesignRenameSerializer(serializers.Serializer):
 
 class DesignDuplicateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=160, required=False, allow_blank=True)
+
+
+class DesignImageUploadSerializer(serializers.Serializer):
+    """Input for uploading an image to use as an element's content — the
+    "upload a new one" half of image replace, alongside picking a listing
+    photo.
+
+    Deliberately not tied to any model: the file is written straight through
+    the storage API (see the view) and only the resulting key is kept, which
+    is exactly what an image element's `content` holds. Nothing here creates a
+    row an agent would need to separately clean up.
+    """
+
+    image = ValidatedImageField(write_only=True)
 
 
 class DesignExportRequestSerializer(serializers.Serializer):

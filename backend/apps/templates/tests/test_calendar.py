@@ -16,7 +16,6 @@ from django.utils import timezone
 from apps.templates.models import (
     CalendarEvent,
     Design,
-    ElementPermission,
     ElementType,
     Template,
     TemplateCategory,
@@ -43,11 +42,9 @@ def make_seasonal_template(**overrides) -> Template:
         key="greeting",
         label="Greeting",
         element_type=ElementType.TEXT,
-        permission=ElementPermission.CONTENT_ONLY,
         geometry={"x": 0.08, "y": 0.3, "width": 0.84, "height": 0.16},
         style_properties={"font_size_ratio": 0.075, "color": "#FFFFFF"},
         default_content="Happy Diwali",
-        constraints={"max_length": 60},
         z_index=5,
     )
     TemplateElement.objects.create(
@@ -55,7 +52,6 @@ def make_seasonal_template(**overrides) -> Template:
         key="agent_name",
         label="Agent name",
         element_type=ElementType.TEXT,
-        permission=ElementPermission.CONTENT_ONLY,
         geometry={"x": 0.1, "y": 0.85, "width": 0.8, "height": 0.05},
         style_properties={"font_size_ratio": 0.03, "color": "#FFFFFF"},
         content_source="agent.name",
@@ -66,7 +62,6 @@ def make_seasonal_template(**overrides) -> Template:
         key="disclaimer",
         label="Disclaimer",
         element_type=ElementType.TEXT,
-        permission=ElementPermission.LOCKED,
         geometry={"x": 0.05, "y": 0.96, "width": 0.9, "height": 0.03},
         style_properties={"font_size_ratio": 0.013, "color": "#94A3B8"},
         content_source="brokerage.required_disclaimer",
@@ -177,12 +172,15 @@ class DesignWithoutListingTests(TemplateAPITestCase):
         response = self.client.get(self.design_action_url(design, "resolved"))
 
         self.assertEqual(response.status_code, 200)
-        by_key = {element["key"]: element for element in response.data["elements"]}
+        by_key = {
+            element["original_element_id"]: element
+            for element in response.data["elements"]
+        }
         # Agent and brokerage sources still resolve...
-        self.assertEqual(by_key["agent_name"]["content"], "Alex Agent")
-        self.assertEqual(by_key["disclaimer"]["content"], "Figures are indicative only.")
+        self.assertEqual(by_key["agent_name"]["resolved_content"], "Alex Agent")
+        self.assertEqual(by_key["disclaimer"]["resolved_content"], "Figures are indicative only.")
         # ...and the literal default is used where there is no source.
-        self.assertEqual(by_key["greeting"]["content"], "Happy Diwali")
+        self.assertEqual(by_key["greeting"]["resolved_content"], "Happy Diwali")
 
     def test_the_html_builds_without_a_listing(self):
         """The renderer must not assume a property exists."""
@@ -197,22 +195,32 @@ class DesignWithoutListingTests(TemplateAPITestCase):
         self.assertIn("Happy Diwali", html)
         self.assertIn("Alex Agent", html)
 
-    def test_permissions_still_apply_without_a_listing(self):
+    def test_every_element_is_editable_without_a_listing(self):
+        """A seasonal design gets the same fully-editable canvas as any other.
+
+        This used to assert the opposite for the disclaimer — that a locked
+        element refused the edit. There is no locked tier now, so the thing
+        worth pinning is that *both* elements go through, including the one
+        that used to be untouchable.
+        """
         design = self.make_design(self.seasonal, self.profile, listing=None)
+        elements = list(design.elements)
+        for element in elements:
+            if element["original_element_id"] == "disclaimer":
+                element["content"] = "Removed"
+                element["manually_overridden"] = True
+            if element["original_element_id"] == "greeting":
+                element["content"] = "Shubh Deepavali"
+                element["manually_overridden"] = True
 
-        locked = self.client.patch(
-            self.design_detail_url(design),
-            {"overrides": {"disclaimer": {"text": "Removed"}}},
-            format="json",
-        )
-        allowed = self.client.patch(
-            self.design_detail_url(design),
-            {"overrides": {"greeting": {"text": "Shubh Deepavali"}}},
-            format="json",
+        response = self.client.patch(
+            self.design_detail_url(design), {"elements": elements}, format="json"
         )
 
-        self.assertEqual(locked.status_code, 400)
-        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.data)
+        design.refresh_from_db()
+        self.assertEqual(self.element_of(design, "disclaimer")["content"], "Removed")
+        self.assertEqual(self.element_of(design, "greeting")["content"], "Shubh Deepavali")
 
     @mock.patch("apps.templates.rendering.requests.post")
     def test_a_listingless_design_exports(self, post):

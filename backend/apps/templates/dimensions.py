@@ -42,6 +42,16 @@ SOCIAL_DIMENSIONS: dict[str, Dimension] = {
     ),
     "facebook": Dimension("facebook", "Facebook", 1200, 630),
     "linkedin": Dimension("linkedin", "LinkedIn", 1200, 627),
+    # Not a social format: the native size of tall editorial artwork supplied
+    # as a portrait file. It exists because forcing such a design into a
+    # square crops the composition, and forcing it into a Story stretches it —
+    # 844:2048 is 0.412 wide, a Story is 0.5625. No safe insets: this is a
+    # print/download format, not something a platform overlays chrome on.
+    "portrait_tall": Dimension("portrait_tall", "Portrait (tall)", 844, 2048),
+    # A4-proportioned property flyer (1:sqrt(2)). The size print shops and
+    # PDF handouts expect, and the native shape of artwork supplied as a
+    # flyer rather than as a social post.
+    "flyer_portrait": Dimension("flyer_portrait", "Flyer (A4 portrait)", 1414, 2000),
 }
 
 DEFAULT_DIMENSION = "instagram_post"

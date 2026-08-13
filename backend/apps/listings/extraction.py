@@ -105,6 +105,10 @@ class ExtractionResult:
     fields: dict = field(default_factory=dict)
     photo_urls: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Whether the page actually declared a listing (JSON-LD or microdata), as
+    #: opposed to yielding only meta tags and text guesses. The import path uses
+    #: this to decide whether re-fetching with a browser is worth the cost.
+    structured: bool = False
 
     @property
     def extracted_fields(self) -> list[str]:
@@ -269,6 +273,32 @@ def _extract_photos(result: ExtractionResult, node: dict, base_url: str) -> None
                 result.photo_urls.append(absolute)
 
 
+def _apply_listing_node(result: ExtractionResult, node: dict, base_url: str) -> None:
+    """Apply one schema.org listing node, whatever syntax it arrived in.
+
+    JSON-LD and microdata are two spellings of the same vocabulary, so they
+    converge here rather than growing a second set of field rules that would
+    drift apart.
+    """
+    _extract_address(result, node)
+    _extract_price(result, node)
+    _extract_property_type(result, node)
+    _extract_floor_size(result, node)
+    _extract_photos(result, node, base_url)
+
+    result.set("bedrooms", _to_int(node.get("numberOfBedrooms")))
+    bathrooms = _to_decimal(
+        node.get("numberOfBathroomsTotal")
+        or node.get("numberOfBathrooms")
+        or node.get("numberOfFullBathrooms")
+    )
+    result.set("bathrooms", bathrooms)
+
+    description = _first_scalar(node.get("description"))
+    if isinstance(description, str):
+        result.set("description", description.strip())
+
+
 def _apply_jsonld(result: ExtractionResult, soup: BeautifulSoup, base_url: str) -> bool:
     found_listing_node = False
 
@@ -276,24 +306,89 @@ def _apply_jsonld(result: ExtractionResult, soup: BeautifulSoup, base_url: str) 
         if not _types_of(node) & LISTING_TYPES:
             continue
         found_listing_node = True
+        _apply_listing_node(result, node, base_url)
 
-        _extract_address(result, node)
-        _extract_price(result, node)
-        _extract_property_type(result, node)
-        _extract_floor_size(result, node)
-        _extract_photos(result, node, base_url)
+    return found_listing_node
 
-        result.set("bedrooms", _to_int(node.get("numberOfBedrooms")))
-        bathrooms = _to_decimal(
-            node.get("numberOfBathroomsTotal")
-            or node.get("numberOfBathrooms")
-            or node.get("numberOfFullBathrooms")
-        )
-        result.set("bathrooms", bathrooms)
 
-        description = _first_scalar(node.get("description"))
-        if isinstance(description, str):
-            result.set("description", description.strip())
+# ---------------------------------------------------------------------------
+# Microdata (itemscope / itemprop)
+# ---------------------------------------------------------------------------
+#
+# The same schema.org vocabulary written inline in the markup instead of in a
+# script tag. Plenty of brokerage sites and CMS templates emit this and no
+# JSON-LD at all, and ignoring it meant those pages imported as blank despite
+# stating everything we needed, in a form that is just as explicit.
+
+
+def _microdata_value(tag, base_url: str):
+    """The value of one itemprop, read the way the spec says to."""
+    if tag.has_attr("itemscope"):
+        return _microdata_node(tag, base_url)
+
+    name = tag.name
+    if name == "meta":
+        return (tag.get("content") or "").strip()
+    if name in ("img", "audio", "video", "source", "embed", "iframe", "track"):
+        src = tag.get("src")
+        return urljoin(base_url, src) if src else ""
+    if name in ("a", "area", "link"):
+        href = tag.get("href")
+        return urljoin(base_url, href) if href else ""
+    if name in ("data", "meter"):
+        return (tag.get("value") or tag.get_text(" ", strip=True)).strip()
+    if name == "time":
+        return (tag.get("datetime") or tag.get_text(" ", strip=True)).strip()
+    if name == "object":
+        return (tag.get("data") or "").strip()
+
+    return tag.get_text(" ", strip=True)
+
+
+def _microdata_node(scope, base_url: str) -> dict:
+    """Turn one itemscope element into a JSON-LD-shaped dict."""
+    node: dict = {}
+
+    itemtype = scope.get("itemtype")
+    if itemtype:
+        types = itemtype if isinstance(itemtype, list) else [itemtype]
+        # "https://schema.org/Apartment" -> "Apartment", matching JSON-LD.
+        node["@type"] = [str(t).rstrip("/").rsplit("/", 1)[-1] for t in types]
+
+    for prop in scope.find_all(attrs={"itemprop": True}):
+        # Only direct properties: anything inside a nested itemscope belongs to
+        # that nested item, and hoisting it here would attach a sub-object's
+        # values to the listing.
+        parent_scope = prop.find_parent(attrs={"itemscope": True})
+        if parent_scope is not scope:
+            continue
+
+        names = prop.get("itemprop")
+        value = _microdata_value(prop, base_url)
+        if value in ("", None):
+            continue
+
+        for name in names if isinstance(names, list) else str(names).split():
+            existing = node.get(name)
+            if existing is None:
+                node[name] = value
+            elif isinstance(existing, list):
+                existing.append(value)
+            else:
+                node[name] = [existing, value]
+
+    return node
+
+
+def _apply_microdata(result: ExtractionResult, soup: BeautifulSoup, base_url: str) -> bool:
+    found_listing_node = False
+
+    for scope in soup.find_all(attrs={"itemscope": True, "itemtype": True}):
+        node = _microdata_node(scope, base_url)
+        if not _types_of(node) & LISTING_TYPES:
+            continue
+        found_listing_node = True
+        _apply_listing_node(result, node, base_url)
 
     return found_listing_node
 
@@ -405,7 +500,12 @@ def extract_listing_data(html: str, base_url: str) -> ExtractionResult:
         result.warnings.append("The page could not be parsed as HTML.")
         return result
 
+    # JSON-LD first so it wins where both are present: `set()` keeps the first
+    # value for a field, and a script block is less likely to have been
+    # mangled by a CMS than inline attributes.
     had_structured_data = _apply_jsonld(result, soup, base_url)
+    had_structured_data |= _apply_microdata(result, soup, base_url)
+    result.structured = had_structured_data
     _apply_meta(result, soup, base_url)
     # Run last: structured data always wins, and `set()` ignores repeats.
     _apply_text_heuristics(result, soup)

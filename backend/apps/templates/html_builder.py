@@ -5,10 +5,26 @@ Django owns this, not the renderer service. The renderer stays a dumb
 without any template logic moving with it — and it can be tested here, in
 Python, without a browser.
 
-Geometry is fractional, so mapping a template onto Instagram Post, Story,
+Geometry is fractional, so mapping a design onto Instagram Post, Story,
 Facebook or LinkedIn is arithmetic rather than four hand-built layouts. Element
 coordinates are mapped into the *safe area* of the target dimension so nothing
 important lands under platform chrome.
+
+WHAT IT RENDERS FROM
+--------------------
+``design.elements`` — the design's own document (see ``document.py``). Not the
+template, and not a diff against it. A design was deep-copied from its
+template when it was created and has owned its elements ever since, so there
+is one list to walk and no permission tier to consult.
+
+HOW A BOUND ELEMENT RESOLVES
+----------------------------
+An element with ``bound_to`` (price, agent_phone, photo_1, ...) renders the
+*current* value of that field, so correcting a listing's price fixes every
+design that shows it. Once the agent types over it, ``manually_overridden``
+goes true and their words win from then on — clearing that flag is the "sync
+to current data" action, and is why the binding is flagged rather than
+deleted.
 """
 
 from __future__ import annotations
@@ -19,7 +35,14 @@ import re
 from typing import Any
 
 from apps.templates.dimensions import Dimension
-from apps.templates.models import ElementType
+from apps.templates.document import (
+    BACKGROUND_TYPE,
+    LINE_TYPE,
+    SHAPE_TYPE,
+    carries_image,
+    carries_text,
+    sorted_for_render,
+)
 from apps.templates.render_context import resolve_path
 
 #: Only families we know are installed in the renderer image. A brand kit can
@@ -60,7 +83,7 @@ PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w.]*(?:\[\d+\])?)\s*(?:\|\s*(\w
 def interpolate(text: str, context: dict) -> str:
     """Substitute ``{{ path }}`` placeholders from the template context.
 
-    Runs over literal template text, so a designer can write
+    Runs over literal element text, so a designer — or an agent — can write
 
         "Presented by {{ agent.full_name }} at {{ brokerage.name }}"
 
@@ -94,46 +117,38 @@ def unresolved_placeholders(text: str, context: dict) -> list[str]:
     ]
 
 
-def resolve_element_content(element, override: dict, context: dict) -> Any:
-    """Override wins, then the element's content source, then its default."""
-    if element.element_type in (ElementType.IMAGE, ElementType.LOGO):
-        if override.get("image_key"):
-            # Resolved by the caller into a data URI; see build_html.
-            return override["image_key"]
-        if element.content_source:
-            return resolve_path(context, element.content_source)
-        return element.default_content or None
+def resolve_content(element: dict, context: dict, images: dict) -> Any:
+    """What this element actually displays.
 
-    # Placeholders are interpolated in all three cases, so an agent's own
-    # override text can use them too — "Call {{ agent.phone }}" works whether
-    # the designer wrote it or the agent did.
-    if "text" in override:
-        return interpolate(override["text"], context)
-    if element.content_source:
-        value = resolve_path(context, element.content_source)
-        if value not in (None, "", []):
-            return _format_value(value, element.style_properties.get("format"))
-    return interpolate(element.default_content, context)
+    Order of precedence, and the reasoning for it:
 
-
-def _merged_style(element, override: dict) -> dict:
-    """Element defaults, then whatever the override is *allowed* to change.
-
-    By the time an override reaches here it has already been validated against
-    the element's permission, so this merge cannot widen anyone's rights — it
-    is presentation only.
+      1. A resolved image for this element id — the caller turned a storage key
+         into a data URI, because only it has storage access.
+      2. The element's bound/sourced value, when it has one and the agent has
+         not typed over it. This is what makes a price correction reach every
+         design that shows the price.
+      3. The element's own stored content, interpolated — the agent's words,
+         or the template's default text where they never changed it.
     """
-    style = dict(element.style_properties or {})
-    for field in (
-        "color",
-        "background_color",
-        "font_size_ratio",
-        "font_weight",
-        "text_align",
-    ):
-        if field in override:
-            style[field] = override[field]
-    return style
+    element_type = element.get("type", "")
+    stored = element.get("content") or ""
+
+    if carries_image(element_type, stored):
+        if element["id"] in images:
+            return images[element["id"]]
+        if element.get("content_source") and not element.get("manually_overridden"):
+            return resolve_path(context, element["content_source"])
+        return None
+
+    if element.get("content_source") and not element.get("manually_overridden"):
+        value = resolve_path(context, element["content_source"])
+        if value not in (None, "", []):
+            return _format_value(value, (element.get("style") or {}).get("format"))
+        # A bound field with nothing in it falls through to whatever text the
+        # element carries, so a template's placeholder wording still shows
+        # rather than the element vanishing mid-layout.
+
+    return interpolate(str(stored), context)
 
 
 def _resolve_color(value: Any, context: dict) -> str:
@@ -143,15 +158,15 @@ def _resolve_color(value: Any, context: dict) -> str:
     return value if isinstance(value, str) else "transparent"
 
 
-def _geometry(element, override: dict) -> dict:
-    geometry = dict(element.geometry or {})
-    if "geometry" in override:
-        geometry.update(override["geometry"])
+def _transform(element: dict) -> dict:
+    raw = element.get("transform") or {}
     return {
-        "x": float(geometry.get("x", 0.0)),
-        "y": float(geometry.get("y", 0.0)),
-        "width": float(geometry.get("width", 1.0)),
-        "height": float(geometry.get("height", 0.1)),
+        "x": float(raw.get("x", 0.0)),
+        "y": float(raw.get("y", 0.0)),
+        "width": float(raw.get("width", 1.0)),
+        "height": float(raw.get("height", 0.1)),
+        "rotation": float(raw.get("rotation", 0.0)),
+        "z_index": int(raw.get("z_index", 0)),
     }
 
 
@@ -171,22 +186,44 @@ def type_scale_reference(dimension: Dimension) -> float:
     return float(min(dimension.width, dimension.height))
 
 
-def _element_html(element, override: dict, context: dict, dimension: Dimension) -> str:
-    if override.get("hidden"):
+def _image_framing(style: dict) -> str:
+    """The CSS that expresses zoom-and-pan inside an image's frame.
+
+    A crop, without ever re-encoding the file. ``image_scale`` blows the
+    picture up inside its box and ``image_offset_x/y`` slide it around; the
+    box keeps ``overflow:hidden``, so the result is exactly the visible
+    rectangle the agent dragged out. Doing it in CSS means the editor and the
+    export agree by construction — both are laying out the same box.
+    """
+    scale = float(style.get("image_scale", 1.0) or 1.0)
+    offset_x = float(style.get("image_offset_x", 0.0) or 0.0)
+    offset_y = float(style.get("image_offset_y", 0.0) or 0.0)
+    if scale == 1.0 and not offset_x and not offset_y:
+        return ""
+    return (
+        f"transform:translate({offset_x * 100:.2f}%,{offset_y * 100:.2f}%) "
+        f"scale({scale:.3f});transform-origin:center center;"
+    )
+
+
+def element_html(element: dict, context: dict, dimension: Dimension, images: dict) -> str:
+    """One document element as absolutely-positioned HTML."""
+    if not element.get("visible", True):
         return ""
 
-    geometry = _geometry(element, override)
-    style = _merged_style(element, override)
+    transform = _transform(element)
+    style = element.get("style") or {}
+    element_type = element.get("type", "")
     scale_ref = type_scale_reference(dimension)
 
     # Map the fractional coordinate space into the dimension's safe area.
     safe_top = dimension.safe_inset_top
     safe_height = 1.0 - dimension.safe_inset_top - dimension.safe_inset_bottom
 
-    left = geometry["x"] * dimension.width
-    top = (safe_top + geometry["y"] * safe_height) * dimension.height
-    width = geometry["width"] * dimension.width
-    height = geometry["height"] * safe_height * dimension.height
+    left = transform["x"] * dimension.width
+    top = (safe_top + transform["y"] * safe_height) * dimension.height
+    width = transform["width"] * dimension.width
+    height = transform["height"] * safe_height * dimension.height
 
     css = [
         "position:absolute",
@@ -194,9 +231,15 @@ def _element_html(element, override: dict, context: dict, dimension: Dimension) 
         f"top:{top:.2f}px",
         f"width:{width:.2f}px",
         f"height:{height:.2f}px",
-        f"z-index:{element.z_index}",
+        f"z-index:{transform['z_index']}",
         "box-sizing:border-box",
     ]
+
+    # Rotating around the box's own centre, not the canvas origin, is what
+    # makes the rendered result match what the rotate handle showed.
+    if transform["rotation"]:
+        css.append(f"transform:rotate({transform['rotation']:.2f}deg)")
+        css.append("transform-origin:center center")
 
     background = style.get("background_color")
     if background:
@@ -207,24 +250,50 @@ def _element_html(element, override: dict, context: dict, dimension: Dimension) 
         css.append(f"opacity:{float(style['opacity'])}")
     if style.get("background_gradient"):
         css.append(f"background-image:{style['background_gradient']}")
+    # A border is only drawn when it has a real width — a colour on its own
+    # would silently do nothing, and `border-style:solid` with width 0 is a
+    # no-op that still costs a CSS declaration. Width scales with the canvas
+    # like every other ratio here, so a border looks the same relative to the
+    # design at 1080px as it does at 1920px.
+    if style.get("border_width_ratio"):
+        border_px = float(style["border_width_ratio"]) * scale_ref
+        border_color = _resolve_color(style.get("border_color", "#000000"), context)
+        border_style = style.get("border_style", "solid")
+        css.append(f"border:{border_px:.2f}px {border_style} {border_color}")
 
-    content = resolve_element_content(element, override, context)
+    content = resolve_content(element, context, images)
 
-    if element.element_type in (ElementType.IMAGE, ElementType.LOGO):
+    if carries_image(element_type, content):
         if not content:
+            # A background with no picture is still a filled box; every other
+            # image type with nothing in it has nothing to draw.
+            if element_type == BACKGROUND_TYPE:
+                return f'<div style="{";".join(css)}"></div>'
             return ""
         css.append("overflow:hidden")
         fit = style.get("object_fit", "cover")
+        position = style.get("object_position", "center center")
+        framing = _image_framing(style)
+        # An icon is usually a single-colour glyph, so a tint is expressed as a
+        # CSS filter over the image rather than by editing the file.
+        tint = ""
+        if style.get("tint_color"):
+            colour = _resolve_color(style["tint_color"], context)
+            tint = f"background-color:{colour};-webkit-mask-image:url({content});"
+            tint += "-webkit-mask-size:contain;-webkit-mask-repeat:no-repeat;"
+            tint += "-webkit-mask-position:center;"
+            return f'<div style="{";".join(css)}"><div style="width:100%;height:100%;{tint}"></div></div>'
         inner = (
             f'<img src="{html.escape(str(content), quote=True)}" '
-            f'style="width:100%;height:100%;object-fit:{fit};display:block;" />'
+            f'style="width:100%;height:100%;object-fit:{fit};'
+            f'object-position:{position};display:block;{framing}" />'
         )
         return f'<div style="{";".join(css)}">{inner}</div>'
 
-    if element.element_type in (ElementType.COLOR_BLOCK, ElementType.DIVIDER):
+    if not carries_text(element_type):
+        # shape, line, and a background with no photo: a filled box.
         return f'<div style="{";".join(css)}"></div>'
 
-    # Text and badge.
     text = str(content or "")
     if not text.strip():
         return ""
@@ -242,6 +311,7 @@ def _element_html(element, override: dict, context: dict, dimension: Dimension) 
             f"text-align:{align}",
             f"font-size:{font_px:.2f}px",
             f"font-weight:{style.get('font_weight', '400')}",
+            f"font-style:{style.get('font_style', 'normal')}",
             f"line-height:{style.get('line_height', 1.2)}",
             f"color:{_resolve_color(style.get('color', '#000000'), context)}",
             f"font-family:{SAFE_FONT_STACK}",
@@ -251,6 +321,8 @@ def _element_html(element, override: dict, context: dict, dimension: Dimension) 
         css.append(f"letter-spacing:{float(style['letter_spacing_em'])}em")
     if style.get("text_transform"):
         css.append(f"text-transform:{style['text_transform']}")
+    if style.get("text_decoration"):
+        css.append(f"text-decoration:{style['text_decoration']}")
     if style.get("padding_ratio"):
         css.append(f"padding:{float(style['padding_ratio']) * scale_ref:.2f}px")
     # Text that outgrows its box would otherwise sit on top of the element
@@ -261,23 +333,19 @@ def _element_html(element, override: dict, context: dict, dimension: Dimension) 
     return f'<div style="{";".join(css)}">{body}</div>'
 
 
-def build_html(design, context: dict, dimension: Dimension, image_overrides: dict) -> str:
+def build_html(design, context: dict, dimension: Dimension, images: dict) -> str:
     """Return a complete HTML document for one design at one dimension.
 
-    ``image_overrides`` maps element key -> data URI, resolved by the caller
-    (which owns storage access) so this function stays pure.
+    ``images`` maps element id -> data URI, resolved by the caller (which owns
+    storage access) so this function stays pure.
     """
     layout = design.template.layout_definition or {}
     background = _resolve_color(layout.get("background_color", "#FFFFFF"), context)
 
-    overrides = design.overrides or {}
-    parts = []
-    for element in design.template.elements.all():
-        override = dict(overrides.get(element.key, {}))
-        if element.key in image_overrides:
-            override["image_key"] = image_overrides[element.key]
-        parts.append(_element_html(element, override, context, dimension))
-
+    parts = [
+        element_html(element, context, dimension, images)
+        for element in sorted_for_render(design.ensure_document())
+    ]
     body = "".join(part for part in parts if part)
 
     return f"""<!doctype html>
@@ -293,37 +361,64 @@ def build_html(design, context: dict, dimension: Dimension, image_overrides: dic
 <body><div id="canvas">{body}</div></body></html>"""
 
 
-def describe_design(design, context: dict, dimension: Dimension) -> dict:
-    """A JSON description of the resolved design.
+def describe_design(
+    design, context: dict, dimension: Dimension, images: dict | None = None
+) -> dict:
+    """A JSON description of the resolved design — what the editor binds to.
 
-    Used by the editor to show current values and by tests to assert on
-    resolution without rendering an image.
+    Every element is returned exactly as stored, plus two derived fields the
+    canvas needs and cannot work out for itself:
+
+      ``resolved_content``  what this element currently displays, after the
+                            binding and image resolution above. The canvas
+                            draws this; ``content`` is what the properties
+                            panel edits.
+      ``bound_value``       the live value behind the binding, so the panel can
+                            offer "sync to current data" and show what syncing
+                            would put there.
     """
-    overrides = design.overrides or {}
+    images = images or {}
     elements = []
-    for element in design.template.elements.all():
-        override = overrides.get(element.key, {})
+    for element in sorted_for_render(design.ensure_document()):
+        bound_value = None
+        if element.get("content_source"):
+            bound_value = resolve_path(context, element["content_source"])
+            if bound_value is not None and not carries_image(
+                element.get("type", ""), element.get("content")
+            ):
+                bound_value = _format_value(
+                    bound_value, (element.get("style") or {}).get("format")
+                )
         elements.append(
             {
-                "key": element.key,
-                "label": element.label,
-                "element_type": element.element_type,
-                "permission": element.permission,
-                "constraints": element.constraints,
-                "geometry": _geometry(element, override),
-                "style": _merged_style(element, override),
-                "content": resolve_element_content(element, override, context),
-                "hidden": bool(override.get("hidden")),
-                "overridden_fields": sorted(override.keys()),
+                **element,
+                "resolved_content": resolve_content(element, context, images),
+                "bound_value": bound_value,
             }
         )
+
     return {
         "dimension": dimension.key,
         "width": dimension.width,
         "height": dimension.height,
+        # Safe-area insets, alongside width/height for the same reason: a
+        # client mapping fractional geometry to pixels needs the full picture,
+        # not just the raw canvas size. See render_dimensions() in views.py.
+        "safe_inset_top": dimension.safe_inset_top,
+        "safe_inset_bottom": dimension.safe_inset_bottom,
+        "background_color": _resolve_color(
+            (design.template.layout_definition or {}).get("background_color", "#FFFFFF"),
+            context,
+        ),
         "elements": elements,
     }
 
 
 def to_json(value) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+# Kept as an alias: `SHAPE_TYPE`/`LINE_TYPE` are imported here for the
+# type checks above, and re-exported so callers that reason about what renders
+# as a filled box have one place to ask.
+FILLED_BOX_TYPES = frozenset({SHAPE_TYPE, LINE_TYPE})

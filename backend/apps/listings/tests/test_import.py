@@ -360,3 +360,386 @@ class ImportEndpointTests(ListingAPITestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertIn("url", response.data)
+
+
+# ---------------------------------------------------------------------------
+# Microdata, bot walls, and the paste-the-source fallback
+# ---------------------------------------------------------------------------
+
+MICRODATA_PAGE = """
+<html><body>
+<div itemscope itemtype="https://schema.org/SingleFamilyResidence">
+  <h1 itemprop="name">8 Rosewood Crescent</h1>
+  <p itemprop="description">A renovated family home near the park.</p>
+  <div itemprop="address" itemscope itemtype="https://schema.org/PostalAddress">
+    <span itemprop="streetAddress">8 Rosewood Crescent</span>
+    <span itemprop="addressLocality">Ottawa</span>
+    <span itemprop="addressRegion">ON</span>
+    <span itemprop="postalCode">K1P 1J1</span>
+    <span itemprop="addressCountry">Canada</span>
+  </div>
+  <span itemprop="numberOfBedrooms">3</span>
+  <span itemprop="numberOfBathroomsTotal">2</span>
+  <div itemprop="offers" itemscope itemtype="https://schema.org/Offer">
+    <meta itemprop="price" content="915000" />
+    <meta itemprop="priceCurrency" content="CAD" />
+  </div>
+  <img itemprop="image" src="/photos/front.jpg" />
+</div>
+</body></html>
+"""
+
+#: A nested item whose own values must not be hoisted onto the listing.
+MICRODATA_WITH_NESTED_AGENT = """
+<html><body>
+<div itemscope itemtype="https://schema.org/Apartment">
+  <span itemprop="numberOfBedrooms">2</span>
+  <div itemprop="agent" itemscope itemtype="https://schema.org/Person">
+    <span itemprop="name">Someone Else</span>
+    <span itemprop="numberOfBedrooms">99</span>
+  </div>
+</div>
+</body></html>
+"""
+
+BOT_WALL_PAGE = """
+<!DOCTYPE html><html><head>
+<noscript><title>Pardon Our Interruption</title></noscript>
+<meta name="viewport" content="width=device-width" />
+</head><body>
+<p>As you were browsing something about your browser made us think you were a bot.</p>
+</body></html>
+"""
+
+
+class MicrodataTests(SimpleTestCase):
+    """schema.org written inline instead of in a script tag.
+
+    Plenty of brokerage sites and CMS templates emit only this, and before it
+    was read those pages imported as blank despite stating everything needed.
+    """
+
+    def test_microdata_is_read(self):
+        result = extract_listing_data(MICRODATA_PAGE, SOURCE_URL)
+
+        self.assertEqual(result.fields["address"], "8 Rosewood Crescent")
+        self.assertEqual(result.fields["city"], "Ottawa")
+        self.assertEqual(result.fields["state"], "ON")
+        self.assertEqual(result.fields["postcode"], "K1P 1J1")
+        self.assertEqual(result.fields["bedrooms"], 3)
+        self.assertEqual(result.fields["price"], Decimal("915000"))
+
+    def test_a_microdata_page_does_not_warn_about_missing_structured_data(self):
+        result = extract_listing_data(MICRODATA_PAGE, SOURCE_URL)
+
+        self.assertFalse(
+            any("no structured listing data" in w for w in result.warnings),
+            result.warnings,
+        )
+
+    def test_relative_image_urls_are_resolved(self):
+        result = extract_listing_data(MICRODATA_PAGE, SOURCE_URL)
+
+        self.assertIn("https://example.test/photos/front.jpg", result.photo_urls)
+
+    def test_a_nested_items_values_do_not_leak_onto_the_listing(self):
+        """The agent's own properties are not the property's properties."""
+        result = extract_listing_data(MICRODATA_WITH_NESTED_AGENT, SOURCE_URL)
+
+        self.assertEqual(result.fields["bedrooms"], 2)
+
+    def test_json_ld_still_wins_when_both_are_present(self):
+        both = JSON_LD_PAGE + MICRODATA_PAGE
+
+        result = extract_listing_data(both, SOURCE_URL)
+
+        self.assertEqual(result.fields["address"], "12 Harbour View Terrace")
+
+
+class BotWallTests(SimpleTestCase):
+    """A challenge page is not an empty listing, and must not read as one."""
+
+    def test_a_bot_wall_is_recognised(self):
+        from apps.listings.fetching import looks_like_bot_wall
+
+        self.assertTrue(looks_like_bot_wall(BOT_WALL_PAGE))
+
+    def test_a_normal_page_is_not_mistaken_for_one(self):
+        from apps.listings.fetching import looks_like_bot_wall
+
+        self.assertFalse(looks_like_bot_wall(JSON_LD_PAGE))
+        self.assertFalse(looks_like_bot_wall(BARE_PAGE))
+
+    def test_the_phrase_appearing_late_in_a_real_page_is_not_a_block(self):
+        """A listing that happens to quote the words is still a listing."""
+        from apps.listings.fetching import looks_like_bot_wall
+
+        page = JSON_LD_PAGE + "x" * 5000 + "<p>Pardon our interruption, open house!</p>"
+
+        self.assertFalse(looks_like_bot_wall(page))
+
+
+class BlockedSiteEndpointTests(ListingAPITestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.authenticate_as(self.agent)
+
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_blocked_site_is_reported_as_blocked_not_as_an_empty_page(self, fetch_doc):
+        from apps.listings.fetching import SiteBlockedError
+
+        fetch_doc.side_effect = SiteBlockedError(
+            "This website does not allow automatic importing."
+        )
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertTrue(response.data["blocked_by_site"])
+        # No half-built draft left behind.
+        self.assertEqual(Listing.objects.count(), 0)
+
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_an_ordinary_fetch_failure_is_not_flagged_as_blocked(self, fetch_doc):
+        fetch_doc.side_effect = FetchError("The page could not be reached.")
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(response.data["blocked_by_site"])
+
+
+class PastedSourceTests(ListingAPITestCase):
+    """The route for sites that refuse us: the agent fetches, we parse."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.authenticate_as(self.agent)
+
+    def _paste(self, html: str, url: str = SOURCE_URL):
+        return self.client.post(
+            self.listing_import_html_url, {"html": html, "url": url}, format="json"
+        )
+
+    def test_pasted_source_produces_the_same_fields_as_a_fetch(self):
+        response = self._paste(JSON_LD_PAGE)
+
+        self.assertEqual(response.status_code, 201, response.data)
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertEqual(listing.address, "12 Harbour View Terrace")
+        self.assertEqual(listing.price, Decimal("1850000.00"))
+        self.assertEqual(listing.bedrooms, 4)
+
+    def test_pasted_source_is_still_only_a_draft(self):
+        """Who fetched the page changes nothing about trusting it."""
+        response = self._paste(JSON_LD_PAGE)
+
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertEqual(listing.verification_status, VerificationStatus.UNVERIFIED)
+        self.assertEqual(listing.status, "draft")
+        self.assertEqual(listing.source, ListingSource.IMPORT)
+
+    def test_it_still_refuses_to_invent_anything(self):
+        response = self._paste(AMBIGUOUS_PAGE)
+
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertIsNone(listing.price)
+        self.assertIsNone(listing.bedrooms)
+
+    @mock.patch("apps.listings.importing.fetch_image")
+    def test_no_outbound_request_is_made(self, fetch_img):
+        """The whole point: this path never touches the network.
+
+        Photos referenced in pasted markup usually sit behind the same wall
+        that blocked the page, so they are reported rather than attempted.
+        """
+        response = self._paste(JSON_LD_PAGE)
+
+        fetch_img.assert_not_called()
+        self.assertEqual(response.data["photo_count"], 0)
+        self.assertTrue(
+            any("not downloaded" in w for w in response.data["warnings"]),
+            response.data["warnings"],
+        )
+
+    def test_the_source_url_is_recorded_but_never_fetched(self):
+        with mock.patch("apps.listings.importing.fetch_document") as fetch_doc:
+            response = self._paste(JSON_LD_PAGE, url="https://blocked.test/a-listing")
+
+        fetch_doc.assert_not_called()
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertEqual(listing.source_url, "https://blocked.test/a-listing")
+
+    def test_a_url_pasted_into_the_html_box_is_rejected_helpfully(self):
+        """The mistake that started all this: pasting a link, not the source."""
+        response = self._paste("https://www.realtor.ca/real-estate/30132324/x")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Ctrl+U", str(response.data["html"]))
+
+    def test_pasting_requires_authentication(self):
+        self.client.credentials()
+
+        response = self._paste(JSON_LD_PAGE)
+
+        self.assertEqual(response.status_code, 401)
+
+
+#: What a JavaScript-built listing page looks like to a plain HTTP client:
+#: an empty shell. A person sees a full listing; `requests` sees this.
+JS_SHELL_PAGE = """
+<html><head><title>Loading…</title></head>
+<body><div id="root"></div><script src="/app.js"></script></body></html>
+"""
+
+
+@override_settings(LISTING_IMPORT_USE_BROWSER=True)
+class BrowserRetryTests(ListingAPITestCase):
+    """Pasting a link should work on sites that build the page in JavaScript.
+
+    The plain fetch stays the default because it is far cheaper. The browser is
+    a second attempt, made only on evidence that the first one found nothing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.authenticate_as(self.agent)
+
+    @mock.patch("apps.listings.importing.fetch_image")
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_js_only_page_is_retried_in_a_browser(self, fetch_doc, fetch_rendered, fetch_img):
+        fetch_doc.return_value = _document(JS_SHELL_PAGE)
+        fetch_rendered.return_value = _document(JSON_LD_PAGE)
+        fetch_img.return_value = FetchedDocument(
+            url="https://cdn.example.test/a.jpg",
+            content_type="image/png",
+            content=make_image_file("a.png").read(),
+        )
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        fetch_rendered.assert_called_once()
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertEqual(listing.address, "12 Harbour View Terrace")
+        self.assertEqual(listing.bedrooms, 4)
+
+    @mock.patch("apps.listings.importing.fetch_image")
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_page_that_already_worked_is_not_re_fetched(
+        self, fetch_doc, fetch_rendered, fetch_img
+    ):
+        """The browser costs seconds. Do not spend them on a page that parsed."""
+        fetch_doc.return_value = _document(JSON_LD_PAGE)
+        fetch_img.return_value = FetchedDocument(
+            url="https://cdn.example.test/a.jpg",
+            content_type="image/png",
+            content=make_image_file("a.png").read(),
+        )
+
+        self.client.post(self.listing_import_url, {"url": SOURCE_URL}, format="json")
+
+        fetch_rendered.assert_not_called()
+
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_thin_page_does_not_look_richer_just_for_being_rendered(
+        self, fetch_doc, fetch_rendered
+    ):
+        """A genuinely empty listing stays empty rather than acquiring guesses."""
+        fetch_doc.return_value = _document(AMBIGUOUS_PAGE)
+        fetch_rendered.return_value = _document(BARE_PAGE)
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertIsNone(listing.price)
+        self.assertIsNone(listing.bedrooms)
+
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_broken_renderer_does_not_fail_an_import_that_worked(
+        self, fetch_doc, fetch_rendered
+    ):
+        """The browser is a bonus, not a dependency."""
+        fetch_doc.return_value = _document(AMBIGUOUS_PAGE)
+        fetch_rendered.side_effect = FetchError("renderer is down")
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_site_that_blocks_both_is_reported_as_blocked(
+        self, fetch_doc, fetch_rendered
+    ):
+        from apps.listings.fetching import SiteBlockedError
+
+        fetch_doc.side_effect = SiteBlockedError("plain client refused")
+        fetch_rendered.side_effect = SiteBlockedError("browser refused too")
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertTrue(response.data["blocked_by_site"])
+        self.assertEqual(Listing.objects.count(), 0)
+
+    @mock.patch("apps.listings.importing.fetch_image")
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_a_browser_gets_through_where_a_plain_client_did_not(
+        self, fetch_doc, fetch_rendered, fetch_img
+    ):
+        """Some sites turn away HTTP clients but serve a real browser fine.
+
+        Being an actual browser is not a disguise, so this is worth trying
+        before telling the agent the site refused them.
+        """
+        from apps.listings.fetching import SiteBlockedError
+
+        fetch_doc.side_effect = SiteBlockedError("plain client refused")
+        fetch_rendered.return_value = _document(JSON_LD_PAGE)
+        fetch_img.return_value = FetchedDocument(
+            url="https://cdn.example.test/a.jpg",
+            content_type="image/png",
+            content=make_image_file("a.png").read(),
+        )
+
+        response = self.client.post(
+            self.listing_import_url, {"url": SOURCE_URL}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        listing = Listing.objects.get(pk=response.data["listing"]["id"])
+        self.assertEqual(listing.bedrooms, 4)
+
+    @override_settings(LISTING_IMPORT_USE_BROWSER=False)
+    @mock.patch("apps.listings.importing.fetch_document_rendered")
+    @mock.patch("apps.listings.importing.fetch_document")
+    def test_the_retry_can_be_switched_off(self, fetch_doc, fetch_rendered):
+        fetch_doc.return_value = _document(JS_SHELL_PAGE)
+
+        self.client.post(self.listing_import_url, {"url": SOURCE_URL}, format="json")
+
+        fetch_rendered.assert_not_called()

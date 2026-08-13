@@ -19,7 +19,12 @@ from apps.accounts.tests.base import make_image_file
 from apps.listings.models import ListingPhoto
 from apps.templates.dimensions import SOCIAL_DIMENSIONS, get_dimension
 from apps.templates.html_builder import build_html
-from apps.templates.models import DesignExport, ExportFormat
+from apps.templates.models import (
+    DesignExport,
+    ElementType,
+    ExportFormat,
+    TemplateElement,
+)
 from apps.templates.render_context import build_context
 from apps.templates.tests.base import TemplateAPITestCase
 
@@ -68,6 +73,13 @@ class HtmlBuilderTests(RenderingTestCase):
         context = build_context(self.design)
         return build_html(self.design, context, get_dimension(dimension_key), {})
 
+    def edit(self, original_key: str, **fields):
+        """Change one of the design's own elements — what editing now means."""
+        element = self.element_of(self.design, original_key)
+        element.update(fields)
+        self.design.save(update_fields=["elements"])
+        return element
+
     def test_content_resolves_from_the_listing(self):
         html = self._html()
 
@@ -75,9 +87,8 @@ class HtmlBuilderTests(RenderingTestCase):
         self.assertIn("$1,850,000", html)  # price, currency-formatted
         self.assertIn("Figures are indicative only.", html)  # locked disclaimer
 
-    def test_overrides_replace_resolved_content(self):
-        self.design.overrides = {"headline": {"text": "Beachside living"}}
-        self.design.save()
+    def test_the_agents_own_words_replace_the_bound_value(self):
+        self.edit("headline", content="Beachside living", manually_overridden=True)
 
         html = self._html()
 
@@ -93,8 +104,11 @@ class HtmlBuilderTests(RenderingTestCase):
         self.assertEqual(external, [], f"template referenced external URLs: {external}")
 
     def test_text_is_escaped(self):
-        self.design.overrides = {"headline": {"text": '<script>alert(1)</script>'}}
-        self.design.save()
+        self.edit(
+            "headline",
+            content="<script>alert(1)</script>",
+            manually_overridden=True,
+        )
 
         html = self._html()
 
@@ -102,8 +116,7 @@ class HtmlBuilderTests(RenderingTestCase):
         self.assertIn("&lt;script&gt;", html)
 
     def test_hidden_elements_are_omitted(self):
-        self.design.overrides = {"badge": {"hidden": True}}
-        self.design.save()
+        self.edit("badge", visible=False)
 
         self.assertNotIn("Just listed", self._html())
 
@@ -151,11 +164,142 @@ class HtmlBuilderTests(RenderingTestCase):
         from apps.accounts.models import BrandKit
 
         BrandKit.objects.create(agent=self.profile, primary_color="#123456")
-        element = self.template.elements.get(key="headline")
-        element.style_properties = {**element.style_properties, "color": "@primary_color"}
-        element.save()
+        # Edited on the design, not the template: a design that was copied
+        # before this change would otherwise not see it, which is the whole
+        # point of the copy.
+        headline = self.element_of(self.design, "headline")
+        headline["style"]["color"] = "@primary_color"
+        self.design.save(update_fields=["elements"])
 
         self.assertIn("color:#123456", self._html())
+
+
+class TemplateArtworkTests(RenderingTestCase):
+    """Decorative, template-owned artwork.
+
+    It used to be its own element type (STATIC_GRAPHIC) with its own resolver,
+    because a template's `static_asset` was the one image an override could
+    never reach. Copying the template into the design collapsed that: the
+    asset's storage key is copied into the element's `content`, and from then
+    on it is an ordinary image — editable, replaceable, deletable, like
+    everything else on the canvas.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.graphic = TemplateElement.objects.create(
+            template=self.template,
+            key="ribbon",
+            label="Decorative ribbon",
+            element_type=ElementType.STATIC_GRAPHIC,
+            geometry={"x": 0.0, "y": 0.0, "width": 0.2, "height": 0.2},
+            static_asset=make_image_file("ribbon.png"),
+            z_index=30,
+        )
+        # Re-copied, because the design in setUp was made before this element.
+        self.design.reset_document()
+        self.design.save(update_fields=["elements"])
+
+    def render(self):
+        from apps.templates.rendering import resolve_images
+
+        return build_html(
+            self.design,
+            build_context(self.design),
+            get_dimension("instagram_post"),
+            resolve_images(self.design),
+        )
+
+    def test_the_asset_is_copied_into_the_design_as_an_ordinary_image(self):
+        ribbon = self.element_of(self.design, "ribbon")
+
+        self.assertEqual(ribbon["type"], "image")
+        self.assertTrue(ribbon["content"], "the asset key should have been copied")
+        self.assertFalse(ribbon["locked"])
+
+    def test_it_renders_as_an_inlined_image(self):
+        self.assertIn("data:image/png;base64,", self.render())
+
+    def test_it_disappears_when_its_content_is_cleared(self):
+        """No file, no <img> — the same 'render nothing' rule every element
+        follows, and now reachable by an agent deleting the picture."""
+        ribbon = self.element_of(self.design, "ribbon")
+        ribbon["content"] = ""
+        self.design.save(update_fields=["elements"])
+
+        # The only other image on this template is the hero photo; if the
+        # ribbon rendered, there would be a second data URI.
+        self.assertEqual(self.render().count("data:image/png;base64,"), 1)
+
+    def test_the_editor_resolved_view_gets_a_real_data_uri_not_a_raw_key(self):
+        """The canvas cannot draw a storage key. `resolved_content` is the
+        resolved form; `content` stays the raw key the panel edits."""
+        response = self.client.get(
+            self.design_action_url(self.design, "resolved"),
+            {"dimension": "instagram_post"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        ribbon = self._resolved(response, "ribbon")
+        self.assertTrue(str(ribbon["resolved_content"]).startswith("data:image/png;base64,"))
+        self.assertFalse(str(ribbon["content"]).startswith("data:"))
+
+    def test_the_resolved_view_reports_z_index_and_safe_area(self):
+        """A visual editor has to stack and position elements the same way an
+        export would — it needs the same numbers html_builder uses."""
+        response = self.client.get(
+            self.design_action_url(self.design, "resolved"),
+            {"dimension": "instagram_story"},
+        )
+
+        self.assertIn("safe_inset_top", response.data)
+        self.assertGreater(response.data["safe_inset_top"], 0)
+        self.assertEqual(self._resolved(response, "ribbon")["transform"]["z_index"], 30)
+
+    def test_the_artwork_is_editable_like_anything_else(self):
+        """The old contract refused this outright: a static graphic was locked
+        and every write to it was a 400. It is the agent's canvas now."""
+        elements = list(self.design.elements)
+        for element in elements:
+            if element["original_element_id"] == "ribbon":
+                element["transform"] = {**element["transform"], "x": 0.5}
+                element["style"] = {"opacity": 0.4}
+
+        response = self.client.patch(
+            self.design_detail_url(self.design),
+            {"elements": elements},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.design.refresh_from_db()
+        ribbon = self.element_of(self.design, "ribbon")
+        self.assertEqual(ribbon["transform"]["x"], 0.5)
+        self.assertEqual(ribbon["style"]["opacity"], 0.4)
+
+    def test_an_image_element_still_refuses_a_url_as_its_content(self):
+        """The one check that was never about permissions: a URL here would be
+        fetched by the renderer, from our container, to a host the caller
+        chose. That refusal survives the rewrite."""
+        elements = list(self.design.elements)
+        for element in elements:
+            if element["original_element_id"] == "ribbon":
+                element["content"] = "https://example.invalid/leak.png"
+
+        response = self.client.patch(
+            self.design_detail_url(self.design),
+            {"elements": elements},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not a URL", str(response.data))
+
+    def _resolved(self, response, original_key: str) -> dict:
+        for element in response.data["elements"]:
+            if element.get("original_element_id") == original_key:
+                return element
+        raise AssertionError(f"no resolved element for {original_key!r}")
 
 
 class ExportTests(RenderingTestCase):
@@ -164,7 +308,7 @@ class ExportTests(RenderingTestCase):
 
     @mock.patch("apps.templates.rendering.requests.post")
     def test_export_at_every_social_dimension(self, post):
-        """One design, four platforms, one request."""
+        """One design, every supported size, one request."""
         post.return_value = FakeResponse()
 
         response = self.client.post(
@@ -176,7 +320,7 @@ class ExportTests(RenderingTestCase):
         self.assertEqual(response.status_code, 201, response.data)
         # The export response also carries the compliance report — an export
         # that passed its checks says so, rather than leaving it implied.
-        self.assertEqual(len(response.data["exports"]), 4)
+        self.assertEqual(len(response.data["exports"]), len(SOCIAL_DIMENSIONS))
         self.assertIn("compliance", response.data)
 
         by_dimension = {row["dimension"]: row for row in response.data["exports"]}
@@ -186,7 +330,7 @@ class ExportTests(RenderingTestCase):
         self.assertEqual(by_dimension["facebook"]["width"], 1200)
         self.assertEqual(by_dimension["linkedin"]["height"], 627)
 
-        self.assertEqual(DesignExport.objects.count(), 4)
+        self.assertEqual(DesignExport.objects.count(), len(SOCIAL_DIMENSIONS))
 
     @mock.patch("apps.templates.rendering.requests.post")
     def test_each_dimension_is_rendered_at_its_own_size(self, post):
@@ -236,6 +380,26 @@ class ExportTests(RenderingTestCase):
         self.assertEqual(export.export_format, ExportFormat.JPG)
         self.assertTrue(export.image.name.endswith(".jpg"))
         self.assertEqual(post.call_args.kwargs["json"]["format"], "jpg")
+
+    @mock.patch("apps.templates.rendering.requests.post")
+    def test_pdf_export(self, post):
+        post.return_value = FakeResponse(
+            content=b"%PDF-1.7 fake pdf bytes",
+            headers={"Content-Type": "application/pdf", "X-Render-Ms": "210"},
+        )
+
+        response = self.client.post(
+            self._export_url(),
+            {"dimensions": ["instagram_post"], "export_format": "pdf"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        export = DesignExport.objects.get()
+        self.assertEqual(export.export_format, ExportFormat.PDF)
+        self.assertTrue(export.image.name.endswith(".pdf"))
+        # The renderer payload asks for the print pipeline, not a screenshot.
+        self.assertEqual(post.call_args.kwargs["json"]["format"], "pdf")
 
     @mock.patch("apps.templates.rendering.requests.post")
     def test_duplicate_dimensions_are_rendered_once(self, post):
@@ -403,6 +567,25 @@ class DimensionEndpointTests(TemplateAPITestCase):
 
         self.assertEqual(response.status_code, 200)
         keys = {row["key"] for row in response.data}
-        self.assertEqual(
-            keys, {"instagram_post", "instagram_story", "facebook", "linkedin"}
+        # The four platform formats must always be offered. The set is allowed
+        # to grow — portrait_tall was added for artwork whose native shape is
+        # neither square nor a Story — so this asserts presence, not equality;
+        # freezing it made adding a format look like a regression.
+        self.assertLessEqual(
+            {"instagram_post", "instagram_story", "facebook", "linkedin"}, keys
         )
+        self.assertEqual(keys, set(SOCIAL_DIMENSIONS))
+
+    def test_safe_area_insets_are_published(self):
+        """A canvas editor needs these to place elements the same place
+        html_builder does — without them Story content would be positioned
+        against the raw canvas edge, under the platform's own chrome."""
+        agent, _ = self.make_agent_in(self.make_brokerage("Acme"), "a@example.com")
+        self.authenticate_as(agent)
+
+        response = self.client.get(self.dimensions_url)
+
+        by_key = {row["key"]: row for row in response.data}
+        self.assertGreater(by_key["instagram_story"]["safe_inset_top"], 0)
+        self.assertGreater(by_key["instagram_story"]["safe_inset_bottom"], 0)
+        self.assertEqual(by_key["instagram_post"]["safe_inset_top"], 0)

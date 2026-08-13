@@ -20,6 +20,7 @@ from apps.compliance.models import (
     LegalStatus,
     Severity,
 )
+from apps.templates.document import new_element
 from apps.templates.tests.base import TemplateAPITestCase
 
 
@@ -257,6 +258,65 @@ class ExportGateTests(TemplateAPITestCase):
 
         response = self.client.get(self.design_action_url(self.design, "compliance"))
 
+        self.assertEqual(response.data["status"], EvaluationStatus.PASSED)
+
+    def test_an_added_elements_text_is_still_checked(self):
+        """Compliance must not have a blind spot for elements the template
+        never had. It does not, because ``from_design`` walks the design's own
+        document — the same list the canvas draws and the exporter renders —
+        so an element the agent added is on it exactly like everything else.
+
+        This matters more now than it did: an agent can add, retype and delete
+        anything on the canvas, so "the template author vetted this text" is no
+        longer true of any element.
+        """
+        prohibited_rule("guaranteed returns", severity=Severity.ERROR)
+
+        added = new_element("text")
+        added["content"] = "Guaranteed returns on every sale"
+        self.design.elements.append(added)
+        self.design.save(update_fields=["elements"])
+
+        response = self.client.get(self.design_action_url(self.design, "compliance"))
+
+        self.assertEqual(response.data["status"], EvaluationStatus.FAILED)
+        failing = [r for r in response.data["results"] if r["status"] == "fail"]
+        self.assertTrue(any("guaranteed returns" in r["message"] for r in failing))
+
+    def test_deleting_the_flagged_element_clears_the_flag(self):
+        prohibited_rule("guaranteed returns", severity=Severity.ERROR)
+        added = new_element("text")
+        added["content"] = "Guaranteed returns on every sale"
+        self.design.elements.append(added)
+        self.design.save(update_fields=["elements"])
+
+        self.design.elements = [
+            element for element in self.design.elements if element["id"] != added["id"]
+        ]
+        self.design.save(update_fields=["elements"])
+
+        response = self.client.get(self.design_action_url(self.design, "compliance"))
+        self.assertEqual(response.data["status"], EvaluationStatus.PASSED)
+
+    def test_hiding_the_flagged_element_clears_the_flag_too(self):
+        """A hidden element renders nothing, so there is nothing to check —
+        and the export it would have appeared in does not contain it."""
+        prohibited_rule("guaranteed returns", severity=Severity.ERROR)
+        added = new_element("text")
+        added["content"] = "Guaranteed returns on every sale"
+        self.design.elements.append(added)
+        self.design.save(update_fields=["elements"])
+        self.assertEqual(
+            self.client.get(
+                self.design_action_url(self.design, "compliance")
+            ).data["status"],
+            EvaluationStatus.FAILED,
+        )
+
+        self.design.elements[-1]["visible"] = False
+        self.design.save(update_fields=["elements"])
+
+        response = self.client.get(self.design_action_url(self.design, "compliance"))
         self.assertEqual(response.data["status"], EvaluationStatus.PASSED)
 
 

@@ -88,6 +88,17 @@ def design_export_upload_to(instance, filename: str) -> str:
     return build_upload_key("designs/exports", filename)
 
 
+def template_asset_upload_to(instance, filename: str) -> str:
+    """Storage key for a static decorative graphic baked into a template.
+
+    Authored by Nehrux, the same way every other template field is — agents
+    never write to this. It exists so a template can carry artwork (a ribbon,
+    an illustrated background) that is not a photo of anything and is not
+    swapped by content_source, without pretending it is listing or brand data.
+    """
+    return build_upload_key("templates/assets", filename)
+
+
 def delete_stored_file(file_field) -> None:
     """Delete the file behind a ``FieldFile``, if any, via the storage API.
 

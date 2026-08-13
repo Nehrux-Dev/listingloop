@@ -462,6 +462,26 @@ RENDERER_TIMEOUT_SECONDS = env.int("RENDERER_TIMEOUT_SECONDS", default=30)
 RENDERER_SCALE = env.int("RENDERER_SCALE", default=1)
 RENDERER_JPG_QUALITY = env.int("RENDERER_JPG_QUALITY", default=90)
 
+#: Retry a listing import in a real browser when the plain HTTP fetch finds no
+#: structured data.
+#:
+#: Many property sites ship an empty shell and build the listing in JavaScript,
+#: so a plain fetch sees nothing while a person sees a full page. This is not a
+#: way around sites that refuse automation — no disguise is attempted, and a
+#: refusal is still a refusal — it is simply executing the page the way the
+#: publisher wrote it.
+#:
+#: Off means imports stay fast and cheap and JS-only sites come back blank.
+#:
+#: Off under test as well: the suite stubs the fetch layer, and a retry that
+#: quietly reached for a real browser would make those tests depend on a
+#: running renderer. The tests that care about this path turn it on explicitly.
+LISTING_IMPORT_USE_BROWSER = (
+    False if TESTING else env.bool("LISTING_IMPORT_USE_BROWSER", default=True)
+)
+#: Longer than a screenshot: a real page has to load and settle.
+LISTING_IMPORT_BROWSER_TIMEOUT = env.int("LISTING_IMPORT_BROWSER_TIMEOUT", default=45)
+
 
 # ---------------------------------------------------------------------------
 # Authentication

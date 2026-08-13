@@ -7,19 +7,22 @@ That is wrong, and annoyingly so: it would block a Diwali card because the
 agent has not uploaded a listing photo, and block a listing card because they
 have not written a tagline.
 
-The requirement is *"if a template requires X and it is missing"* — so the
-template is the source of truth. This walks the design's own elements, resolves
-each one exactly as the renderer will, and reports the ones that would come out
-empty. A template that never shows a brokerage logo cannot be blocked for the
-want of one.
+The requirement is *"if this design shows X and X is missing"* — so the design
+is the source of truth. This walks the design's own elements, resolves each one
+exactly as the renderer will, and reports the ones that would come out empty. A
+design that shows no brokerage logo cannot be blocked for the want of one, and
+an agent who deleted that element has said as much.
 
 WHAT COUNTS AS BLOCKING
 -----------------------
-An element blocks the export when it resolves to nothing AND either:
+An element blocks the export when it resolves to nothing AND it draws on
+agent / brokerage / brand data — the reusable information the profile exists
+to hold.
 
-  * it is marked ``required`` in the template's own constraints, or
-  * it draws on agent / brokerage / brand data — the reusable information the
-    profile exists to hold.
+The template's old ``required`` constraint is no longer consulted: a design
+owns its elements, so a template cannot declare that one of them must survive.
+What remains is stronger for being simpler — if the design *shows* a field, it
+has to have something to show.
 
 This is where a missing disclaimer is actually caught. Not at sign-up: an
 agent who has not yet named their brokerage can still create an account, add
@@ -40,10 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from apps.accounts.completeness import fix_path_for
-from apps.templates.html_builder import (
-    resolve_element_content,
-    unresolved_placeholders,
-)
+from apps.templates.html_builder import resolve_content, unresolved_placeholders
 
 #: content_source prefix -> (label shown to the agent, Settings area)
 SOURCE_LABELS: dict[str, tuple[str, str]] = {
@@ -95,7 +95,7 @@ class MissingElement:
         }
 
 
-def _describe(source: str, element) -> tuple[str, str]:
+def _describe(source: str, element: dict) -> tuple[str, str]:
     if source in SOURCE_LABELS:
         return SOURCE_LABELS[source]
 
@@ -103,7 +103,7 @@ def _describe(source: str, element) -> tuple[str, str]:
     # and — more importantly — is attributed to the right screen. Sending an
     # agent to Brokerage settings to fix a missing listing photo is worse than
     # a vague message, because they will look and find nothing wrong.
-    label = element.label or element.key.replace("_", " ").capitalize()
+    label = element.get("name") or "Element"
     if source.startswith(("listing.", "property.")):
         step = "listing"
     elif source.startswith("agent."):
@@ -132,38 +132,50 @@ def _fix_path(step: str, design) -> str:
 
 def assess_design(design, context: dict) -> list[MissingElement]:
     """Elements that would render empty and should not."""
-    overrides = design.overrides or {}
     missing: list[MissingElement] = []
     seen: set[str] = set()
 
-    for element in design.template.elements.all():
-        override = overrides.get(element.key, {})
-        if override.get("hidden"):
+    for element in design.ensure_document():
+        if not element.get("visible", True):
             continue
 
-        content = resolve_element_content(element, override, context)
+        # Resolved with no image map: an unreadable image is a storage problem,
+        # not a missing-profile-field one, and passing images through here
+        # would mean reading every file just to ask whether it is empty.
+        content = resolve_content(element, context, {})
         is_empty = content is None or (isinstance(content, str) and not content.strip())
 
-        source = element.content_source or ""
-        required_by_template = bool(element.constraints.get("required"))
-        draws_on_profile = source.startswith(PROFILE_PREFIXES)
-
-        if is_empty and (required_by_template or draws_on_profile):
+        source = element.get("content_source") or ""
+        # An element with a data source is *supposed* to show something. If it
+        # resolves to nothing, the export gets a blank rectangle where a price
+        # or a photo belongs — which an agent may not notice until after it is
+        # published.
+        #
+        # An element with no source and nothing in it is a different case: an
+        # empty box the agent left on the canvas. Their business, not a gap.
+        #
+        # This replaces the template's old `required` constraint, and covers
+        # more: that flag had to be set by hand per element, and was the only
+        # reason a missing listing photo was ever caught. Now anything the
+        # design binds to data is checked, and anything the agent does not want
+        # checked they can simply delete — which they could not do before.
+        if is_empty and source:
             label, step = _describe(source, element)
-            # A template can show the same field twice; the agent only needs
+            # A design can show the same field twice; the agent only needs
             # telling once.
             if label in seen:
                 continue
             seen.add(label)
             missing.append(
-                MissingElement(element.key, label, step, _fix_path(step, design))
+                MissingElement(element["id"], label, step, _fix_path(step, design))
             )
             continue
 
         # A partly-resolved placeholder is its own failure: "Call " with no
         # number reads as finished when it is not.
-        if isinstance(content, str) and "{{" in (element.default_content or ""):
-            for path in unresolved_placeholders(element.default_content, context):
+        stored = element.get("content")
+        if isinstance(stored, str) and "{{" in stored:
+            for path in unresolved_placeholders(stored, context):
                 if not path.startswith(PROFILE_PREFIXES):
                     continue
                 label, step = _describe(path, element)
@@ -171,7 +183,7 @@ def assess_design(design, context: dict) -> list[MissingElement]:
                     continue
                 seen.add(label)
                 missing.append(
-                    MissingElement(element.key, label, step, _fix_path(step, design))
+                    MissingElement(element["id"], label, step, _fix_path(step, design))
                 )
 
     return missing

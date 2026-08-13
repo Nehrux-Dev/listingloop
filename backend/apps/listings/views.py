@@ -25,8 +25,8 @@ from rest_framework.throttling import ScopedRateThrottle
 from django.utils import timezone
 
 from apps.accounts.models import AgentProfile
-from apps.listings.fetching import FetchError, UnsafeUrlError
-from apps.listings.importing import import_listing_from_url
+from apps.listings.fetching import FetchError, SiteBlockedError, UnsafeUrlError
+from apps.listings.importing import import_listing_from_html, import_listing_from_url
 from apps.listings.models import (
     Enquiry,
     EnquiryStatus,
@@ -42,6 +42,7 @@ from apps.listings.permissions import (
 from apps.listings.public_serializers import EnquirySerializer, EnquiryStatusSerializer
 from apps.listings.serializers import (
     ListingImportResultSerializer,
+    ListingImportHtmlSerializer,
     ListingImportSerializer,
     ListingPhotoSerializer,
     ListingSerializer,
@@ -156,12 +157,31 @@ class ListingViewSet(viewsets.ModelViewSet):
                 {"detail": str(exc), "warnings": []},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        except SiteBlockedError as exc:
+            # Distinct from a generic fetch failure, and flagged so the UI can
+            # offer the paste-the-source route. Retrying will never help: the
+            # site has decided not to serve automated requests, and the agent
+            # needs to be told that plainly rather than left thinking the
+            # listing page was empty.
+            return Response(
+                {
+                    "detail": str(exc),
+                    "blocked_by_site": True,
+                    "warnings": [
+                        "Nothing was created. Open the page in your browser, "
+                        "press Ctrl+U to view its source, copy all of it, and "
+                        "paste it below.",
+                    ],
+                },
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
         except FetchError as exc:
             # Graceful failure: the page could not be read, so no half-built
             # listing is left behind.
             return Response(
                 {
                     "detail": f"That page could not be imported: {exc}",
+                    "blocked_by_site": False,
                     "warnings": [
                         "Nothing was created. You can still add the listing manually."
                     ],
@@ -169,7 +189,51 @@ class ListingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        payload = ListingImportResultSerializer(
+        return Response(
+            self._import_payload(outcome), status=status.HTTP_201_CREATED
+        )
+
+    import_url.throttle_scope = "listing_import"
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="import-html",
+        throttle_classes=[ScopedRateThrottle],
+    )
+    def import_html(self, request: Request) -> Response:
+        """``POST /api/listings/import-html/`` — import from pasted page source.
+
+        The fallback for sites that refuse automated requests. The agent opens
+        the page in their own browser and pastes what they are looking at; the
+        extraction is identical to the URL path, including the refusal to
+        invent any value that is not stated.
+
+        Still throttled. It makes no outbound request, so it cannot be used to
+        probe the network, but it does hand a large parsing job to the server.
+        """
+        input_serializer = ListingImportHtmlSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+
+        profile = AgentProfile.objects.filter(user=request.user).first()
+        if profile is None:
+            raise ValidationError(
+                {"detail": "You need an agent profile before importing listings."}
+            )
+
+        outcome = import_listing_from_html(
+            input_serializer.validated_data["html"],
+            profile,
+            source_url=input_serializer.validated_data.get("url", ""),
+        )
+        return Response(
+            self._import_payload(outcome), status=status.HTTP_201_CREATED
+        )
+
+    import_html.throttle_scope = "listing_import"
+
+    def _import_payload(self, outcome) -> dict:
+        return ListingImportResultSerializer(
             {
                 "listing": outcome.listing,
                 "extracted_fields": outcome.extracted_fields,
@@ -178,9 +242,6 @@ class ListingViewSet(viewsets.ModelViewSet):
             },
             context=self.get_serializer_context(),
         ).data
-        return Response(payload, status=status.HTTP_201_CREATED)
-
-    import_url.throttle_scope = "listing_import"
 
 
 class EnquiryViewSet(viewsets.ReadOnlyModelViewSet):

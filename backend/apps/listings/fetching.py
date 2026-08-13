@@ -74,12 +74,55 @@ IMAGE_CONTENT_TYPES = ("image/jpeg", "image/png", "image/webp")
 USER_AGENT = "RealEstateListingImporter/1.0 (+one-off import, agent triggered)"
 
 
+#: Fingerprints of bot-protection interstitials.
+#:
+#: These pages arrive with HTTP 200 and look, to a parser, like a listing page
+#: that simply happens to be empty. Reporting them as "no structured data" is
+#: actively misleading: it sends the agent hunting for a problem with their
+#: listing when the truth is that the site declined to serve us at all. The
+#: right answer for the agent is completely different in each case, so the two
+#: are distinguished here rather than blurred together.
+BOT_WALL_MARKERS = (
+    "pardon our interruption",
+    "request unsuccessful. incapsula",
+    "cf-browser-verification",
+    "checking your browser before accessing",
+    "attention required! | cloudflare",
+    "please enable javascript and cookies to continue",
+    "access to this page has been denied",
+    "are you a robot",
+)
+
+#: Status codes that, on a page that exists in a browser, mean "not to you".
+BLOCKED_STATUS_CODES = frozenset({401, 403, 429})
+
+
 class UnsafeUrlError(Exception):
     """The URL points somewhere we refuse to fetch from."""
 
 
 class FetchError(Exception):
     """The URL could not be fetched (network error, timeout, bad status)."""
+
+
+class SiteBlockedError(FetchError):
+    """The site served a bot wall or refused us outright.
+
+    A subclass of FetchError so every existing caller keeps working, but
+    distinguishable where it matters: this one is not the agent's fault and no
+    amount of retrying will fix it, so the UI tells them to paste the page
+    source instead of implying their listing was empty.
+    """
+
+
+def looks_like_bot_wall(html: str) -> bool:
+    """True when ``html`` is an interstitial rather than a real page.
+
+    Deliberately checks only the opening stretch. Interstitials are small and
+    say so immediately; a genuine listing page that happens to quote one of
+    these phrases further down is not a block.
+    """
+    return any(marker in html[:4000].lower() for marker in BOT_WALL_MARKERS)
 
 
 @dataclass
@@ -194,6 +237,18 @@ def fetch_document(
                     current = assert_fetchable(requests.compat.urljoin(current, location))
                     continue
 
+                if response.status_code in BLOCKED_STATUS_CODES:
+                    logger.info(
+                        "Listing import refused by site: %r returned HTTP %s",
+                        current, response.status_code,
+                    )
+                    raise SiteBlockedError(
+                        "This website does not allow automatic importing "
+                        f"(it returned HTTP {response.status_code}). Open the "
+                        "page in your browser and paste the page source "
+                        "instead."
+                    )
+
                 if response.status_code >= 400:
                     raise FetchError(
                         f"The page returned HTTP {response.status_code}."
@@ -224,15 +279,79 @@ def fetch_document(
                 except requests.RequestException as exc:
                     raise FetchError("The page could not be read.") from exc
 
+                content = b"".join(chunks)
+
+                # A bot wall arrives as HTTP 200, so nothing above catches it.
+                # Left alone it parses as a page with no listing on it, and the
+                # agent is told their listing had no data — which is not what
+                # happened.
+                if allowed_content_types is HTML_CONTENT_TYPES and looks_like_bot_wall(
+                    content.decode("utf-8", "replace")
+                ):
+                    logger.info("Listing import hit a bot wall at %r", current)
+                    raise SiteBlockedError(
+                        "This website served an automated-traffic check "
+                        "instead of the listing, so nothing could be read. "
+                        "Open the page in your browser and paste the page "
+                        "source instead."
+                    )
+
                 return FetchedDocument(
                     url=current,
                     content_type=content_type,
-                    content=b"".join(chunks),
+                    content=content,
                 )
 
         raise FetchError("Too many redirects.")
     finally:
         session.close()
+
+
+def fetch_document_rendered(url: str) -> FetchedDocument:
+    """Fetch ``url`` through the renderer service, in a real browser.
+
+    Used when the plain fetch above returns a page with no listing on it,
+    because an increasing number of property sites build the listing in
+    JavaScript and serve an empty shell to anything that does not run it.
+
+    The URL is validated here as well as in the renderer. Two checks for the
+    same thing is deliberate: this one keeps a bad address from ever leaving
+    Django, and the renderer's one covers the redirects and subresources that
+    only exist once a browser is driving.
+    """
+    from django.conf import settings
+
+    safe_url = assert_fetchable(url)
+
+    try:
+        response = requests.post(
+            f"{settings.RENDERER_URL.rstrip('/')}/fetch",
+            json={"url": safe_url},
+            headers={"X-Renderer-Token": settings.RENDERER_TOKEN},
+            timeout=settings.LISTING_IMPORT_BROWSER_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        logger.info("Browser fetch unavailable for %r: %s", safe_url, exc)
+        raise FetchError("The page could not be reached with a browser.") from exc
+
+    if response.status_code != 200:
+        raise FetchError("The page could not be loaded in a browser.")
+
+    payload = response.json()
+    html = payload.get("html") or ""
+    status = payload.get("status") or 0
+
+    if status in BLOCKED_STATUS_CODES or looks_like_bot_wall(html):
+        raise SiteBlockedError(
+            "This website does not allow automatic importing. Open the page "
+            "in your browser and paste the page source instead."
+        )
+
+    return FetchedDocument(
+        url=payload.get("finalUrl") or safe_url,
+        content_type="text/html",
+        content=html.encode("utf-8"),
+    )
 
 
 def fetch_image(url: str) -> FetchedDocument:

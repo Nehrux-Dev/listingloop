@@ -302,6 +302,21 @@ class ListingPhotoTests(ListingAPITestCase):
             self.listing_a.photos.first().image.name.startswith("listings/photos/")
         )
 
+    def test_the_photo_response_exposes_a_usable_override_key(self):
+        """Not just the URL — a design's image-replace flow needs the raw
+        storage key to set as an image_key override; overrides.py refuses a
+        URL there on purpose (see _validate_image_key)."""
+        self.authenticate_as(self.agent_a)
+
+        response = self.client.post(
+            self.photos_url,
+            {"listing": self.listing_a.pk, "image": make_image_file("hero.png"), "order": 0},
+            format="multipart",
+        )
+
+        self.assertEqual(response.data["image_key"], self.listing_a.photos.get().image.name)
+        self.assertNotIn("://", response.data["image_key"])
+
     def test_photos_come_back_in_order(self):
         self.authenticate_as(self.agent_a)
         for order in (2, 0, 1):
