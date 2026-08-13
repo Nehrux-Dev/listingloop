@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(docker compose -f e:\\\\Real_Estate\\\\docker-compose.yml --project-directory e:\\\\Real_Estate exec -T frontend npm run lint 2>&1)",
+      "PowerShell(cd e:\\\\Real_Estate; \\(Get-Content backend\\\\apps\\\\accounts\\\\tests\\\\test_profile_setup.py -Raw\\) -replace '\\\\\\(OnboardingTestCase\\\\\\)', '\\(ProfileSetupTestCase\\)' -replace 'self\\\\.completion_url', 'self.completeness_url' | Set-Content backend\\\\apps\\\\accounts\\\\tests\\\\test_profile_setup.py -Encoding utf8 -NoNewline; Select-String -Path backend\\\\apps\\\\accounts\\\\tests\\\\test_profile_setup.py -Pattern \"class |completion_url|complete_url|status_url\" | ForEach-Object { \"$\\($_.LineNumber\\): $\\($_.Line.Trim\\(\\)\\)\" })",
+      "PowerShell(cd e:\\\\Real_Estate; git checkout -- backend/apps/accounts/tests/test_profile_setup.py; $p='e:\\\\Real_Estate\\\\backend\\\\apps\\\\accounts\\\\tests\\\\test_profile_setup.py'; $t=[IO.File]::ReadAllText\\($p\\); if \\($t -match 'REALTOR\\\\u00ae'\\) { \"encoding restored ok\" } else { \"CHECK ENCODING\" })",
+      "Bash(docker compose *)",
+      "Bash(grep -E \"^\\(FAIL|ERROR\\):|^Ran |^OK$|^FAILED|Error\")",
+      "Bash(rm -rf \"/c/Users/MSIGF6~1/AppData/Local/Temp/claude/e--Real-Estate/0705bbfb-391c-4acd-9cce-59f0b729caf6/scratchpad/phase4-shots\" *)",
+      "Bash(docker compose exec -T backend python manage.py shell -c ' *)",
+      "Bash(python -)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\MSIGF6~1\\AppData\\Local\\Temp\\claude\\e--Real-Estate\\0705bbfb-391c-4acd-9cce-59f0b729caf6\\scratchpad"
+    ]
+  }
+}

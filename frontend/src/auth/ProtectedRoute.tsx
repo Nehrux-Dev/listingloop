@@ -8,7 +8,7 @@
  * not shown doors they cannot open.
  */
 
-import type { ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Navigate, Outlet, useLocation } from 'react-router-dom'
 
 import { useAuth } from './AuthContext.tsx'
@@ -74,14 +74,9 @@ export function RequireRole({
   orBrokerageAdministrator = false,
   children,
 }: RequireRoleProps) {
-  const { status, user, hasRole, hasRoleAtLeast } = useAuth()
+  const { status, user, hasRole, hasRoleAtLeast, revalidate } = useAuth()
   const location = useLocation()
-
-  if (status === 'loading') return <AuthLoading />
-
-  if (status !== 'authenticated' || !user) {
-    return <Navigate to="/login" replace state={{ from: location }} />
-  }
+  const [revalidated, setRevalidated] = useState(false)
 
   const byRole = minimumRole
     ? hasRoleAtLeast(minimumRole)
@@ -89,9 +84,35 @@ export function RequireRole({
       ? hasRole(...roles)
       : false
   const allowed =
-    byRole || (orBrokerageAdministrator && user.administers_brokerage)
+    byRole || (orBrokerageAdministrator && (user?.administers_brokerage ?? false))
+
+  // Before turning anyone away, make sure we are not judging them on a stale
+  // copy of themselves.
+  //
+  // `user` is a snapshot taken at sign-in. Anything that changes a user's
+  // rights mid-session — creating a brokerage, an admin granting a role —
+  // leaves that snapshot behind, and the guard then refuses someone the server
+  // would have allowed. That is worse than a slow page: the export gate sends
+  // an agent to /brokerage and this bounces them to /forbidden.
+  //
+  // One re-fetch, once per mount, and only on the failing path.
+  useEffect(() => {
+    if (status === 'authenticated' && !allowed && !revalidated) {
+      setRevalidated(true)
+      void revalidate()
+    }
+  }, [status, allowed, revalidated, revalidate])
+
+  if (status === 'loading') return <AuthLoading />
+
+  if (status !== 'authenticated' || !user) {
+    return <Navigate to="/login" replace state={{ from: location }} />
+  }
 
   if (!allowed) {
+    // Still waiting on the re-check: showing the loader beats a /forbidden
+    // flash that turns out to be wrong a moment later.
+    if (!revalidated) return <AuthLoading />
     return <Navigate to="/forbidden" replace />
   }
 

@@ -25,10 +25,18 @@ const PERMISSION_BADGE: Record<ElementPermission, string> = {
   free: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
 }
 
-/** Brand references (`@accent_color`) are stored as tokens, not hex. */
+/**
+ * Brand references (`@accent_color`) are stored as tokens, not hex.
+ *
+ * These are only stand-ins for when the real kit is not to hand — this panel
+ * is not passed one. The canvas toolbar's equivalent resolves the actual
+ * brand colour (see controls.tsx::swatchColor); until this panel does too, a
+ * neutral warm fallback is the honest choice. The previous `#2563EB` was a
+ * bright blue advertising an accent that renders red for this brokerage.
+ */
 function swatchColor(value: string): string {
   if (!value.startsWith('@')) return value
-  return { '@primary_color': '#1F2937', '@secondary_color': '#4B5563', '@accent_color': '#2563EB' }[
+  return { '@primary_color': '#1F2937', '@secondary_color': '#4B5563', '@accent_color': '#8B4F24' }[
     value
   ] ?? '#94A3B8'
 }
@@ -85,12 +93,28 @@ export function ElementControls({
       )}
 
       {/* Locked: show the value so the agent knows what is there, with no
-          affordance to change it. */}
-      {element.permission === 'locked' && (
-        <p className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-500">
-          {element.content || <span className="italic">Set by the template</span>}
-        </p>
-      )}
+          affordance to change it. An image-bearing element's "value" is a
+          (potentially huge) data URI — including static_graphic, which is
+          locked by convention — so that case gets a thumbnail instead of
+          dumping kilobytes of base64 as literal text. */}
+      {element.permission === 'locked' &&
+        (['image', 'logo', 'static_graphic'].includes(element.element_type) ? (
+          <div className="mt-3">
+            {element.content ? (
+              <img
+                src={String(element.content)}
+                alt=""
+                className="size-12 rounded border border-slate-200 object-cover"
+              />
+            ) : (
+              <span className="text-sm italic text-slate-500">Set by the template</span>
+            )}
+          </div>
+        ) : (
+          <p className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-500">
+            {element.content || <span className="italic">Set by the template</span>}
+          </p>
+        ))}
 
       {element.permission !== 'locked' && (
         <div className="mt-3 space-y-3">
@@ -113,7 +137,7 @@ export function ElementControls({
             </label>
           )}
 
-          {['image', 'logo'].includes(element.element_type) && (
+          {['image', 'logo', 'static_graphic'].includes(element.element_type) && (
             <div className="flex items-center gap-3">
               {element.content ? (
                 <img
@@ -127,8 +151,8 @@ export function ElementControls({
                 </div>
               )}
               <p className="text-xs text-slate-500">
-                Follows the listing photo. Swapping the image here is not in this
-                build; change the listing's photos instead.
+                Select this element on the canvas above to replace, fit or reposition
+                the image.
               </p>
             </div>
           )}
@@ -199,20 +223,23 @@ export function ElementControls({
   )
 }
 
-function ColorChoice({
+/** Exported for reuse by the canvas Toolbar's colour control — same swatch
+ *  logic, same brand-token handling, so there is only one implementation of
+ *  "how a colour override renders as a picker" in the app. */
+export function ColorChoice({
   label,
   value,
   options,
   onChange,
 }: {
-  label: string
+  label?: string
   value: string
   options?: string[]
   onChange: (value: string) => void
 }) {
   return (
     <div>
-      <span className="text-xs font-medium text-slate-600">{label}</span>
+      {label && <span className="text-xs font-medium text-slate-600">{label}</span>}
       {options && options.length > 0 ? (
         // An allowlist means swatches, not a colour picker: offering a picker
         // for values the server will reject is a worse experience than not

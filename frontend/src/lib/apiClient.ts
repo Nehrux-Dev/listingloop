@@ -128,9 +128,16 @@ export async function refreshAccessToken(): Promise<string | null> {
 // A single in-flight refresh shared by all callers. Without this, five
 // concurrent 401s would fire five refreshes — and since refresh tokens rotate
 // and are single-use, four of them would fail and log the user out.
+//
+// EVERY caller must go through here, including session restore on boot.
+// React StrictMode invokes effects twice in development, so a provider calling
+// `refreshAccessToken` directly issues two overlapping refreshes: the first
+// rotates the token and blacklists the cookie the second is still holding, the
+// second comes back 401 and clears the access token. The symptom is being
+// bounced to /login on reload while genuinely signed in.
 let refreshInFlight: Promise<string | null> | null = null
 
-function refreshOnce(): Promise<string | null> {
+export function refreshOnce(): Promise<string | null> {
   refreshInFlight ??= refreshAccessToken().finally(() => {
     refreshInFlight = null
   })

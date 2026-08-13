@@ -7,6 +7,7 @@ import {
   searchBrokerages,
   type BrokerageMatch,
 } from '../api/profileSetup.ts'
+import { useAuth } from '../auth/AuthContext.tsx'
 import { ApiError } from '../lib/apiClient.ts'
 
 /**
@@ -38,6 +39,12 @@ export default function BrokerageSetupCard({
   brokerage: BrokerageBadge | null
   onChanged: () => void | Promise<void>
 }) {
+  // Creating a brokerage makes you its administrator, and that fact lives on
+  // the auth user (`administers_brokerage`), not on the profile. Re-fetching
+  // only the profile left the nav and the /brokerage route guard reading a
+  // stale user, so the agent was sent to /forbidden on the very screen the
+  // export gate had just told them to visit.
+  const { refresh: refreshUser } = useAuth()
   const [mode, setMode] = useState<'search' | 'create'>('search')
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<BrokerageMatch[]>([])
@@ -75,6 +82,7 @@ export default function BrokerageSetupCard({
     setError(null)
     try {
       await joinBrokerage(id)
+      await refreshUser()
       await onChanged()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not join that brokerage.')
@@ -91,6 +99,7 @@ export default function BrokerageSetupCard({
     setErrors({})
     try {
       await createBrokerage(fields)
+      await refreshUser()
       await onChanged()
     } catch (err) {
       if (err instanceof ApiError && err.data && typeof err.data === 'object') {

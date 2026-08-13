@@ -1,1 +1,108 @@
 @import 'tailwindcss';
+
+/**
+ * Editor chrome tokens.
+ *
+ * ==========================================================================
+ * THESE COLOURS DRESS THE APPLICATION, NEVER THE ARTWORK.
+ * ==========================================================================
+ * A design's own colours live in the template's `style_properties` and in a
+ * `Design`'s overrides, and reach the page as inline styles computed from
+ * that data — see ElementLayer.tsx and html_builder.py. Nothing in this file
+ * can reach them, which is the point: retheming the editor must never
+ * restyle a customer's marketing material, and the exported PNG must look
+ * identical before and after this file changes.
+ *
+ * So: use these tokens for panels, toolbars, navigation and controls. Never
+ * for anything inside the canvas stage.
+ *
+ * Tailwind v4 turns each `--color-*` entry into a full utility family
+ * (`bg-app`, `text-ink`, `border-line`, `ring-brand`, ...), which is what
+ * keeps the palette in one file instead of scattered across twenty
+ * components as literal hex.
+ */
+@theme {
+  /* -- surfaces ---------------------------------------------------------- */
+  /** The page itself: warm off-white, never pure grey. */
+  --color-app: #faf8f3;
+  /** Panels, cards, toolbars — the things that sit on top of the page. */
+  --color-surface: #ffffff;
+  /** A recessed surface: search fields, inset wells, muted tiles. */
+  --color-subtle: #f7f3ec;
+  /** Warm beige for filled chips, thumbnails and empty states. */
+  --color-beige: #ede4d5;
+  /** The mat the design sits on. Deliberately its own token rather than a
+   *  reuse of `subtle`: this is the one surface that must stay visually
+   *  neutral against ANY template's own colours, so it should be tuned
+   *  independently of the panel palette. */
+  --color-workspace: #f7f4ee;
+
+  /* -- accent ------------------------------------------------------------ */
+  /** The one accent in the product. Brown, not blue and not purple. */
+  --color-brand: #8b4f24;
+  /** Pressed/hover state for filled brand buttons. */
+  --color-brand-strong: #6f3e1b;
+  /** A brand wash for selected rows — carries the accent without shouting. */
+  --color-brand-soft: #f2e7dc;
+
+  /* -- text -------------------------------------------------------------- */
+  --color-ink: #2a1a10;
+  --color-muted: #756a60;
+
+  /* -- lines and interaction states -------------------------------------- */
+  --color-line: #e6ded2;
+  --color-hover: #f3ece3;
+  --color-active: #efe3d6;
+
+  /* -- status ------------------------------------------------------------ */
+  --color-success: #22a06b;
+  --color-warning: #b0761f;
+  --color-danger: #b4442c;
+
+  /* -- radii ------------------------------------------------------------- */
+  /** Controls: buttons, inputs, chips. */
+  --radius-control: 8px;
+  /** Panels, cards, popovers. */
+  --radius-panel: 12px;
+
+  /* -- elevation --------------------------------------------------------- */
+  /** Resting panels: a hairline lift, not a drop shadow. */
+  --shadow-panel: 0 1px 2px rgb(42 26 16 / 0.04), 0 1px 3px rgb(42 26 16 / 0.03);
+  /** Things that float above the page: menus, popovers, canvas overlays. */
+  --shadow-pop: 0 4px 12px rgb(42 26 16 / 0.08), 0 2px 4px rgb(42 26 16 / 0.04);
+}
+
+/**
+ * The app background belongs on the root element rather than on a wrapper,
+ * so overscroll and any full-height page still show the warm ground instead
+ * of the browser's default white.
+ */
+html,
+body,
+#root {
+  height: 100%;
+  background-color: var(--color-app);
+  color: var(--color-ink);
+}
+
+/** Warm the native form controls and selection to match, so browser defaults
+ *  do not reintroduce the blue this theme deliberately removes. */
+@layer base {
+  ::selection {
+    background-color: var(--color-active);
+    color: var(--color-ink);
+  }
+
+  input,
+  textarea,
+  select,
+  button {
+    accent-color: var(--color-brand);
+  }
+
+  /* Sliders and checkboxes inherit `accent-color`; focus rings should too. */
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+  }
+}
