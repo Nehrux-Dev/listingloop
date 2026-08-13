@@ -30,7 +30,7 @@ import {
   type ReactNode,
 } from 'react'
 
-import { refreshAccessToken } from '../lib/apiClient.ts'
+import { refreshOnce } from '../lib/apiClient.ts'
 import { fetchCurrentUser, login as loginRequest, logout as logoutRequest } from './api.ts'
 import { clearAccessToken } from './tokenStore.ts'
 import { hasRoleAtLeast, type Credentials, type Role, type User } from './types.ts'
@@ -50,6 +50,14 @@ type AuthContextValue = {
    * registered agent straight back to the sign-in page.
    */
   refresh: () => Promise<void>
+  /**
+   * Re-read the current user without risking the session.
+   *
+   * For permission re-checks: `user` is a snapshot from sign-in, so anything
+   * that changes a user's rights mid-session leaves it stale. Unlike
+   * `refresh`, a failure here is swallowed and the existing user kept.
+   */
+  revalidate: () => Promise<void>
   /** Exact-role check, for conditional UI. */
   hasRole: (...roles: Role[]) => boolean
   /** Hierarchical check, mirroring the backend's "or above" permissions. */
@@ -68,7 +76,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async function bootstrap() {
       // One refresh attempt on boot. A 401 here is the normal "not logged in"
       // case, not an error worth surfacing.
-      const token = await refreshAccessToken()
+      //
+      // `refreshOnce`, not `refreshAccessToken`: StrictMode runs this effect
+      // twice in development, and two overlapping refreshes would rotate the
+      // token out from under each other — the second gets a 401 on a session
+      // that is perfectly valid. Sharing the in-flight promise means both
+      // mounts observe the same single request.
+      const token = await refreshOnce()
       if (cancelled) return
 
       if (!token) {
@@ -115,6 +129,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const revalidate = useCallback(async () => {
+    try {
+      const currentUser = await fetchCurrentUser()
+      setUser(currentUser)
+      setStatus('authenticated')
+    } catch {
+      // Deliberately silent, and deliberately NOT `refresh`. This is a
+      // permission re-check, not a sign-in: a transient failure here means we
+      // simply keep the user we already had. Signing someone out because a
+      // background check hiccuped is a far worse outcome than showing them the
+      // /forbidden page they were heading to anyway.
+    }
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       // Server-side revocation: blacklists the refresh token and expires the
@@ -137,6 +165,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      revalidate,
       // Client-side role checks decide what to *render*. They are a UX
       // affordance, never a security boundary — the server re-checks the role
       // on every request, because anything in the browser can be edited.
@@ -144,7 +173,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       hasRoleAtLeast: (minimum: Role) =>
         user ? hasRoleAtLeast(user.role, minimum) : false,
     }),
-    [user, status, login, logout, refresh],
+    [user, status, login, logout, refresh, revalidate],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

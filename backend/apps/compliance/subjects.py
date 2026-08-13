@@ -97,9 +97,10 @@ def from_generated_content(generation) -> ComplianceSubject:
 def from_design(design) -> ComplianceSubject:
     """A design, resolved the same way the renderer resolves it.
 
-    Uses the render pipeline's own resolver rather than reading the template,
-    so what compliance sees is what will actually appear in the image —
-    including locked elements the agent never touched.
+    Uses the render pipeline's own resolver rather than reading the design's
+    stored text, so what compliance sees is what will actually appear in the
+    image — an element bound to the disclaimer is checked on the disclaimer it
+    would render, not on the empty string it stores.
     """
     from apps.templates.dimensions import DEFAULT_DIMENSION, get_dimension
     from apps.templates.html_builder import describe_design
@@ -110,13 +111,17 @@ def from_design(design) -> ComplianceSubject:
 
     blocks: dict[str, str] = {}
     for element in described["elements"]:
-        if element.get("hidden"):
+        # An element the agent hid renders nothing, so it carries nothing to
+        # check. Deleting it has the same effect — it is simply not in the
+        # document — which is why the disclaimer rule tests the brokerage field
+        # as well as the rendered text.
+        if not element.get("visible", True):
             continue
-        content = element.get("content")
+        content = element.get("resolved_content")
         # Images resolve to data URIs; including one would be megabytes of
         # base64 for a text check to wade through.
         if isinstance(content, str) and content and not content.startswith("data:"):
-            blocks[element["key"]] = content
+            blocks[element["id"]] = content
 
     listing = design.listing
     brokerage = design.agent.brokerage

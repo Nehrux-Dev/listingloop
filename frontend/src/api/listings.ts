@@ -40,6 +40,11 @@ export type ListingPhoto = {
   id: number
   listing: number
   image_url: string | null
+  /** The raw storage key behind image_url — what an image_key override
+   *  actually needs. overrides.py refuses a URL there on purpose (see
+   *  _validate_image_key), so image_url alone can't be used to pick this
+   *  photo for a design element. */
+  image_key: string
   caption: string
   order: number
   source_url: string
@@ -229,6 +234,29 @@ export function importListing(url: string): Promise<ListingImportResult> {
     method: 'POST',
     body: { url },
   })
+}
+
+/**
+ * Import from page source the agent copied out of their own browser.
+ *
+ * For sites that refuse automated requests. Same parser, same refusal to
+ * invent a value — the only difference is who fetched the page.
+ */
+export function importListingFromHtml(
+  html: string,
+  url: string,
+): Promise<ListingImportResult> {
+  return apiRequest<ListingImportResult>('/api/listings/import-html/', {
+    method: 'POST',
+    body: { html, url },
+  })
+}
+
+/** The 422 body returned when a site blocks automated fetching. */
+export type BlockedBySite = {
+  detail: string
+  blocked_by_site: boolean
+  warnings: string[]
 }
 
 // -- photos -----------------------------------------------------------------

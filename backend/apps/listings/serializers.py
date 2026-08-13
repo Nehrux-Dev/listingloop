@@ -17,6 +17,13 @@ from apps.listings.models import (
 class ListingPhotoSerializer(serializers.ModelSerializer):
     image = ValidatedImageField(write_only=True)
     image_url = serializers.SerializerMethodField()
+    #: The raw storage key behind `image`, not just its URL. Needed so a
+    #: design's image-replace flow can offer "use this listing photo" as an
+    #: `image_key` override — overrides.py deliberately refuses a URL there
+    #: (see _validate_image_key), so the URL alone isn't enough to act on.
+    #: Not a secret, just an internal storage path — no different in kind
+    #: from the URL already exposed here.
+    image_key = serializers.CharField(source="image.name", read_only=True)
 
     class Meta:
         model = ListingPhoto
@@ -25,12 +32,13 @@ class ListingPhotoSerializer(serializers.ModelSerializer):
             "listing",
             "image",
             "image_url",
+            "image_key",
             "caption",
             "order",
             "source_url",
             "created_at",
         )
-        read_only_fields = ("id", "image_url", "source_url", "created_at")
+        read_only_fields = ("id", "image_url", "image_key", "source_url", "created_at")
 
     def get_image_url(self, obj: ListingPhoto) -> str | None:
         request = self.context.get("request")
@@ -172,6 +180,34 @@ class ListingImportSerializer(serializers.Serializer):
     """Input for the one-off URL import."""
 
     url = serializers.URLField(max_length=2000)
+
+
+class ListingImportHtmlSerializer(serializers.Serializer):
+    """Input for importing from page source the agent pasted themselves.
+
+    ``url`` is optional and purely a record of where the markup came from; it
+    is never fetched on this path, so it is a plain CharField rather than a
+    URLField that would reject a perfectly good paste over a typo.
+    """
+
+    #: Generous, because a real listing page is large — but bounded, since this
+    #: lands in a request body and an unbounded field is a free memory bomb.
+    MAX_HTML_CHARS = 5 * 1024 * 1024
+
+    html = serializers.CharField(
+        trim_whitespace=False,
+        max_length=MAX_HTML_CHARS,
+        help_text="The page source, copied from the browser.",
+    )
+    url = serializers.CharField(max_length=1000, required=False, allow_blank=True)
+
+    def validate_html(self, value: str) -> str:
+        if "<" not in value:
+            raise serializers.ValidationError(
+                "That does not look like page source. In your browser press "
+                "Ctrl+U to view the source, select all of it, and paste it here."
+            )
+        return value
 
 
 class ListingImportResultSerializer(serializers.Serializer):

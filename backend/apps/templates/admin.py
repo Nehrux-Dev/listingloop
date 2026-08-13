@@ -14,11 +14,14 @@ class TemplateElementInline(admin.StackedInline):
     extra = 0
     fields = (
         ("key", "label"),
-        ("element_type", "permission", "z_index"),
+        ("element_type", "z_index"),
         "geometry",
         "style_properties",
         ("content_source", "default_content"),
-        "constraints",
+        # Only meaningful when element_type is STATIC_GRAPHIC — left visible
+        # for every row rather than conditionally hidden, since Django admin
+        # inlines don't support per-row conditional fields without JS.
+        "static_asset",
     )
 
 
@@ -38,8 +41,8 @@ class TemplateAdmin(admin.ModelAdmin):
 
 @admin.register(TemplateElement)
 class TemplateElementAdmin(admin.ModelAdmin):
-    list_display = ("key", "template", "element_type", "permission", "z_index")
-    list_filter = ("permission", "element_type", "template__category")
+    list_display = ("key", "template", "element_type", "z_index")
+    list_filter = ("element_type", "template__category")
     search_fields = ("key", "label", "template__name")
     autocomplete_fields = ("template",)
 

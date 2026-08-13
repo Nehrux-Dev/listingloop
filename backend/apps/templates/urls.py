@@ -6,6 +6,7 @@ from apps.templates.views import (
     DesignExportViewSet,
     DesignViewSet,
     TemplateViewSet,
+    element_kinds,
     render_dimensions,
 )
 
@@ -19,4 +20,5 @@ router.register("calendar-events", CalendarEventViewSet, basename="calendarevent
 
 urlpatterns = router.urls + [
     path("render-dimensions/", render_dimensions, name="render-dimensions"),
+    path("design-element-kinds/", element_kinds, name="design-element-kinds"),
 ]

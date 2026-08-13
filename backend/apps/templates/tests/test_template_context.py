@@ -223,7 +223,7 @@ class PlaceholderRenderingTests(TemplateAPITestCase):
     def test_a_template_default_can_use_placeholders(self):
         from apps.templates.dimensions import get_dimension
         from apps.templates.html_builder import build_html
-        from apps.templates.models import ElementPermission, ElementType, TemplateElement
+        from apps.templates.models import ElementType, TemplateElement
 
         template = self.make_template()
         TemplateElement.objects.create(
@@ -231,7 +231,6 @@ class PlaceholderRenderingTests(TemplateAPITestCase):
             key="byline",
             label="Byline",
             element_type=ElementType.TEXT,
-            permission=ElementPermission.CONTENT_ONLY,
             geometry={"x": 0.1, "y": 0.9, "width": 0.8, "height": 0.05},
             style_properties={"font_size_ratio": 0.02},
             default_content="Presented by {{ agent.full_name }} · {{ agent.phone }}",
@@ -246,17 +245,16 @@ class PlaceholderRenderingTests(TemplateAPITestCase):
         self.assertIn("+1 416 555 0100", html)
         self.assertNotIn("{{", html)
 
-    def test_an_agents_own_override_can_use_placeholders_too(self):
+    def test_an_agents_own_text_can_use_placeholders_too(self):
         from apps.templates.dimensions import get_dimension
         from apps.templates.html_builder import build_html
 
         template = self.make_template()
-        design = self.make_design(
-            template,
-            self.profile,
-            self.listing,
-            overrides={"headline": {"text": "Call {{ agent.full_name }}"}},
-        )
+        design = self.make_design(template, self.profile, self.listing)
+        headline = self.element_of(design, "headline")
+        headline["content"] = "Call {{ agent.full_name }}"
+        headline["manually_overridden"] = True
+        design.save(update_fields=["elements"])
 
         html = build_html(
             design, build_context(design), get_dimension("instagram_post"), {}

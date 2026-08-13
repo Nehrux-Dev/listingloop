@@ -1,6 +1,6 @@
 """The export readiness gate.
 
-"Do not silently render broken/empty required template elements" — this is the
+"Do not silently render broken/empty elements" — this is the
 check that holds that line, and the tests below are mostly about it *not*
 over-firing, because a gate that blocks things it shouldn't gets worked around.
 """
@@ -16,7 +16,7 @@ from django.urls import reverse
 
 from apps.accounts.tests.base import make_image_file
 from apps.listings.models import ListingPhoto
-from apps.templates.models import ElementPermission, ElementType, TemplateElement
+from apps.templates.models import ElementType, TemplateElement
 from apps.templates.readiness import (
     DesignNotReadyError,
     assess_design,
@@ -61,6 +61,19 @@ class ReadinessTestCase(TemplateAPITestCase):
         design = design or self.design
         return [item.label for item in assess_design(design, build_context(design))]
 
+    def recopy(self):
+        """Re-copy the template into the design.
+
+        Needed whenever a test adds a TemplateElement after ``setUp`` has
+        already created the design. That is not a quirk of the fixture — it is
+        the copy architecture: a design is a snapshot, so a template edited
+        afterwards does not reach back into designs already made from it.
+        ``test_a_template_element_added_later_does_not_appear`` pins exactly
+        that, so this helper cannot quietly paper over a regression in it.
+        """
+        self.design.reset_document()
+        self.design.save(update_fields=["elements"])
+
 
 class GateTests(ReadinessTestCase):
     def test_a_complete_design_is_ready(self):
@@ -68,13 +81,48 @@ class GateTests(ReadinessTestCase):
 
         self.assertEqual(self.missing_labels(), [])
 
-    def test_a_missing_required_element_blocks(self):
+    def test_an_element_bound_to_missing_data_blocks(self):
+        """The hero photo is bound to the listing's first photo. With no photo
+        the design would export a blank rectangle, so it is refused."""
         self.listing.photos.all().delete()
 
         with self.assertRaises(DesignNotReadyError) as ctx:
             require_design_ready(self.design, build_context(self.design))
 
         self.assertIn("Main photo", str(ctx.exception))
+
+    def test_deleting_the_element_is_a_valid_way_to_clear_the_block(self):
+        """The old model had no answer to "I do not want a photo on this one" —
+        `required` was the template's decision. Now it is the agent's."""
+        self.listing.photos.all().delete()
+        hero = self.element_of(self.design, "hero_photo")
+        self.design.elements = [
+            element for element in self.design.elements if element["id"] != hero["id"]
+        ]
+        self.design.save(update_fields=["elements"])
+
+        require_design_ready(self.design, build_context(self.design))  # no raise
+
+    def test_a_template_element_added_later_does_not_appear_in_an_existing_design(self):
+        """The copy is a snapshot. Editing a template must not reach into work
+        an agent has already started — that is the whole reason for the copy."""
+        before = len(self.design.elements)
+        TemplateElement.objects.create(
+            template=self.template,
+            key="added_after_the_fact",
+            label="Added later",
+            element_type=ElementType.TEXT,
+            geometry={"x": 0.1, "y": 0.9, "width": 0.5, "height": 0.04},
+            default_content="New",
+        )
+
+        self.design.refresh_from_db()
+
+        self.assertEqual(len(self.design.elements), before)
+        self.assertNotIn(
+            "added_after_the_fact",
+            [e["original_element_id"] for e in self.design.elements],
+        )
 
     def test_a_missing_listing_photo_points_at_the_listing_not_the_profile(self):
         """Sending an agent to Brokerage settings to fix a listing photo is
@@ -111,7 +159,7 @@ class GateTests(ReadinessTestCase):
     def test_a_hidden_element_is_not_required(self):
         """An agent who switched something off has decided it is not needed."""
         self.listing.photos.all().delete()
-        self.design.overrides = {"hero_photo": {"hidden": True}}
+        self.element_of(self.design, "hero_photo")["visible"] = False
         self.design.save()
 
         self.assertEqual(self.missing_labels(), [])
@@ -122,11 +170,12 @@ class GateTests(ReadinessTestCase):
             key="optional_note",
             label="Optional note",
             element_type=ElementType.TEXT,
-            permission=ElementPermission.CONTENT_ONLY,
             geometry={"x": 0.1, "y": 0.5, "width": 0.8, "height": 0.05},
             style_properties={"font_size_ratio": 0.02},
-            # No content_source, no default, not required — simply blank.
+            # No content_source and no default — simply an empty box the
+            # agent left on the canvas, which is their business.
         )
+        self.recopy()
 
         self.assertEqual(self.missing_labels(), [])
 
@@ -139,12 +188,12 @@ class GateTests(ReadinessTestCase):
             key="disclaimer_repeat",
             label="Disclaimer again",
             element_type=ElementType.TEXT,
-            permission=ElementPermission.LOCKED,
             geometry={"x": 0.1, "y": 0.8, "width": 0.8, "height": 0.03},
             style_properties={"font_size_ratio": 0.013},
             content_source="brokerage.required_disclaimer",
         )
         self.profile.refresh_from_db()
+        self.recopy()
 
         labels = self.missing_labels()
 
@@ -159,11 +208,11 @@ class GateTests(ReadinessTestCase):
             key="byline",
             label="Byline",
             element_type=ElementType.TEXT,
-            permission=ElementPermission.CONTENT_ONLY,
             geometry={"x": 0.1, "y": 0.7, "width": 0.8, "height": 0.05},
             style_properties={"font_size_ratio": 0.02},
             default_content="Call {{ agent.phone }} today",
         )
+        self.recopy()
 
         self.assertIn("Professional phone", self.missing_labels())
 
@@ -200,7 +249,7 @@ class GateApiTests(ReadinessTestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.status_code, 409, response.data)
         self.assertIn("Main photo", response.data["detail"])
         # Nothing was rendered, so nothing was paid for.
         post.assert_not_called()

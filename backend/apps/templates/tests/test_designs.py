@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+
+from django.core.files.storage import default_storage
+from django.test import override_settings
+
+from apps.accounts.tests.base import make_image_file
 from apps.templates.models import Design, TemplateCategory
 from apps.templates.tests.base import TemplateAPITestCase
+
+MEDIA_ROOT = tempfile.mkdtemp(prefix="real-estate-design-upload-media-")
 
 
 class DesignRoundTripTests(TemplateAPITestCase):
@@ -15,57 +24,118 @@ class DesignRoundTripTests(TemplateAPITestCase):
         self.listing = self.make_verified_listing(self.profile, self.agent)
         self.authenticate_as(self.agent)
 
-    def test_save_and_reopen_preserves_every_override(self):
-        """The round trip that matters: what you saved is what you reopen."""
-        overrides = {
-            "headline": {"text": "Beachside living at its best"},
-            "badge": {"background_color": "#0F172A", "font_size_ratio": 0.022},
-            "price": {
-                "geometry": {"x": 0.42, "y": 0.36, "width": 0.5, "height": 0.085},
-                "color": "#FFFFFF",
-                "font_weight": "800",
-            },
-        }
-
+    def test_creating_a_design_copies_the_templates_elements(self):
+        """The copy is the architecture. A design that came back with an empty
+        canvas, or with a reference to the template, would mean every later
+        edit was either lost or shared."""
         created = self.client.post(
             self.designs_url,
             {
                 "name": "Harbour View — Instagram",
                 "template": self.template.pk,
                 "listing": self.listing.pk,
-                "overrides": overrides,
             },
             format="json",
         )
-        self.assertEqual(created.status_code, 201, created.data)
 
-        reopened = self.client.get(self.design_detail_url(Design.objects.get()))
+        self.assertEqual(created.status_code, 201, created.data)
+        elements = created.data["elements"]
+        self.assertEqual(len(elements), self.template.elements.count())
+        self.assertEqual(
+            {e["original_element_id"] for e in elements},
+            set(self.template.elements.values_list("key", flat=True)),
+        )
+
+    def test_nothing_arrives_locked(self):
+        """The headline change: a template cannot ship an uneditable element."""
+        created = self.client.post(
+            self.designs_url,
+            {"name": "D", "template": self.template.pk, "listing": self.listing.pk},
+            format="json",
+        )
+
+        self.assertEqual(
+            [], [e["name"] for e in created.data["elements"] if e["locked"]]
+        )
+
+    def test_save_and_reopen_preserves_the_whole_document(self):
+        """The round trip that matters: what you saved is what you reopen."""
+        created = self.client.post(
+            self.designs_url,
+            {
+                "name": "Harbour View — Instagram",
+                "template": self.template.pk,
+                "listing": self.listing.pk,
+            },
+            format="json",
+        )
+        design = Design.objects.get()
+
+        elements = created.data["elements"]
+        for element in elements:
+            if element["original_element_id"] == "headline":
+                element["content"] = "Beachside living at its best"
+                element["manually_overridden"] = True
+            if element["original_element_id"] == "badge":
+                element["style"] = {"background_color": "#0F172A", "font_size_ratio": 0.022}
+            if element["original_element_id"] == "price":
+                element["transform"] = {
+                    "x": 0.42, "y": 0.36, "width": 0.5, "height": 0.085,
+                    "rotation": 0.0, "z_index": 10,
+                }
+                element["style"] = {"color": "#FFFFFF", "font_weight": "800"}
+                element["locked"] = True
+                element["name"] = "The price"
+
+        saved = self.client.patch(
+            self.design_detail_url(design), {"elements": elements}, format="json"
+        )
+        self.assertEqual(saved.status_code, 200, saved.data)
+
+        reopened = self.client.get(self.design_detail_url(design))
 
         self.assertEqual(reopened.status_code, 200)
         self.assertEqual(reopened.data["name"], "Harbour View — Instagram")
-        self.assertEqual(reopened.data["overrides"], overrides)
-        self.assertEqual(reopened.data["template"], self.template.pk)
-        self.assertEqual(reopened.data["listing"], self.listing.pk)
+        self.assertEqual(reopened.data["elements"], saved.data["elements"])
+
+        by_original = {e["original_element_id"]: e for e in reopened.data["elements"]}
+        self.assertEqual(
+            by_original["headline"]["content"], "Beachside living at its best"
+        )
+        self.assertEqual(by_original["badge"]["style"]["background_color"], "#0F172A")
+        self.assertEqual(by_original["price"]["transform"]["x"], 0.42)
+        # A user-set lock is part of the document and survives the round trip;
+        # it is the only thing that restricts editing, so losing it would mean
+        # losing the one guard there is.
+        self.assertTrue(by_original["price"]["locked"])
+        self.assertEqual(by_original["price"]["name"], "The price")
 
     def test_reopening_resolves_content_against_the_listing(self):
-        design = self.make_design(
-            self.template,
-            self.profile,
-            self.listing,
-            overrides={"headline": {"text": "Custom headline"}},
-        )
+        design = self.make_design(self.template, self.profile, self.listing)
+        headline = self.element_of(design, "headline")
+        headline["content"] = "Custom headline"
+        headline["manually_overridden"] = True
+        design.save(update_fields=["elements"])
 
         response = self.client.get(self.design_action_url(design, "resolved"))
 
         self.assertEqual(response.status_code, 200)
-        by_key = {element["key"]: element for element in response.data["elements"]}
+        by_key = {
+            element["original_element_id"]: element
+            for element in response.data["elements"]
+        }
 
-        # Overridden content wins...
-        self.assertEqual(by_key["headline"]["content"], "Custom headline")
-        self.assertEqual(by_key["headline"]["overridden_fields"], ["text"])
+        # The agent's own words win, and the payload says why: still bound to
+        # the address, but flagged, so the panel can offer to sync it back.
+        self.assertEqual(by_key["headline"]["resolved_content"], "Custom headline")
+        self.assertTrue(by_key["headline"]["manually_overridden"])
+        self.assertEqual(by_key["headline"]["bound_to"], "address")
+        self.assertEqual(by_key["headline"]["bound_value"], self.listing.full_address)
+
         # ...and everything else resolves from the listing and brokerage.
-        self.assertEqual(by_key["price"]["content"], "$1,850,000")
-        self.assertEqual(by_key["disclaimer"]["permission"], "locked")
+        self.assertEqual(by_key["price"]["resolved_content"], "$1,850,000")
+        # Nothing arrives locked, including what used to be the locked tier.
+        self.assertFalse(by_key["disclaimer"]["locked"])
 
     def test_resolved_view_reflects_the_requested_dimension(self):
         design = self.make_design(self.template, self.profile, self.listing)
@@ -88,13 +158,10 @@ class DesignRoundTripTests(TemplateAPITestCase):
         design.refresh_from_db()
         self.assertEqual(design.name, "Renamed")
 
-    def test_duplicate_copies_overrides_but_not_exports(self):
-        design = self.make_design(
-            self.template,
-            self.profile,
-            self.listing,
-            overrides={"headline": {"text": "Original"}},
-        )
+    def test_duplicate_copies_the_document_but_not_the_exports(self):
+        design = self.make_design(self.template, self.profile, self.listing)
+        self.element_of(design, "headline")["content"] = "Original"
+        design.save(update_fields=["elements"])
 
         response = self.client.post(
             self.design_action_url(design, "duplicate"), {}, format="json"
@@ -104,7 +171,7 @@ class DesignRoundTripTests(TemplateAPITestCase):
         copy = Design.objects.get(pk=response.data["id"])
         self.assertNotEqual(copy.pk, design.pk)
         self.assertEqual(copy.name, "Test Design (copy)")
-        self.assertEqual(copy.overrides, design.overrides)
+        self.assertEqual(self.element_of(copy, "headline")["content"], "Original")
         self.assertEqual(copy.exports.count(), 0)
 
     def test_duplicate_accepts_a_name(self):
@@ -119,21 +186,26 @@ class DesignRoundTripTests(TemplateAPITestCase):
         self.assertEqual(response.data["name"], "Story version")
 
     def test_editing_a_copy_does_not_touch_the_original(self):
-        design = self.make_design(
-            self.template, self.profile, self.listing, overrides={"headline": {"text": "A"}}
+        design = self.make_design(self.template, self.profile, self.listing)
+        self.element_of(design, "headline")["content"] = "A"
+        design.save(update_fields=["elements"])
+
+        copy = Design.objects.get(
+            pk=self.client.post(
+                self.design_action_url(design, "duplicate"), {}, format="json"
+            ).data["id"]
         )
-        copy_id = self.client.post(
-            self.design_action_url(design, "duplicate"), {}, format="json"
-        ).data["id"]
+        elements = list(copy.elements)
+        for element in elements:
+            if element["original_element_id"] == "headline":
+                element["content"] = "B"
 
         self.client.patch(
-            self.design_detail_url(Design.objects.get(pk=copy_id)),
-            {"overrides": {"headline": {"text": "B"}}},
-            format="json",
+            self.design_detail_url(copy), {"elements": elements}, format="json"
         )
 
         design.refresh_from_db()
-        self.assertEqual(design.overrides["headline"]["text"], "A")
+        self.assertEqual(self.element_of(design, "headline")["content"], "A")
 
     def test_delete(self):
         design = self.make_design(self.template, self.profile, self.listing)
@@ -355,3 +427,103 @@ class TemplateLibraryTests(TemplateAPITestCase):
         )
 
         self.assertEqual(response.status_code, 405)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class UploadImageTests(TemplateAPITestCase):
+    """The 'upload a new one' half of image replace — a bare storage write
+    the caller then PATCHes onto whichever element they mean it for."""
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(MEDIA_ROOT, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.template = self.make_template()
+        self.listing = self.make_verified_listing(self.profile, self.agent)
+        self.design = self.make_design(self.template, self.profile, self.listing)
+        self.authenticate_as(self.agent)
+
+    def _upload(self, **kwargs):
+        return self.client.post(
+            self.design_action_url(self.design, "upload-image"),
+            {"image": make_image_file("feature.png", **kwargs)},
+            format="multipart",
+        )
+
+    def test_a_valid_image_is_accepted(self):
+        response = self._upload()
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIn("image_key", response.data)
+        self.assertIn("url", response.data)
+        self.assertTrue(default_storage.exists(response.data["image_key"]))
+
+    def test_the_returned_key_works_as_an_elements_content(self):
+        """The point of the endpoint: what it hands back is immediately
+        usable, not a second format the client has to translate."""
+        key = self._upload().data["image_key"]
+        elements = list(self.design.elements)
+        for element in elements:
+            if element["original_element_id"] == "hero_photo":
+                element["content"] = key
+                element["manually_overridden"] = True
+
+        response = self.client.patch(
+            self.design_detail_url(self.design), {"elements": elements}, format="json"
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.design.refresh_from_db()
+        self.assertEqual(self.element_of(self.design, "hero_photo")["content"], key)
+
+    def test_the_url_points_at_the_uploaded_key(self):
+        # Not a real HTTP round trip: Django's dev-only media-serving route is
+        # wired to the real MEDIA_ROOT at URLconf import time, which this
+        # test's @override_settings can't reach — the same reason no other
+        # test in this codebase fetches a media URL through the test client.
+        # What actually matters, and is real here, is that storage has the
+        # file and the URL names it.
+        response = self._upload()
+
+        self.assertIn(response.data["image_key"], response.data["url"])
+        self.assertTrue(default_storage.exists(response.data["image_key"]))
+
+    def test_uploading_requires_authentication(self):
+        self.client.credentials()
+
+        response = self._upload()
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_another_agent_cannot_upload_to_your_design(self):
+        other_agent, _ = self.make_agent_in(self.acme, "b@example.com")
+        self.authenticate_as(other_agent)
+
+        response = self._upload()
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_non_image_file_is_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        response = self.client.post(
+            self.design_action_url(self.design, "upload-image"),
+            {"image": SimpleUploadedFile("note.txt", b"not an image", content_type="text/plain")},
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_uploading_does_not_itself_change_the_design(self):
+        """It only ever produces a key — applying it is a separate PATCH."""
+        before = list(self.design.elements)
+
+        self._upload()
+
+        self.design.refresh_from_db()
+        self.assertEqual(self.design.elements, before)

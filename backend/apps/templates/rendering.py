@@ -17,7 +17,8 @@ from django.core.files.base import ContentFile
 from rest_framework.exceptions import APIException
 
 from apps.templates.dimensions import Dimension, get_dimension
-from apps.templates.html_builder import build_html
+from apps.templates.html_builder import build_html, describe_design
+from apps.templates.document import carries_image
 from apps.templates.models import DesignExport, ExportFormat
 from apps.templates.render_context import build_context, file_to_data_uri
 
@@ -48,37 +49,60 @@ class RenderResult:
     export_format: str
 
 
-def _resolve_image_overrides(design) -> dict[str, str]:
-    """Turn stored image keys in overrides into inline data URIs.
+def resolve_images(design) -> dict[str, str]:
+    """Turn each image element's stored key into a data URI, by element id.
 
-    Overrides store a storage *key*, never a URL (see ``overrides.py``), so
-    resolution happens here, through the storage API — which is what keeps the
-    renderer network-isolated and the storage backend swappable.
+    The *only* place that touches storage for a design's images —
+    html_builder.py stays pure and storage-free, testable without a browser or
+    a filesystem.
+
+    Only elements whose ``content`` is a storage key need this. An element
+    bound to ``photo_1`` or ``brokerage_logo`` resolves through the render
+    context instead, which already inlines those files; going through storage
+    twice for the same photo would just be slower.
     """
-    resolved = {}
-    for element_key, payload in (design.overrides or {}).items():
-        image_key = payload.get("image_key")
-        if not image_key:
+    resolved: dict[str, str] = {}
+    for element in design.ensure_document():
+        content = element.get("content") or ""
+        if not content or not carries_image(element.get("type", ""), content):
             continue
-        data_uri = file_to_data_uri(image_key)
+        data_uri = file_to_data_uri(content)
         if data_uri:
-            resolved[element_key] = data_uri
+            resolved[element["id"]] = data_uri
         else:
-            logger.info("Image key %r for element %r could not be read", image_key, element_key)
+            logger.info(
+                "Image %r for element %r could not be read", content, element["id"]
+            )
     return resolved
+
+
+#: Django's export_format -> the renderer's `format` payload value. A plain
+#: mapping rather than a chain of `if`s, so adding a format later (this is
+#: exactly how PDF joined PNG/JPG) is one new entry, not a new branch.
+_RENDERER_FORMAT = {
+    ExportFormat.PNG: "png",
+    ExportFormat.JPG: "jpg",
+    ExportFormat.PDF: "pdf",
+}
+
+_DEFAULT_CONTENT_TYPE = {
+    ExportFormat.PNG: "image/png",
+    ExportFormat.JPG: "image/jpeg",
+    ExportFormat.PDF: "application/pdf",
+}
 
 
 def render_design(design, dimension_key: str, export_format: str = ExportFormat.PNG) -> RenderResult:
     """Render one design at one dimension. Does not save anything."""
     dimension = get_dimension(dimension_key)
     context = build_context(design)
-    html = build_html(design, context, dimension, _resolve_image_overrides(design))
+    html = build_html(design, context, dimension, resolve_images(design))
 
     payload = {
         "html": html,
         "width": dimension.width,
         "height": dimension.height,
-        "format": "png" if export_format == ExportFormat.PNG else "jpg",
+        "format": _RENDERER_FORMAT[export_format],
         "quality": settings.RENDERER_JPG_QUALITY,
         "scale": settings.RENDERER_SCALE,
     }
@@ -105,11 +129,26 @@ def render_design(design, dimension_key: str, export_format: str = ExportFormat.
 
     return RenderResult(
         content=response.content,
-        content_type=response.headers.get("Content-Type", "image/png"),
+        content_type=response.headers.get(
+            "Content-Type", _DEFAULT_CONTENT_TYPE[export_format]
+        ),
         render_ms=int(response.headers.get("X-Render-Ms", 0)),
         dimension=dimension,
         export_format=export_format,
     )
+
+
+def describe_design_for_editor(design, dimension_key: str) -> dict:
+    """The JSON the canvas editor renders from — images resolved, not raw keys.
+
+    Exists so the ``resolved`` API action does not have to know that image
+    resolution is even a thing; it shares the exact same ``resolve_images``
+    call as an actual export, so what the editor shows for an image element is
+    never out of step with what exporting would produce.
+    """
+    dimension = get_dimension(dimension_key)
+    context = build_context(design)
+    return describe_design(design, context, dimension, resolve_images(design))
 
 
 def export_design(design, dimension_key: str, export_format: str = ExportFormat.PNG) -> DesignExport:
@@ -121,8 +160,7 @@ def export_design(design, dimension_key: str, export_format: str = ExportFormat.
     """
     result = render_design(design, dimension_key, export_format)
 
-    extension = "png" if export_format == ExportFormat.PNG else "jpg"
-    filename = f"{design.pk}-{dimension_key}.{extension}"
+    filename = f"{design.pk}-{dimension_key}.{_RENDERER_FORMAT[export_format]}"
 
     export = DesignExport(
         design=design,

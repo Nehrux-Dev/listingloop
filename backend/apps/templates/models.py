@@ -1,18 +1,23 @@
-"""Template library, controlled-editing model, and saved designs.
+"""Template library, saved designs, and the content calendar.
 
-THE PERMISSION MODEL IS THE POINT
----------------------------------
-A template is not just a layout — it is a layout plus a statement about *what
-an agent is allowed to change*. Four levels, from most to least restricted:
+A TEMPLATE IS A STARTING POINT, NOT A CAGE
+------------------------------------------
+A template is a layout: a canvas, a background, and a set of elements. That is
+all it is. Opening one for editing deep-copies its elements into a Design
+(see ``document.py``), and from that moment the agent owns them outright —
+every element can be moved, restyled, retyped, hidden, duplicated or deleted.
 
-    locked        nothing may be changed. Brokerage logos, compliance text.
-    content_only  swap the text or the image; geometry and styling are fixed.
-    styled        content, plus colour and size within an explicit allowlist.
-    free          content, styling, and move/resize within declared bounds.
+This used to be otherwise. Each template element carried a four-tier
+``permission`` (locked / content_only / styled / free) that decided what an
+agent could change, and most elements were locked, which the editor surfaced
+as "FIXED BY TEMPLATE". That concept is gone: not renamed, not defaulted to
+permissive — removed, along with the column that stored it. The only thing
+that restricts editing now is ``locked`` on the design's own element, which
+defaults to False and which the user sets and unsets themselves.
 
-Every one of those rules is enforced server-side in ``overrides.py``. The
-frontend disables the controls it should, but that is a UX affordance — the
-API assumes the client is hostile and re-checks every field of every override.
+The checks that remain server-side (``document.validate_document``) were never
+permission checks: they stop a colour or an image key from being interpolated
+into HTML that a real browser then executes.
 
 GEOMETRY IS FRACTIONAL
 ----------------------
@@ -31,7 +36,13 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from apps.core.models import TimeStampedModel
-from apps.core.storage import design_export_upload_to
+from apps.core.storage import design_export_upload_to, template_asset_upload_to
+from apps.core.validators import ImageUploadValidator
+
+#: One shared instance, same pattern as apps/accounts/profiles.py — the size
+#: limit is read from settings at validation time, so it is not frozen into
+#: migrations.
+image_upload_validator = ImageUploadValidator()
 
 
 class TemplateCategory(models.TextChoices):
@@ -110,15 +121,6 @@ class TemplateStyle(models.TextChoices):
     CLASSIC = "classic", _("Classic")
 
 
-class ElementPermission(models.TextChoices):
-    """What an agent may change about an element."""
-
-    LOCKED = "locked", _("Locked — no changes")
-    CONTENT_ONLY = "content_only", _("Content only — swap text or image")
-    STYLED = "styled", _("Styled — content plus limited colour and size")
-    FREE = "free", _("Free — move, resize and restyle within bounds")
-
-
 class ElementType(models.TextChoices):
     TEXT = "text", _("Text")
     IMAGE = "image", _("Image")
@@ -126,6 +128,12 @@ class ElementType(models.TextChoices):
     LOGO = "logo", _("Logo")
     BADGE = "badge", _("Badge")
     DIVIDER = "divider", _("Divider")
+    #: Decorative artwork that is part of the template's design, not a photo
+    #: of anything — a ribbon, an illustrated background shape. Distinct from
+    #: IMAGE because an IMAGE element's content comes from listing/agent/brand
+    #: data or an agent's own upload; a STATIC_GRAPHIC's content is the
+    #: template's own `static_asset` file and nothing else ever resolves it.
+    STATIC_GRAPHIC = "static_graphic", _("Static graphic")
 
 
 class Template(TimeStampedModel):
@@ -154,6 +162,29 @@ class Template(TimeStampedModel):
 
     is_active = models.BooleanField(_("active"), default=True, db_index=True)
 
+    allows_added_elements = models.BooleanField(
+        _("allows added elements"),
+        default=True,
+        help_text=_(
+            "Whether the editor offers to add new elements to a design made "
+            "from this template. A hint about how the layout is meant to be "
+            "used — not a restriction on the elements it already has, which "
+            "are the agent's to change once the design exists."
+        ),
+    )
+
+    default_dimension = models.CharField(
+        _("native format"),
+        max_length=40,
+        default="instagram_post",
+        help_text=_(
+            "The format this template was composed for — the one the editor "
+            "opens. Geometry is normalised so every template still renders at "
+            "every size, but a layout drawn tall reads as a crop when opened "
+            "square, so it should not open square."
+        ),
+    )
+
     class Meta:
         verbose_name = _("template")
         verbose_name_plural = _("templates")
@@ -178,26 +209,9 @@ class Template(TimeStampedModel):
         """
         return self.category in LISTING_CATEGORIES
 
-    @property
-    def permission_map(self) -> dict[str, str]:
-        """``{element_key: permission}`` — the template's editing contract.
-
-        Exposed as one object so a client can reason about the whole template
-        without walking the element list, and so the contract is visible in the
-        API rather than implied.
-        """
-        return {element.key: element.permission for element in self.elements.all()}
-
-    def editable_keys(self) -> set[str]:
-        return {
-            element.key
-            for element in self.elements.all()
-            if element.permission != ElementPermission.LOCKED
-        }
-
 
 class TemplateElement(models.Model):
-    """One element of a template, and the rules for changing it."""
+    """One element of a template: the starting state of a design's element."""
 
     template = models.ForeignKey(
         Template, on_delete=models.CASCADE, related_name="elements"
@@ -209,15 +223,13 @@ class TemplateElement(models.Model):
     element_type = models.CharField(
         _("element type"), max_length=32, choices=ElementType.choices
     )
-    permission = models.CharField(
-        _("permission"),
-        max_length=32,
-        choices=ElementPermission.choices,
-        default=ElementPermission.LOCKED,
-        help_text=_("Locked by default: an element is not editable unless it says so."),
-    )
 
-    #: Fractions of the canvas, 0..1: {"x":.., "y":.., "width":.., "height":..}
+    #: Fractions of the canvas, 0..1: {"x":.., "y":.., "width":.., "height":..}.
+    #: An optional "rotation" (degrees, -180..180, default 0) may also be
+    #: present — validated in overrides.py, applied in html_builder.py. Kept
+    #: inside this JSONField rather than a new column: it is one more number
+    #: in the same coordinate space, gated by the same FREE-only rule as the
+    #: rest of geometry, so it needs no schema change to add.
     geometry = models.JSONField(_("geometry"), default=dict)
     #: Rendering properties: text, colour, font_size_ratio, align, weight, etc.
     style_properties = models.JSONField(_("style properties"), default=dict, blank=True)
@@ -227,15 +239,16 @@ class TemplateElement(models.Model):
     content_source = models.CharField(_("content source"), max_length=120, blank=True)
     #: Literal fallback when there is no source and no override.
     default_content = models.TextField(_("default content"), blank=True)
-
-    constraints = models.JSONField(
-        _("constraints"),
-        default=dict,
+    #: The file behind a STATIC_GRAPHIC element. Meaningless on any other
+    #: element_type — nothing reads it unless element_type is STATIC_GRAPHIC.
+    #: Uploaded through the admin only, same as every other template asset;
+    #: there is deliberately no override field that can ever touch this.
+    static_asset = models.ImageField(
+        _("static asset"),
+        upload_to=template_asset_upload_to,
         blank=True,
-        help_text=_(
-            "Limits applied to overrides: allowed_colors, min/max font size "
-            "ratio, bounds for movement, max_length for text."
-        ),
+        null=True,
+        validators=[image_upload_validator],
     )
 
     z_index = models.PositiveIntegerField(_("z-index"), default=0)
@@ -252,24 +265,6 @@ class TemplateElement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.template_id}:{self.key}"
-
-    # -- permission helpers -------------------------------------------------
-
-    @property
-    def is_locked(self) -> bool:
-        return self.permission == ElementPermission.LOCKED
-
-    @property
-    def allows_content(self) -> bool:
-        return self.permission != ElementPermission.LOCKED
-
-    @property
-    def allows_styling(self) -> bool:
-        return self.permission in (ElementPermission.STYLED, ElementPermission.FREE)
-
-    @property
-    def allows_geometry(self) -> bool:
-        return self.permission == ElementPermission.FREE
 
 
 class CalendarEvent(TimeStampedModel):
@@ -387,14 +382,33 @@ class Design(TimeStampedModel):
         blank=True,
     )
 
+    #: THE DESIGN'S OWN CANVAS. A full, deep copy of the template's elements,
+    #: taken the moment the design is created, and independently mutable from
+    #: then on. Nothing an agent does here ever reaches the Template.
+    #:
+    #: This replaced `overrides` (below), which stored only a diff against the
+    #: template and therefore could only express changes the template's
+    #: permission tiers allowed. Schema and validation live in `document.py`.
+    elements = models.JSONField(_("elements"), default=list, blank=True)
+
+    #: Superseded by `elements`, kept for one release so a design saved by the
+    #: old editor is still readable and so the backfill in migration 0010 can
+    #: be re-run or audited. Nothing writes it any more; `document.py` and
+    #: `html_builder.py` do not read it.
     overrides = models.JSONField(
-        _("overrides"),
+        _("overrides (legacy)"),
         default=dict,
         blank=True,
         help_text=_(
-            "{element_key: {field: value}}. Validated against each element's "
-            "permission and constraints before it is ever stored."
+            "Superseded by `elements`. Retained so pre-canvas designs remain "
+            "readable; no code path writes this field."
         ),
+    )
+    #: Superseded by `elements`, on which an added element is simply an element
+    #: with no `original_element_id`. Kept alongside `overrides` for the same
+    #: reason and folded into `elements` by the same backfill.
+    extra_elements = models.JSONField(
+        _("extra elements (legacy)"), default=list, blank=True
     )
 
     objects = DesignQuerySet.as_manager()
@@ -407,6 +421,66 @@ class Design(TimeStampedModel):
 
     def __str__(self) -> str:
         return self.name
+
+    # -- the design's document ---------------------------------------------
+
+    def ensure_document(self) -> list[dict]:
+        """This design's elements, copying from the template if it has none.
+
+        The copy normally happens once, at creation (see
+        ``DesignSerializer.create``). This is the safety net for the paths that
+        do not go through the serializer — the admin, a shell, a fixture, a
+        design created before ``elements`` existed. It copies rather than
+        raising because a design with no elements is not an error state a user
+        should ever be shown; it is a design that has not been opened yet.
+
+        Deliberately does not save: the caller decides whether this read
+        becomes a write. ``views.DesignViewSet`` saves; a render does not need
+        to.
+        """
+        if self.elements:
+            return self.elements
+
+        from apps.templates.document import elements_from_template
+
+        self.elements = elements_from_template(self.template)
+        return self.elements
+
+    def reset_element(self, element_id: str) -> dict | None:
+        """Restore one element to how the template has it.
+
+        Matched by ``original_element_id``, so it still works after the element
+        has been renamed, restyled, moved, reordered or duplicated. Returns the
+        restored element, or None if this element has no template original —
+        which is the case for anything the agent added, and is not an error,
+        just nothing to reset to.
+        """
+        from apps.templates.document import element_from_template
+
+        for index, element in enumerate(self.elements or []):
+            if element.get("id") != element_id:
+                continue
+            original_key = element.get("original_element_id")
+            if not original_key:
+                return None
+            source = self.template.elements.filter(key=original_key).first()
+            if source is None:
+                # The template element was deleted after this design was made.
+                return None
+            restored = element_from_template(source)
+            # Keep the design-local identity so selection, layer rows and any
+            # in-flight undo entry still refer to the same element.
+            restored["id"] = element["id"]
+            self.elements[index] = restored
+            return restored
+        return None
+
+    def reset_document(self) -> list[dict]:
+        """Discard every edit and re-copy the whole canvas from the template."""
+        from apps.templates.document import elements_from_template
+
+        self.elements = elements_from_template(self.template)
+        return self.elements
 
     def clean(self) -> None:
         # Enforced here as well as in the serializer so a shell or admin cannot
@@ -429,10 +503,11 @@ class Design(TimeStampedModel):
 class ExportFormat(models.TextChoices):
     PNG = "png", _("PNG")
     JPG = "jpg", _("JPG")
+    PDF = "pdf", _("PDF")
 
 
 class DesignExport(TimeStampedModel):
-    """One rendered image: a design at a specific dimension and format."""
+    """One rendered export: a design at a specific dimension and format."""
 
     design = models.ForeignKey(
         Design, on_delete=models.CASCADE, related_name="exports"
@@ -446,6 +521,13 @@ class DesignExport(TimeStampedModel):
     # Written through the same storage abstraction as every other upload, so
     # exports move to object storage with everything else — see
     # apps/core/storage.py.
+    #
+    # Stays an ImageField even for a PDF export: Django's ImageField only
+    # validates content when a validator says to (this one carries none), so
+    # it stores any bytes exactly as a FileField would. Renaming it purely for
+    # accuracy would touch the serializer's `image_url` property and every
+    # frontend reference to it for no behavioural gain — not worth it for a
+    # field that already works correctly for both.
     image = models.ImageField(_("image"), upload_to=design_export_upload_to)
     width = models.PositiveIntegerField(_("width"))
     height = models.PositiveIntegerField(_("height"))

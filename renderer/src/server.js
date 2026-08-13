@@ -16,6 +16,7 @@
 import { createServer } from 'node:http'
 
 import { getPage, releasePage, startBrowser, stopBrowser } from './browser.js'
+import { fetchRendered } from './fetching.js'
 
 const PORT = Number(process.env.PORT ?? 8080)
 const TOKEN = process.env.RENDERER_TOKEN ?? ''
@@ -79,7 +80,7 @@ async function handleRender(request, response) {
     send(response, 400, { detail: 'Requested image is too large.' })
     return
   }
-  if (!['png', 'jpg', 'jpeg'].includes(format)) {
+  if (!['png', 'jpg', 'jpeg', 'pdf'].includes(format)) {
     send(response, 400, { detail: `Unsupported format '${format}'.` })
     return
   }
@@ -92,14 +93,34 @@ async function handleRender(request, response) {
     await page.setContent(html, { waitUntil: 'load' })
     await page.evaluate(() => document.fonts.ready)
 
-    const buffer = await page.screenshot({
-      type: format === 'png' ? 'png' : 'jpeg',
-      ...(format === 'png' ? {} : { quality: Math.min(100, Math.max(1, quality)) }),
-      clip: { x: 0, y: 0, width: Math.round(width), height: Math.round(height) },
-    })
+    let buffer, contentType
+    if (format === 'pdf') {
+      // A genuinely different Chromium pipeline from screenshot() — it prints
+      // the page rather than capturing pixels, and printing suppresses
+      // backgrounds by default. Without printBackground:true every PDF export
+      // would come back with the template's background stripped out: readable
+      // as "it worked" (200, a PDF, the right page size) while actually
+      // producing a broken file, so this is the one line in this branch that
+      // is easy to remove by accident and hardest to notice was missing.
+      buffer = await page.pdf({
+        width: `${Math.round(width)}px`,
+        height: `${Math.round(height)}px`,
+        printBackground: true,
+        margin: { top: 0, right: 0, bottom: 0, left: 0 },
+        pageRanges: '1',
+      })
+      contentType = 'application/pdf'
+    } else {
+      buffer = await page.screenshot({
+        type: format === 'png' ? 'png' : 'jpeg',
+        ...(format === 'png' ? {} : { quality: Math.min(100, Math.max(1, quality)) }),
+        clip: { x: 0, y: 0, width: Math.round(width), height: Math.round(height) },
+      })
+      contentType = format === 'png' ? 'image/png' : 'image/jpeg'
+    }
 
     response.writeHead(200, {
-      'Content-Type': format === 'png' ? 'image/png' : 'image/jpeg',
+      'Content-Type': contentType,
       'Content-Length': buffer.length,
       'X-Render-Ms': String(Date.now() - started),
     })
@@ -112,6 +133,43 @@ async function handleRender(request, response) {
   }
 }
 
+/**
+ * POST /fetch — load a public page in a browser, return its rendered HTML.
+ *
+ * Separate from /render on purpose. /render takes HTML and must never touch
+ * the network; this takes a URL and must. Keeping them apart keeps that
+ * distinction enforceable rather than a comment.
+ */
+async function handleFetch(request, response) {
+  if (TOKEN && request.headers['x-renderer-token'] !== TOKEN) {
+    send(response, 401, { detail: 'Invalid renderer token.' })
+    return
+  }
+
+  let payload
+  try {
+    payload = JSON.parse((await readBody(request)).toString('utf8'))
+  } catch (error) {
+    send(response, 400, { detail: `Could not read request: ${error.message}` })
+    return
+  }
+
+  const { url } = payload
+  if (typeof url !== 'string' || !url) {
+    send(response, 400, { detail: 'url is required.' })
+    return
+  }
+
+  const started = Date.now()
+  try {
+    const result = await fetchRendered(url)
+    send(response, 200, { ...result, fetch_ms: Date.now() - started })
+  } catch (error) {
+    console.error('fetch failed:', error.message)
+    send(response, 502, { detail: `Could not load the page: ${error.message}` })
+  }
+}
+
 const server = createServer((request, response) => {
   if (request.method === 'GET' && request.url === '/health') {
     send(response, 200, { status: 'ok' })
@@ -119,6 +177,10 @@ const server = createServer((request, response) => {
   }
   if (request.method === 'POST' && request.url === '/render') {
     void handleRender(request, response)
+    return
+  }
+  if (request.method === 'POST' && request.url === '/fetch') {
+    void handleFetch(request, response)
     return
   }
   send(response, 404, { detail: 'Not found.' })

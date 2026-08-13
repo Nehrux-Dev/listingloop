@@ -33,6 +33,7 @@ class ListingAPITestCase(AuthAPITestCase):
     listings_url = reverse("listings:listing-list")
     listing_summary_url = reverse("listings:listing-summary")
     listing_import_url = reverse("listings:listing-import-url")
+    listing_import_html_url = reverse("listings:listing-import-html")
     photos_url = reverse("listings:listingphoto-list")
 
     @staticmethod
