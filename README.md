@@ -886,6 +886,15 @@ to set a flag. The API publishes it, so the library stops asking for a listing
 on a festival card, and the serializer rejects a listing-led template that
 arrives without one.
 
+**Imported templates are exempt whatever their category.** The extractor keeps
+the artwork's own wording and pictures as each element's default, so an imported
+flyer opens fully formed with nothing attached — a listing binding overwrites
+text that is already there rather than filling a hole. Requiring a property
+would mean an agent could not customise artwork they uploaded themselves until
+they had verified an unrelated listing. Attaching a property is still offered,
+and still has to be a verified one: this governs whether a listing is
+*required*, never whether an unreviewed one may be used.
+
 ### Dates are data, not a formula
 
 Christmas and Canada Day are fixed. Diwali, Eid, Lunar New Year, Easter and

@@ -63,7 +63,12 @@ export default function App() {
               <Route path="calendar" element={<ContentCalendarPage />} />
               <Route path="templates" element={<TemplateLibraryPage />} />
               <Route path="designs" element={<DesignsPage />} />
-              <Route path="designs/:id" element={<DesignEditorPage />} />
+              {/* Editing is its own screen, not a mode of the designs list.
+                  The bare /designs/:id is kept as a redirect: it is what
+                  every link written before the editor moved still points
+                  at, and a dead link is a worse answer than a hop. */}
+              <Route path="designs/:id" element={<Navigate to="edit" replace />} />
+              <Route path="designs/:id/edit" element={<DesignEditorPage />} />
 
               {/* Hierarchical guard: Brokerage Admins and Nehrux Admins —
                   plus any agent who added their own firm from Settings and

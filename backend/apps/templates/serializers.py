@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
+from django.conf import settings
+from django.template.defaultfilters import filesizeformat
 from rest_framework import serializers
 
 from apps.accounts.models import AgentProfile
@@ -14,7 +18,10 @@ from apps.templates.models import (
     DesignExport,
     ExportFormat,
     Template,
+    TemplateCategory,
     TemplateElement,
+    TemplateImport,
+    TemplateStyle,
 )
 from apps.templates.document import elements_from_template, validate_document
 
@@ -53,6 +60,14 @@ class TemplateListSerializer(serializers.ModelSerializer):
     #: Published so the library can stop asking for a listing on a Diwali card.
     requires_listing = serializers.BooleanField(read_only=True)
     is_seasonal = serializers.BooleanField(read_only=True)
+    #: True for a template the viewer imported from their own artwork, false
+    #: for the shared Nehrux library. The gallery uses it to badge one and to
+    #: offer deleting it — a library template is not the viewer's to remove.
+    is_imported = serializers.BooleanField(read_only=True)
+    #: The rasterised source page, when there is one. This is the first time a
+    #: template has a real picture of itself rather than a colour swatch, so
+    #: the grid shows it and falls back to the swatch when it is null.
+    source_image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = Template
@@ -68,11 +83,20 @@ class TemplateListSerializer(serializers.ModelSerializer):
             "element_count",
             "requires_listing",
             "is_seasonal",
+            "is_imported",
+            "source_image_url",
             "allows_added_elements",
             "default_dimension",
             "layout_definition",
         )
         read_only_fields = fields
+
+    def get_source_image_url(self, obj: Template) -> str | None:
+        if not obj.source_image:
+            return None
+        request = self.context.get("request")
+        url = obj.source_image.url
+        return request.build_absolute_uri(url) if request else url
 
 
 class TemplateDetailSerializer(TemplateListSerializer):
@@ -80,6 +104,107 @@ class TemplateDetailSerializer(TemplateListSerializer):
 
     class Meta(TemplateListSerializer.Meta):
         fields = TemplateListSerializer.Meta.fields + ("elements",)
+        read_only_fields = fields
+
+
+#: What the importer can actually open. Sniffed from the bytes as well as the
+#: extension, below — an extension is whatever the client typed.
+IMPORT_EXTENSIONS = ("pdf", "png", "jpg", "jpeg", "webp")
+
+_PDF_MAGIC = b"%PDF"
+
+
+class TemplateImportCreateSerializer(serializers.Serializer):
+    """The upload that starts an import.
+
+    Validation here is about whether the file is worth spending a vision call
+    on — size, extension and a content sniff. Everything about *what is in
+    the design* is the extractor's problem, and cannot be known before it runs.
+    """
+
+    file = serializers.FileField(write_only=True)
+    #: Optional. Blank means the extractor names the template from its own
+    #: headline, which is usually a better name than "flyer-final-v3.pdf".
+    name = serializers.CharField(max_length=160, required=False, allow_blank=True)
+    category = serializers.ChoiceField(
+        choices=TemplateCategory.choices, default=TemplateCategory.NEW_LISTING
+    )
+    style = serializers.ChoiceField(
+        choices=TemplateStyle.choices, default=TemplateStyle.MINIMAL
+    )
+
+    def validate_file(self, value):
+        limit = settings.MAX_TEMPLATE_IMPORT_BYTES
+        if value.size > limit:
+            raise serializers.ValidationError(
+                f"That file is {filesizeformat(value.size)}. The maximum is "
+                f"{filesizeformat(limit)}."
+            )
+        if value.size == 0:
+            raise serializers.ValidationError("That file is empty.")
+
+        extension = PurePosixPath(value.name.replace("\\", "/")).suffix.lower().lstrip(".")
+        if extension not in IMPORT_EXTENSIONS:
+            raise serializers.ValidationError(
+                "Upload a PDF, PNG, JPG or WebP of the design."
+            )
+
+        # The bytes, not the name. A .png that is really a PDF should import
+        # fine; a .png that is really a zip should not reach a worker.
+        head = value.read(1024)
+        value.seek(0)
+        if head[:4] != _PDF_MAGIC and not _looks_like_image(value):
+            raise serializers.ValidationError(
+                "That file is not a readable PDF or image."
+            )
+        return value
+
+
+def _looks_like_image(uploaded) -> bool:
+    """Whether Pillow can decode this upload's header.
+
+    ``verify()`` reads structure without decoding the whole bitmap, so a large
+    photo costs almost nothing here. The file is rewound afterwards because a
+    verified file object is left unusable by design.
+    """
+    from PIL import Image
+
+    try:
+        Image.open(uploaded).verify()
+        return True
+    except Exception:
+        return False
+    finally:
+        uploaded.seek(0)
+
+
+class TemplateImportSerializer(serializers.ModelSerializer):
+    """One import job, as the gallery polls it.
+
+    Carries the finished template inline on success so the client can drop the
+    new card straight into the grid without a second request — the moment the
+    job says "succeeded" is exactly the moment it needs the template.
+    """
+
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+    template_detail = TemplateListSerializer(source="template", read_only=True)
+    is_finished = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = TemplateImport
+        fields = (
+            "id",
+            "original_filename",
+            "status",
+            "status_display",
+            "is_finished",
+            "error",
+            "template",
+            "template_detail",
+            "element_count",
+            "created_at",
+            "finished_at",
+        )
         read_only_fields = fields
 
 
@@ -202,6 +327,21 @@ class DesignSerializer(serializers.ModelSerializer):
                 "This listing has not been verified yet. Review and confirm its "
                 "details before using it in a design."
             )
+        return value
+
+    def validate_template(self, value: Template) -> Template:
+        """A design may only be built on a template the caller can see.
+
+        Without this, a template id guessed or remembered from another account
+        would open someone else's imported artwork — the design copies its
+        elements outright, so it would be handed over wholesale.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not user.is_authenticated:
+            raise serializers.ValidationError("Authentication required.")
+        if not Template.objects.visible_to(user).filter(pk=value.pk).exists():
+            raise serializers.ValidationError("No such template.")
         return value
 
     def validate_agent(self, value: AgentProfile) -> AgentProfile:

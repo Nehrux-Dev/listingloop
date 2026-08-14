@@ -312,6 +312,11 @@ REST_FRAMEWORK = {
         "enquiry": env("ENQUIRY_THROTTLE_RATE", default="5/hour"),
         # Public page reads. Generous: this is a page anyone may look at.
         "public_page": env("PUBLIC_PAGE_THROTTLE_RATE", default="120/min"),
+        # A template import is the most expensive call in the product: one
+        # high-resolution page image into a vision model, and a large JSON
+        # response back. Kept low and per-user for the same reason as
+        # `ai_generate` — each one costs real money.
+        "template_import": env("TEMPLATE_IMPORT_THROTTLE_RATE", default="10/hour"),
     },
 }
 
@@ -440,6 +445,45 @@ for _override in env.list("OPENAI_PRICING_OVERRIDES", default=[]):
         OPENAI_PRICING[_name] = {"input": float(_in), "output": float(_out)}
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Template import (PDF / image -> an editable template)
+#
+# Its own model and limits rather than the caption settings above, because it
+# is a different job with different failure modes: one image in, a few hundred
+# numbers out. `OPENAI_MODEL` defaults to a mini model tuned for cheap text —
+# using it here produces geometry that is confidently wrong, which is the worst
+# possible outcome for a layout the user then has to un-pick by hand.
+# ---------------------------------------------------------------------------
+
+OPENAI_VISION_MODEL = env("OPENAI_VISION_MODEL", default="gpt-4o")
+
+#: A full page of artwork can carry 40+ elements, each an object with a
+#: transform, a role and a style. At the caption budget (1500) the JSON is
+#: truncated mid-object and the whole import fails.
+TEMPLATE_IMPORT_MAX_OUTPUT_TOKENS = env.int(
+    "TEMPLATE_IMPORT_MAX_OUTPUT_TOKENS", default=16000
+)
+#: Longer than the caption timeout: a large image plus a large response is a
+#: minute-scale call, and it runs on a Celery worker where nothing is waiting
+#: on a socket.
+TEMPLATE_IMPORT_TIMEOUT_SECONDS = env.float(
+    "TEMPLATE_IMPORT_TIMEOUT_SECONDS", default=180.0
+)
+
+#: Source artwork is a print-resolution PDF more often than not, so this is
+#: deliberately larger than MAX_IMAGE_UPLOAD_MB.
+MAX_TEMPLATE_IMPORT_MB = env.int("MAX_TEMPLATE_IMPORT_MB", default=25)
+MAX_TEMPLATE_IMPORT_BYTES = MAX_TEMPLATE_IMPORT_MB * 1024 * 1024
+
+#: Longest edge, in pixels, of the raster handed to the vision model. Above
+#: this the model gains no accuracy (it downsamples internally) and the request
+#: just costs more; below it, small type stops being legible and the extractor
+#: starts inventing text.
+TEMPLATE_IMPORT_RASTER_MAX_EDGE = env.int(
+    "TEMPLATE_IMPORT_RASTER_MAX_EDGE", default=2000
+)
 
 
 # ---------------------------------------------------------------------------

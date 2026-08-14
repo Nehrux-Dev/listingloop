@@ -19,6 +19,13 @@ beautifulsoup4>=4.13,<5.0
 # AI content generation. Key is backend-only; see config/settings.py.
 openai>=1.60,<2.0
 
+# Template import: rasterising an uploaded PDF page so the extractor has one
+# picture to measure against, and so the library has a real thumbnail. Chosen
+# over pdf2image/pdfplumber because it needs no external poppler binary — the
+# wheel is self-contained, which keeps the Docker image and a bare `pip
+# install` on Windows behaving the same way.
+PyMuPDF>=1.24,<2.0
+
 # Background processing
 celery>=5.5,<6.0
 redis>=5.2,<7.0

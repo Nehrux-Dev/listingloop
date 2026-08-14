@@ -43,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from apps.accounts.completeness import fix_path_for
+from apps.templates.document import carries_image
 from apps.templates.html_builder import resolve_content, unresolved_placeholders
 
 #: content_source prefix -> (label shown to the agent, Settings area)
@@ -135,14 +136,28 @@ def assess_design(design, context: dict) -> list[MissingElement]:
     missing: list[MissingElement] = []
     seen: set[str] = set()
 
+    # Which image elements already hold a picture, without reading one byte of
+    # it. Storage is deliberately not touched here: an unreadable file is a
+    # storage problem, not a missing-profile-field one, and opening every image
+    # just to ask whether it is empty would make this check cost a render.
+    #
+    # A stand-in value is enough because `resolve_content` only asks whether
+    # the id is present. This is what stops an imported template — whose photo
+    # slots carry artwork cut from the source page *and* a binding to
+    # `listing.photos[n]` — being reported as missing a photo it can plainly
+    # draw. Without it, importing a seasonal flyer and exporting it with no
+    # property attached would be blocked over a photo the design already has.
+    present_images = {
+        element["id"]: "stored"
+        for element in design.ensure_document()
+        if element.get("content") and carries_image(element.get("type", ""), element["content"])
+    }
+
     for element in design.ensure_document():
         if not element.get("visible", True):
             continue
 
-        # Resolved with no image map: an unreadable image is a storage problem,
-        # not a missing-profile-field one, and passing images through here
-        # would mean reading every file just to ask whether it is empty.
-        content = resolve_content(element, context, {})
+        content = resolve_content(element, context, present_images)
         is_empty = content is None or (isinstance(content, str) and not content.strip())
 
         source = element.get("content_source") or ""

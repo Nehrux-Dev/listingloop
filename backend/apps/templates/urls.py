@@ -5,6 +5,7 @@ from apps.templates.views import (
     CalendarEventViewSet,
     DesignExportViewSet,
     DesignViewSet,
+    TemplateImportViewSet,
     TemplateViewSet,
     element_kinds,
     render_dimensions,
@@ -14,6 +15,7 @@ app_name = "templates"
 
 router = DefaultRouter()
 router.register("templates", TemplateViewSet, basename="template")
+router.register("template-imports", TemplateImportViewSet, basename="templateimport")
 router.register("designs", DesignViewSet, basename="design")
 router.register("design-exports", DesignExportViewSet, basename="designexport")
 router.register("calendar-events", CalendarEventViewSet, basename="calendarevent")

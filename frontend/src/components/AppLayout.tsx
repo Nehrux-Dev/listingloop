@@ -3,8 +3,8 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 import { useAuth } from '../auth/AuthContext.tsx'
 import { ROLES } from '../auth/types.ts'
+import { ComplianceBell, ComplianceNoticeProvider } from './ComplianceNotice.tsx'
 import {
-  IconBell,
   IconBrandKit,
   IconBrokerage,
   IconCalendar,
@@ -37,9 +37,10 @@ import {
  * the API enforces the real boundary.
  */
 
-/** The editor is a multi-column workspace and takes the viewport as-is.
+/** Multi-column workspaces that take the viewport as-is: the editor, and the
+ *  template gallery with its filter sidebar beside a four-column grid.
  *  Every other page keeps the centred reading column. */
-const WIDE_ROUTES = [/^\/designs\/\d+/]
+const WIDE_ROUTES = [/^\/designs\/\d+/, /^\/templates/]
 
 const RAIL_WIDTH = 'w-[204px]'
 
@@ -59,6 +60,16 @@ function initialsOf(name: string, email: string): string {
 }
 
 export default function AppLayout() {
+  // The provider sits above the shell so the rail's compliance bell and the
+  // routed page below it are looking at the same report.
+  return (
+    <ComplianceNoticeProvider>
+      <AppShell />
+    </ComplianceNoticeProvider>
+  )
+}
+
+function AppShell() {
   const { user, logout, hasRoleAtLeast, hasRole } = useAuth()
   const navigate = useNavigate()
   const { pathname } = useLocation()
@@ -181,17 +192,18 @@ export default function AppLayout() {
             <span className="rounded-full border border-line bg-subtle px-2 py-0.5 text-[10px] font-semibold text-muted">
               Free plan
             </span>
-            <span className="ml-auto flex items-center gap-0.5">
+            <div className="ml-auto flex items-center gap-0.5">
               <RailUtility title="Theme (coming soon)" disabled>
                 <IconMoon className="size-[15px]" />
               </RailUtility>
-              <RailUtility title="Notifications (coming soon)" disabled>
-                <IconBell className="size-[15px]" />
-              </RailUtility>
+              {/* Compliance lives here rather than pinned open in the editor's
+                  right panel: it is something to check before exporting, not
+                  something to stare at while designing. */}
+              <ComplianceBell />
               <RailUtility title="Collapse (coming soon)" disabled>
                 <IconChevronLeft className="size-[15px]" />
               </RailUtility>
-            </span>
+            </div>
           </div>
         </div>
       </aside>

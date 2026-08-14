@@ -2,11 +2,23 @@
 
 Templates are product content: Nehrux authors them here, agents consume them
 through the API. That asymmetry is why the template endpoints are read-only.
+
+The one exception is an *imported* template — extracted from artwork an agent
+uploaded, owned by them, and visible only to them. Those are listed here too,
+because an operator investigating "why does my import look wrong" needs to see
+the geometry that came out; they are marked by their owner rather than
+separated into their own screen.
 """
 
 from django.contrib import admin
 
-from apps.templates.models import Design, DesignExport, Template, TemplateElement
+from apps.templates.models import (
+    Design,
+    DesignExport,
+    Template,
+    TemplateElement,
+    TemplateImport,
+)
 
 
 class TemplateElementInline(admin.StackedInline):
@@ -27,10 +39,15 @@ class TemplateElementInline(admin.StackedInline):
 
 @admin.register(Template)
 class TemplateAdmin(admin.ModelAdmin):
-    list_display = ("name", "category", "style", "element_count", "is_active", "updated_at")
-    list_filter = ("category", "style", "is_active")
+    list_display = (
+        "name", "owner", "category", "style", "element_count", "is_active", "updated_at",
+    )
+    # `owner` as a filter is really "library vs imported", which is the first
+    # question anyone browsing this list has.
+    list_filter = ("category", "style", "is_active", "owner")
     search_fields = ("name", "slug", "description")
     prepopulated_fields = {"slug": ("name",)}
+    autocomplete_fields = ("owner",)
     inlines = [TemplateElementInline]
     readonly_fields = ("created_at", "updated_at")
 
@@ -63,6 +80,34 @@ class DesignAdmin(admin.ModelAdmin):
     autocomplete_fields = ("template", "agent", "listing")
     inlines = [DesignExportInline]
     readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(TemplateImport)
+class TemplateImportAdmin(admin.ModelAdmin):
+    """Read-only: an import is a record of something that already happened.
+
+    Editing one would make the audit trail a suggestion, and the token and
+    timing columns are the only place the cost of the feature is visible.
+    """
+
+    list_display = (
+        "original_filename", "agent", "status", "element_count", "model_used",
+        "duration_ms", "created_at",
+    )
+    list_filter = ("status", "model_used")
+    search_fields = ("original_filename", "agent__user__email", "requested_name")
+    autocomplete_fields = ("agent", "template")
+    readonly_fields = (
+        "agent", "source_file", "original_filename", "status", "error", "template",
+        "requested_name", "category", "style", "element_count", "model_used",
+        "prompt_tokens", "completion_tokens", "duration_ms", "started_at",
+        "finished_at", "created_at", "updated_at",
+    )
+
+    def has_add_permission(self, request) -> bool:
+        # An import starts with an upload through the API, never here: there
+        # would be no file for the worker to read.
+        return False
 
 
 @admin.register(DesignExport)

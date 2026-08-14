@@ -95,10 +95,13 @@ export default function ListingFormPage() {
       const updated = await updateListing(listingId, form)
       setListing(updated)
       setForm(listingToInput(updated))
+      // Nobody else reviews this. The passive "needs to be reviewed" read as
+      // though the listing had been sent somewhere and an approval was
+      // pending, so agents waited instead of confirming it themselves.
       setMessage(
         updated.is_verified
           ? 'Listing saved.'
-          : 'Listing saved. It now needs to be reviewed and verified.',
+          : 'Listing saved. Confirm its details below to use it in a design.',
       )
     } catch (error) {
       const parsed = fieldErrors(error)

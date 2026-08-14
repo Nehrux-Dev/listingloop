@@ -1,0 +1,90 @@
+/**
+ * The fonts the CANVAS draws with — deliberately not in index.css.
+ *
+ * ==========================================================================
+ * THIS FILE DRESSES THE ARTWORK, WHICH IS EXACTLY WHAT index.css MAY NOT DO.
+ * ==========================================================================
+ * index.css is scoped to application chrome and says so at the top: nothing
+ * in it may reach inside the canvas stage. These declarations are the
+ * opposite — they exist only so the artwork renders correctly — so they live
+ * apart rather than blurring that boundary. Add editor colours here and the
+ * separation stops meaning anything.
+ *
+ * WHY THESE FILES ARE VENDORED
+ * ----------------------------
+ * ElementLayer promises the canvas is "a faithful preview of what an export
+ * would actually produce". That promise was only being kept on machines that
+ * happened to have the renderer's fonts installed. The renderer container
+ * ships DejaVu, Liberation and Roboto (see renderer/Dockerfile) and resolves
+ * html_builder.FONT_STACKS against them; a browser on Windows or macOS has
+ * none of those and silently substituted Arial.
+ *
+ * That is not a cosmetic difference — it changes line breaking. A heading of
+ * "FIND COMFORT IN / EVERY CORNER" at 106px needs ~790px in a condensed face
+ * and ~985px in Arial. In an 859px box the condensed one keeps the two lines
+ * it was written with and the wide one wraps to three, overflows a box sized
+ * for two, gets cut off by `overflow:hidden`, and collides with the price
+ * beneath it. The export was right the whole time; only the preview lied.
+ *
+ * So the exact files the renderer uses are vendored into public/fonts and
+ * declared here, converted TTF -> WOFF2 (2.0MB -> 729KB; same glyphs, same
+ * metrics — WOFF2 is a container, it does not resample outlines).
+ *
+ * WHICH FILES, AND WHY ONLY THESE
+ * -------------------------------
+ * One per (family, weight) actually reachable from FONT_STACKS today:
+ *
+ *   display -> Roboto Condensed      400, 700
+ *   body    -> DejaVu Sans           400, 700
+ *
+ * `serif` (Liberation Serif) and `mono` (Liberation Mono) are not vendored:
+ * no template element uses either yet, and both are metric-compatible with
+ * Times New Roman and Courier New, which the substituting browsers do have —
+ * so they wrap identically without costing a download. If a template ever
+ * uses them for real, vendor them the same way rather than trusting that.
+ *
+ * KEEPING THIS HONEST
+ * -------------------
+ * These families and weights must track html_builder.FONT_STACKS and
+ * ElementLayer's FONT_STACKS. A family named there but missing here does not
+ * error — it silently falls back and the canvas quietly stops matching the
+ * export again, which is the failure this file exists to end.
+ *
+ * `font-display: block` rather than `swap` on purpose. `swap` paints Arial
+ * first and reflows when the real font lands, which on this canvas means the
+ * agent watches the layout jump — the very artefact being fixed. Blocking
+ * briefly on a self-hosted, same-origin, already-cached file is the better
+ * trade.
+ */
+
+@font-face {
+  font-family: 'Roboto Condensed';
+  src: url('/fonts/RobotoCondensed-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Roboto Condensed';
+  src: url('/fonts/RobotoCondensed-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'DejaVu Sans';
+  src: url('/fonts/DejaVuSans.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'DejaVu Sans';
+  src: url('/fonts/DejaVuSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}

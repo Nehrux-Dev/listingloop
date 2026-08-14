@@ -119,6 +119,26 @@ class SeasonalTemplateTests(TemplateAPITestCase):
         self.assertIn(agent_led.name, names)
         self.assertNotIn(self.listing_template.name, names)
 
+    def test_an_imported_template_counts_as_usable_without_a_listing(self):
+        """The filter runs in the database, so it has to track the property.
+
+        An import left out here would be openable from the library and the
+        editor but missing from the one list that exists to say what is
+        openable between listings.
+        """
+        mine = self.make_template(
+            name="My imported flyer",
+            slug="my-imported-flyer",
+            category=TemplateCategory.NEW_LISTING,
+            owner=self.profile,
+        )
+
+        response = self.client.get(self.templates_url, {"no_listing_required": "true"})
+
+        names = {row["name"] for row in response.data["results"]}
+        self.assertIn(mine.name, names)
+        self.assertNotIn(self.listing_template.name, names)
+
     def test_the_new_festival_categories_appear_in_the_facets(self):
         response = self.client.get(self.template_facets_url)
 

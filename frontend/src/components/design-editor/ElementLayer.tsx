@@ -36,10 +36,42 @@ import { geometryToPixelBox } from './geometry.ts'
 const SAFE_FONT_STACK =
   "'DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Helvetica Neue', Arial, sans-serif"
 
+/** Mirrors `html_builder.FONT_STACKS`. A template names a *role* — "display",
+ *  "body" — and never a family, so the canvas and the renderer resolve the
+ *  same word to the same stack instead of each guessing. */
+const FONT_STACKS: Record<string, string> = {
+  body: SAFE_FONT_STACK,
+  display: `'Roboto Condensed', 'Liberation Sans Narrow', 'DejaVu Sans Condensed', ${SAFE_FONT_STACK}`,
+  serif: "'Liberation Serif', 'DejaVu Serif', Georgia, serif",
+  mono: "'Liberation Mono', 'DejaVu Sans Mono', monospace",
+}
+
 const JUSTIFY_BY_ALIGN: Record<string, string> = {
   left: 'flex-start',
   center: 'center',
   right: 'flex-end',
+}
+
+/**
+ * `clip-path` for an element whose visible edge is not its own box — the
+ * angled and chevron photo cuts an imported flyer is full of.
+ *
+ * Takes the flat `[x1, y1, x2, y2, ...]` percentage list the server validated
+ * and builds the CSS from numbers. Deliberately not "whatever string the
+ * element carried": `clip-path` takes a function, and the canvas should be no
+ * more willing to interpolate one than the renderer is. See
+ * `html_builder._clip_path`, which this mirrors exactly.
+ */
+function clipPath(points: unknown): string | undefined {
+  if (!Array.isArray(points) || points.length < 6 || points.length % 2) return undefined
+  const pairs: string[] = []
+  for (let index = 0; index < points.length; index += 2) {
+    const x = Number(points[index])
+    const y = Number(points[index + 1])
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined
+    pairs.push(`${x.toFixed(3)}% ${y.toFixed(3)}%`)
+  }
+  return `polygon(${pairs.join(',')})`
 }
 
 /** A style value may reference the brand kit, e.g. `@accent_color` — the same
@@ -117,6 +149,12 @@ export default function ElementLayer({
   if (typeof style.background_gradient === 'string') {
     box.backgroundImage = style.background_gradient
   }
+  // Angled and chevron photo edges, the same way the export draws them. Built
+  // from numbers here rather than accepting a CSS string, mirroring
+  // html_builder._clip_path — the canvas and the export must agree, and they
+  // agree by both refusing to interpolate anything but numbers.
+  const clip = clipPath(style.clip_polygon)
+  if (clip) box.clipPath = clip
   // Mirrors _element_html: width alone decides whether a border is drawn, and
   // box-sizing:border-box (set above) is what keeps it from changing the
   // element's outer size — same as the export.
@@ -143,7 +181,7 @@ export default function ElementLayer({
     box.fontWeight = String(style.font_weight ?? '400') as React.CSSProperties['fontWeight']
     box.lineHeight = num(style.line_height, 1.2) || 1.2
     box.color = resolveColor(style.color ?? '#000000', brandKit)
-    box.fontFamily = SAFE_FONT_STACK
+    box.fontFamily = FONT_STACKS[String(style.font_family ?? 'body')] ?? SAFE_FONT_STACK
     box.fontStyle = String(style.font_style ?? 'normal') as React.CSSProperties['fontStyle']
     if (style.letter_spacing_em) box.letterSpacing = `${num(style.letter_spacing_em)}em`
     if (typeof style.text_transform === 'string') {

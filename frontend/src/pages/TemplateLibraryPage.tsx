@@ -1,248 +1,707 @@
+/**
+ * The template gallery: a filter sidebar beside a grid you pick from.
+ *
+ * Browse-only. There is no canvas here and no template-detail screen in
+ * between — clicking a card creates the Design copy and lands you in the
+ * editor, which is where every editing surface lives.
+ *
+ * WHAT THE THREE FILTER GROUPS ACTUALLY ARE
+ * ---------------------------------------------------------------------------
+ * They look alike and are not. **Format** is `default_dimension` — what you
+ * are posting to. **Occasion** is `category` — what the post is about.
+ * **Style** is the visual treatment. A "Just Sold" exists as a Post and as a
+ * Story, so collapsing format into occasion would lose exactly the choice an
+ * agent came here to make. All three are counted and filtered server-side;
+ * the counts come from `/facets/` so they describe the whole library rather
+ * than the page currently loaded.
+ *
+ * THE ONE THING THIS PAGE STILL HAS TO ASK
+ * ---------------------------------------------------------------------------
+ * A "Just Sold" template describes a specific property and the server refuses
+ * to create one without a listing. That cannot be skipped, but it does not
+ * have to be asked per click: the listing is picked once, in the header, and
+ * every card below then opens in a single click. Seasonal and agent-led
+ * templates need no property and ignore it.
+ */
+
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { fetchListings, type Listing } from '../api/listings.ts'
 import {
   createDesign,
+  fetchRenderDimensions,
   fetchTemplateFacets,
+  fetchTemplateImport,
+  fetchTemplateImports,
   fetchTemplates,
   type Facet,
+  type RenderDimension,
+  type TemplateFacets,
+  type TemplateImport,
   type TemplateSummary,
 } from '../api/templates.ts'
 import { Alert } from '../components/FormControls.tsx'
+import { IconFilter, IconGrid, IconLayers, IconSearch, IconUpload } from '../components/icons.tsx'
+import ImportTemplateDialog from '../components/ImportTemplateDialog.tsx'
+import TemplateThumb from '../components/TemplateThumb.tsx'
 import { ApiError } from '../lib/apiClient.ts'
+import { designEditorPath } from '../lib/routes.ts'
 
-/** A cheap visual stand-in, derived from the style so the grid is scannable. */
-const STYLE_SWATCH: Record<string, string> = {
-  bold: 'from-slate-900 to-slate-700',
-  minimal: 'from-slate-200 to-slate-100',
-  luxury: 'from-stone-800 to-amber-700',
-  warm: 'from-orange-300 to-rose-300',
-  editorial: 'from-slate-700 to-slate-500',
-  classic: 'from-emerald-900 to-emerald-700',
-}
+type Sort = 'name' | 'name_desc'
+
+const SORTS: { value: Sort; label: string }[] = [
+  { value: 'name', label: 'Name (A–Z)' },
+  { value: 'name_desc', label: 'Name (Z–A)' },
+]
+
+/** Debounce before a keystroke becomes a request. Long enough that typing a
+ *  word is one query, short enough to feel like filtering rather than search. */
+const SEARCH_IDLE_MS = 300
+
+/** How often a running import is polled. Extraction takes tens of seconds, so
+ *  anything faster is just load; anything slower and a finished import sits
+ *  there looking stuck. */
+const IMPORT_POLL_MS = 3000
 
 export default function TemplateLibraryPage() {
   const navigate = useNavigate()
+
   const [templates, setTemplates] = useState<TemplateSummary[] | null>(null)
-  const [facets, setFacets] = useState<{ categories: Facet[]; styles: Facet[] } | null>(null)
-  const [category, setCategory] = useState('')
-  const [style, setStyle] = useState('')
+  const [total, setTotal] = useState(0)
+  const [facets, setFacets] = useState<TemplateFacets | null>(null)
+  const [renderDimensions, setRenderDimensions] = useState<RenderDimension[]>([])
   const [error, setError] = useState<string | null>(null)
+
+  const [dimensions, setDimensions] = useState<string[]>([])
+  const [styles, setStyles] = useState<string[]>([])
+  const [categories, setCategories] = useState<string[]>([])
+  const [rawQuery, setRawQuery] = useState('')
+  const [query, setQuery] = useState('')
+  const [sort, setSort] = useState<Sort>('name')
+  const [view, setView] = useState<'grid' | 'list'>('grid')
+  const [filtersOpen, setFiltersOpen] = useState(true)
 
   // Only verified listings can back a design, so only those are offered.
   const [listings, setListings] = useState<Listing[]>([])
-  const [chosen, setChosen] = useState<TemplateSummary | null>(null)
   const [listingId, setListingId] = useState<string>('')
-  const [creating, setCreating] = useState(false)
+  /** The template being opened, so its card can say so. */
+  const [opening, setOpening] = useState<number | null>(null)
+
+  /** Imports still worth watching: anything unfinished, plus the failures,
+   *  which stay on screen until dismissed so a reason is never lost to a
+   *  re-render. A succeeded one is dropped as soon as its template joins the
+   *  grid — leaving it would show the same design twice. */
+  const [imports, setImports] = useState<TemplateImport[]>([])
+  const [importOpen, setImportOpen] = useState(false)
 
   useEffect(() => {
     fetchTemplateFacets().then(setFacets).catch(() => setFacets(null))
+    fetchRenderDimensions().then(setRenderDimensions).catch(() => setRenderDimensions([]))
     fetchListings({ verification_status: 'verified' })
-      .then((page) => setListings(page.results))
+      .then((page) => {
+        setListings(page.results)
+        // Default to the most recent, so the common case really is one click.
+        if (page.results.length > 0) setListingId(String(page.results[0].id))
+      })
       .catch(() => setListings([]))
+    // Pick up anything still running from a previous visit: an import survives
+    // a page reload, and a user who navigated away mid-extraction should come
+    // back to it in progress rather than to no trace of it.
+    fetchTemplateImports()
+      .then((page) => setImports(page.results.filter((job) => !job.is_finished)))
+      .catch(() => setImports([]))
   }, [])
+
+  /**
+   * Poll every unfinished import until it lands.
+   *
+   * A succeeded job puts its template straight into the grid from
+   * `template_detail` rather than re-fetching the list: the filters currently
+   * applied might exclude it, and a card that vanishes the instant it appears
+   * is worse than one that is simply there.
+   */
+  // Depends on the *ids* being watched, not on the jobs themselves: rewriting
+  // a row on every tick would tear down and rebuild the interval each time.
+  const pendingIds = imports
+    .filter((job) => !job.is_finished)
+    .map((job) => job.id)
+    .join(',')
+
+  useEffect(() => {
+    if (!pendingIds) return
+    const watching = pendingIds.split(',').map(Number)
+
+    const timer = window.setInterval(() => {
+      for (const id of watching) {
+        void fetchTemplateImport(id)
+          .then((fresh) => {
+            if (fresh.status === 'succeeded' && fresh.template_detail) {
+              const finished = fresh.template_detail
+              setTemplates((current) =>
+                current && current.some((entry) => entry.id === finished.id)
+                  ? current
+                  : [finished, ...(current ?? [])],
+              )
+              setTotal((current) => current + 1)
+              setImports((current) => current.filter((entry) => entry.id !== fresh.id))
+              // The new template changes every count in the sidebar.
+              fetchTemplateFacets().then(setFacets).catch(() => {})
+              return
+            }
+            setImports((current) =>
+              current.map((entry) =>
+                // Replaced only on a real change, so an unchanged job does not
+                // produce a new array identity on every single tick.
+                entry.id === fresh.id && entry.status !== fresh.status ? fresh : entry,
+              ),
+            )
+          })
+          .catch(() => {
+            // A dropped poll is not a failed import. Leave the row alone and
+            // try again on the next tick.
+          })
+      }
+    }, IMPORT_POLL_MS)
+
+    return () => window.clearInterval(timer)
+  }, [pendingIds])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setQuery(rawQuery.trim()), SEARCH_IDLE_MS)
+    return () => window.clearTimeout(timer)
+  }, [rawQuery])
 
   useEffect(() => {
     const params: Record<string, string> = {}
-    if (category) params.category = category
-    if (style) params.style = style
+    if (dimensions.length > 0) params.dimension = dimensions.join(',')
+    if (styles.length > 0) params.style = styles.join(',')
+    if (categories.length > 0) params.category = categories.join(',')
+    if (query) params.search = query
 
     setTemplates(null)
+    setError(null)
     fetchTemplates(Object.keys(params).length > 0 ? params : undefined)
-      .then((page) => setTemplates(page.results))
+      .then((page) => {
+        setTemplates(page.results)
+        setTotal(page.count)
+      })
       .catch((err: unknown) =>
         setError(err instanceof ApiError ? err.message : 'Could not load templates.'),
       )
-  }, [category, style])
+  }, [dimensions, styles, categories, query])
 
-  const availableCategories = useMemo(
-    () => (facets?.categories ?? []).filter((facet) => facet.count > 0),
-    [facets],
-  )
-  const availableStyles = useMemo(
-    () => (facets?.styles ?? []).filter((facet) => facet.count > 0),
-    [facets],
-  )
+  /** Aspect per format, so a Story card is tall and a Facebook card is wide —
+   *  the shape is half of what you are picking. */
+  const aspectFor = useMemo(() => {
+    const byKey = new Map(renderDimensions.map((entry) => [entry.key, entry.aspect]))
+    return (template: TemplateSummary) => byKey.get(template.default_dimension) ?? 1
+  }, [renderDimensions])
 
-  async function startDesign() {
-    if (!chosen) return
-    setCreating(true)
+  const formatLabel = useMemo(() => {
+    const byKey = new Map((facets?.dimensions ?? []).map((f) => [f.value, f.label]))
+    return (template: TemplateSummary) =>
+      byKey.get(template.default_dimension) ?? template.default_dimension
+  }, [facets])
+
+  const shown = useMemo(() => {
+    if (!templates) return []
+    const sorted = [...templates].sort((a, b) => a.name.localeCompare(b.name))
+    return sort === 'name_desc' ? sorted.reverse() : sorted
+  }, [templates, sort])
+
+  const activeFilters = dimensions.length + styles.length + categories.length
+  const withCounts = (list: Facet[] | undefined) =>
+    (list ?? []).filter((facet) => facet.count > 0)
+
+  function toggle(setter: (fn: (current: string[]) => string[]) => void, value: string) {
+    setter((current) =>
+      current.includes(value)
+        ? current.filter((entry) => entry !== value)
+        : [...current, value],
+    )
+  }
+
+  function clearFilters() {
+    setDimensions([])
+    setStyles([])
+    setCategories([])
+    setRawQuery('')
+  }
+
+  async function openTemplate(template: TemplateSummary) {
+    if (opening !== null) return
+    setOpening(template.id)
     setError(null)
     try {
       const design = await createDesign({
-        name: `${chosen.name} — ${new Date().toLocaleDateString()}`,
-        template: chosen.id,
-        listing: listingId ? Number(listingId) : null,
+        name: `${template.name} — ${new Date().toLocaleDateString()}`,
+        template: template.id,
+        // An imported template no longer *requires* a property, but it may
+        // still bind listing fields — so it takes the selected one when there
+        // is one. Keying this off `requires_listing` alone would open an
+        // agent's own property flyer with the property deliberately left out.
+        listing:
+          (template.requires_listing || template.is_imported) && listingId
+            ? Number(listingId)
+            : null,
       })
-      void navigate(`/designs/${design.id}`)
+      void navigate(designEditorPath(design.id))
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not start that design.')
-      setCreating(false)
+      setOpening(null)
     }
   }
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">Template library</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          Pick a template, then fill it with one of your verified listings.
-        </p>
-      </div>
-
-      {error && <Alert kind="error">{error}</Alert>}
-
-      <div className="space-y-3">
-        <FilterRow
-          label="Category"
-          options={availableCategories}
-          value={category}
-          onChange={setCategory}
-        />
-        <FilterRow label="Style" options={availableStyles} value={style} onChange={setStyle} />
-      </div>
-
-      {!templates && <p className="text-sm text-slate-500">Loading…</p>}
-
-      {templates && templates.length === 0 && (
-        <div className="rounded-lg border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500">
-          No templates match those filters.
+    <div className="flex h-screen flex-col bg-app">
+      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-6 py-4">
+        <div className="mr-auto min-w-0">
+          <h1 className="text-xl font-semibold tracking-tight">Templates</h1>
+          <p className="mt-0.5 text-sm text-muted">
+            Choose a template to start creating stunning designs
+          </p>
         </div>
-      )}
 
-      {templates && templates.length > 0 && (
-        <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {templates.map((template) => (
-            <li key={template.id}>
-              <button
-                type="button"
-                onClick={() => setChosen(template)}
-                className={`w-full overflow-hidden rounded-lg border bg-white text-left shadow-sm transition hover:border-slate-400 ${
-                  chosen?.id === template.id ? 'border-slate-900 ring-1 ring-slate-900' : 'border-slate-200'
-                }`}
+        <div className="relative w-full max-w-xs">
+          <IconSearch className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" />
+          <input
+            value={rawQuery}
+            onChange={(event) => setRawQuery(event.target.value)}
+            placeholder="Search templates..."
+            aria-label="Search templates"
+            className="w-full rounded-control border border-line bg-surface py-2.5 pl-9 pr-3 text-sm outline-none transition placeholder:text-muted focus:border-brand"
+          />
+        </div>
+
+        {/* Asked once, not per card. Only property templates use it, and they
+            say so on the card when it is missing. */}
+        {listings.length > 0 && (
+          <label className="flex items-center gap-2 text-sm">
+            <span className="text-xs font-medium uppercase tracking-wide text-muted">
+              Property
+            </span>
+            <select
+              value={listingId}
+              onChange={(event) => setListingId(event.target.value)}
+              className="max-w-56 rounded-control border border-line bg-surface px-3 py-2.5 text-sm"
+            >
+              {listings.map((listing) => (
+                <option key={listing.id} value={listing.id}>
+                  {listing.full_address || `Listing #${listing.id}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        <button
+          type="button"
+          onClick={() => setImportOpen(true)}
+          className="flex items-center gap-2 rounded-control bg-brand px-3.5 py-2.5 text-sm font-medium text-white transition hover:opacity-90"
+        >
+          <IconUpload className="size-4" />
+          Import design
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setFiltersOpen((open) => !open)}
+          aria-expanded={filtersOpen}
+          className={`flex items-center gap-2 rounded-control border px-3.5 py-2.5 text-sm font-medium transition ${
+            filtersOpen || activeFilters > 0
+              ? 'border-brand text-brand'
+              : 'border-line text-ink hover:bg-hover'
+          }`}
+        >
+          <IconFilter className="size-4" />
+          Filters
+          {activeFilters > 0 && (
+            <span className="rounded-full bg-brand px-1.5 text-[10px] font-bold text-white">
+              {activeFilters}
+            </span>
+          )}
+        </button>
+      </header>
+
+      <div className="flex min-h-0 flex-1">
+        {filtersOpen && (
+          <aside className="w-[264px] shrink-0 overflow-y-auto border-r border-line bg-surface p-4">
+            <FilterGroup title="Format">
+              <FilterRow
+                label="All templates"
+                count={(facets?.dimensions ?? []).reduce((sum, f) => sum + f.count, 0)}
+                active={dimensions.length === 0}
+                onClick={() => setDimensions([])}
+              />
+              {withCounts(facets?.dimensions).map((facet) => (
+                <FilterRow
+                  key={facet.value}
+                  label={facet.label}
+                  count={facet.count}
+                  active={dimensions.includes(facet.value)}
+                  onClick={() => toggle(setDimensions, facet.value)}
+                />
+              ))}
+            </FilterGroup>
+
+            <FilterGroup title="Style">
+              {withCounts(facets?.styles).map((facet) => (
+                <CheckRow
+                  key={facet.value}
+                  label={facet.label}
+                  count={facet.count}
+                  checked={styles.includes(facet.value)}
+                  onChange={() => toggle(setStyles, facet.value)}
+                />
+              ))}
+            </FilterGroup>
+
+            <FilterGroup title="Occasion">
+              {withCounts(facets?.categories).map((facet) => (
+                <CheckRow
+                  key={facet.value}
+                  label={facet.label}
+                  count={facet.count}
+                  checked={categories.includes(facet.value)}
+                  onChange={() => toggle(setCategories, facet.value)}
+                />
+              ))}
+            </FilterGroup>
+
+            <button
+              type="button"
+              onClick={clearFilters}
+              disabled={activeFilters === 0 && !rawQuery}
+              className="mt-2 w-full rounded-control border border-line px-3 py-2 text-[13px] font-medium text-brand transition hover:bg-hover disabled:cursor-not-allowed disabled:text-muted disabled:hover:bg-transparent"
+            >
+              Clear filters
+            </button>
+          </aside>
+        )}
+
+        <main className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
+          {error && (
+            <div className="mb-4">
+              <Alert kind="error">{error}</Alert>
+            </div>
+          )}
+
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            <p className="mr-auto text-sm font-medium">
+              {templates ? `${total} template${total === 1 ? '' : 's'}` : 'Loading…'}
+            </p>
+
+            <label className="flex items-center gap-2 text-sm text-muted">
+              Sort by:
+              <select
+                value={sort}
+                onChange={(event) => setSort(event.target.value as Sort)}
+                className="rounded-control border border-line bg-surface px-2.5 py-1.5 text-sm text-ink"
               >
-                <div
-                  className={`flex h-32 items-end bg-gradient-to-br p-3 ${
-                    STYLE_SWATCH[template.style] ?? 'from-slate-300 to-slate-200'
-                  }`}
-                >
-                  <span className="rounded bg-white/90 px-2 py-0.5 text-xs font-medium text-slate-700">
-                    {template.style_display}
-                  </span>
-                </div>
-                <div className="p-4">
-                  <p className="font-medium text-slate-800">{template.name}</p>
-                  <p className="mt-0.5 text-xs text-slate-500">{template.category_display}</p>
-                  {template.description && (
-                    <p className="mt-2 line-clamp-2 text-xs text-slate-500">
-                      {template.description}
-                    </p>
-                  )}
-                </div>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
+                {SORTS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-      {chosen && (
-        <div className="sticky bottom-4 rounded-lg border border-slate-300 bg-white p-4 shadow-lg">
-          <p className="text-sm font-medium text-slate-800">{chosen.name}</p>
-          <div className="mt-3 flex flex-wrap items-end gap-3">
-            {/* A seasonal or agent-led template has nothing to attach, so the
-                picker is not shown at all rather than shown-and-ignored. */}
-            {chosen.requires_listing ? (
-              <label className="text-sm">
-                <span className="block text-xs font-medium text-slate-600">Listing</span>
-                <select
-                  value={listingId}
-                  onChange={(event) => setListingId(event.target.value)}
-                  className="mt-1 w-64 rounded-md border border-slate-300 px-3 py-2 text-sm"
-                >
-                  <option value="">Choose a verified listing…</option>
-                  {listings.map((listing) => (
-                    <option key={listing.id} value={listing.id}>
-                      {listing.full_address || `Listing #${listing.id}`}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            ) : (
-              <p className="text-xs text-slate-500">
-                This template needs no listing.
-              </p>
-            )}
-
-            <button
-              type="button"
-              disabled={creating}
-              onClick={() => void startDesign()}
-              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:opacity-60"
-            >
-              {creating ? 'Creating…' : 'Start design'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setChosen(null)}
-              className="rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-50"
-            >
-              Cancel
-            </button>
+            <div className="flex items-center gap-0.5 rounded-control border border-line p-0.5">
+              <ViewButton active={view === 'grid'} onClick={() => setView('grid')} label="Grid view">
+                <IconGrid className="size-4" />
+              </ViewButton>
+              <ViewButton active={view === 'list'} onClick={() => setView('list')} label="List view">
+                <IconLayers className="size-4" />
+              </ViewButton>
+            </div>
           </div>
-          {chosen.requires_listing && listings.length === 0 && (
-            <p className="mt-2 text-xs text-amber-700">
-              You have no verified listings yet. Verify one to use this template, or
-              try the <a href="/calendar" className="underline">content calendar</a> —
-              those templates need no property.
+
+          {imports.length > 0 && (
+            <ul className="mb-4 space-y-2">
+              {imports.map((job) => (
+                <li key={job.id}>
+                  <ImportRow
+                    job={job}
+                    onDismiss={() =>
+                      setImports((current) => current.filter((entry) => entry.id !== job.id))
+                    }
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {listings.length === 0 && (
+            <p className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              You have no verified listings yet, so the library's property templates
+              are unavailable. Verify one to use them — seasonal templates, and any
+              template you imported yourself, need no property.
             </p>
           )}
-        </div>
+
+          {templates && shown.length === 0 && (
+            <div className="rounded-lg border border-dashed border-line p-10 text-center text-sm text-muted">
+              No templates match those filters.
+            </div>
+          )}
+
+          {shown.length > 0 && (
+            <ul
+              className={
+                view === 'grid'
+                  ? 'grid gap-5 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4'
+                  : 'space-y-2'
+              }
+            >
+              {shown.map((template) => {
+                const blocked = template.requires_listing && !listingId
+                const card = {
+                  template,
+                  blocked,
+                  busy: opening === template.id,
+                  disabled: blocked || opening !== null,
+                  aspect: aspectFor(template),
+                  format: formatLabel(template),
+                  onOpen: () => void openTemplate(template),
+                }
+                return (
+                  <li key={template.id}>
+                    {view === 'grid' ? <GridCard {...card} /> : <ListRow {...card} />}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </main>
+      </div>
+
+      {importOpen && (
+        <ImportTemplateDialog
+          onClose={() => setImportOpen(false)}
+          onQueued={(job) => {
+            setImports((current) => [job, ...current])
+            setImportOpen(false)
+          }}
+        />
       )}
     </div>
   )
 }
 
+// -- imports in progress -----------------------------------------------------
+
+/**
+ * One import, while it runs and after it fails.
+ *
+ * A failure is dismissible rather than auto-clearing: the message names what
+ * was wrong with that particular file, and it is the only place that
+ * information exists once the job is off screen.
+ */
+function ImportRow({ job, onDismiss }: { job: TemplateImport; onDismiss: () => void }) {
+  const failed = job.status === 'failed'
+  return (
+    <div
+      className={`flex items-center gap-3 rounded-control border px-3 py-2.5 text-sm ${
+        failed ? 'border-rose-200 bg-rose-50' : 'border-line bg-surface'
+      }`}
+    >
+      {!failed && (
+        <span
+          aria-hidden="true"
+          className="size-4 shrink-0 animate-spin rounded-full border-2 border-brand border-t-transparent"
+        />
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate font-medium text-ink">
+          {job.original_filename || 'Imported design'}
+        </span>
+        <span className={`block text-xs ${failed ? 'text-rose-700' : 'text-muted'}`}>
+          {failed
+            ? job.error
+            : job.status === 'queued'
+              ? 'Queued — waiting for a worker.'
+              : 'Reading the design and measuring its elements…'}
+        </span>
+      </span>
+      {failed && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="shrink-0 rounded-control border border-rose-200 px-2.5 py-1 text-xs font-medium text-rose-700 transition hover:bg-rose-100"
+        >
+          Dismiss
+        </button>
+      )}
+    </div>
+  )
+}
+
+// -- cards -------------------------------------------------------------------
+
+type CardProps = {
+  template: TemplateSummary
+  blocked: boolean
+  busy: boolean
+  disabled: boolean
+  aspect: number
+  format: string
+  onOpen: () => void
+}
+
+function cardTitle({ template, blocked }: CardProps): string {
+  if (blocked) return 'This template describes a property. Verify a listing to use it.'
+  return `Start a design from ${template.name}`
+}
+
+function GridCard(props: CardProps) {
+  const { template, blocked, busy, disabled, aspect, format, onOpen } = props
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      title={cardTitle(props)}
+      onClick={onOpen}
+      className="group w-full overflow-hidden rounded-panel border border-line bg-surface text-left shadow-panel transition hover:-translate-y-0.5 hover:border-brand/50 hover:shadow-pop disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 disabled:hover:border-line disabled:hover:shadow-panel"
+    >
+      <TemplateThumb
+        template={template}
+        className="w-full p-3"
+        style={{ aspectRatio: String(aspect) }}
+      >
+        {busy && (
+          <span className="absolute inset-0 flex items-center justify-center bg-white/80 text-xs font-semibold text-ink">
+            Opening the editor…
+          </span>
+        )}
+      </TemplateThumb>
+      <div className="p-3">
+        <p className="truncate text-sm font-medium text-ink">{template.name}</p>
+        <p className="mt-0.5 text-xs text-muted">
+          {format} · {template.category_display}
+        </p>
+        {blocked && <p className="mt-1 text-xs text-amber-700">Needs a verified listing.</p>}
+      </div>
+    </button>
+  )
+}
+
+function ListRow(props: CardProps) {
+  const { template, blocked, busy, disabled, format, onOpen } = props
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      title={cardTitle(props)}
+      onClick={onOpen}
+      className="flex w-full items-center gap-3 overflow-hidden rounded-control border border-line bg-surface p-2 text-left transition hover:border-brand/50 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:border-line"
+    >
+      <TemplateThumb
+        template={template}
+        className="size-12 shrink-0 rounded-control p-1"
+        showStyleLabel={false}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-ink">{template.name}</span>
+        <span className="block truncate text-xs text-muted">
+          {format} · {template.category_display} · {template.style_display}
+        </span>
+      </span>
+      {blocked && (
+        <span className="shrink-0 text-xs text-amber-700">Needs a verified listing</span>
+      )}
+      {busy && <span className="shrink-0 text-xs font-semibold text-brand">Opening…</span>}
+    </button>
+  )
+}
+
+// -- sidebar chrome ----------------------------------------------------------
+
+function FilterGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="mb-5">
+      <h2 className="mb-2 text-[13px] font-semibold text-ink">{title}</h2>
+      <div className="space-y-0.5">{children}</div>
+    </section>
+  )
+}
+
+/** A single-tap row — the format list, where "All templates" is a real
+ *  choice rather than the absence of one. */
 function FilterRow({
   label,
-  options,
-  value,
+  count,
+  active,
+  onClick,
+}: {
+  label: string
+  count: number
+  active: boolean
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`flex w-full items-center gap-2 rounded-control px-2.5 py-2 text-[13px] font-medium transition ${
+        active ? 'bg-active text-brand' : 'text-muted hover:bg-hover hover:text-ink'
+      }`}
+    >
+      <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+      <span className="shrink-0 text-xs opacity-70">{count}</span>
+    </button>
+  )
+}
+
+function CheckRow({
+  label,
+  count,
+  checked,
   onChange,
 }: {
   label: string
-  options: Facet[]
-  value: string
-  onChange: (value: string) => void
+  count: number
+  checked: boolean
+  onChange: () => void
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      <span className="mr-1 w-16 text-xs font-medium uppercase tracking-wide text-slate-500">
-        {label}
-      </span>
-      <button
-        type="button"
-        onClick={() => onChange('')}
-        className={`rounded-md px-2.5 py-1 text-sm transition ${
-          value === '' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
-        }`}
-      >
-        All
-      </button>
-      {options.map((option) => (
-        <button
-          key={option.value}
-          type="button"
-          onClick={() => onChange(option.value)}
-          className={`rounded-md px-2.5 py-1 text-sm transition ${
-            value === option.value
-              ? 'bg-slate-900 text-white'
-              : 'text-slate-600 hover:bg-slate-100'
-          }`}
-        >
-          {option.label}
-          <span className="ml-1 text-xs opacity-60">{option.count}</span>
-        </button>
-      ))}
-    </div>
+    <label className="flex cursor-pointer items-center gap-2.5 rounded-control px-2.5 py-1.5 text-[13px] transition hover:bg-hover">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onChange}
+        className="size-4 shrink-0 accent-brand"
+      />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <span className="shrink-0 text-xs text-muted">{count}</span>
+    </label>
+  )
+}
+
+function ViewButton({
+  active,
+  onClick,
+  label,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  label: string
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      aria-pressed={active}
+      className={`flex size-8 items-center justify-center rounded transition ${
+        active ? 'bg-active text-brand' : 'text-muted hover:bg-hover hover:text-ink'
+      }`}
+    >
+      {children}
+    </button>
   )
 }

@@ -280,6 +280,102 @@ class DesignListingGateTests(TemplateAPITestCase):
         self.assertEqual(response.status_code, 400)
 
 
+class ImportedTemplateNeedsNoListingTests(TemplateAPITestCase):
+    """An agent's own imported artwork is theirs to customise immediately.
+
+    The library's New Listing card is a shell that says nothing without a
+    property. An imported one is a finished page — the extractor kept its
+    wording and its pictures — so the same category must not gate it behind
+    verifying an unrelated listing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        # Same category, the only difference is who owns it.
+        self.library = self.make_template()
+        self.imported = self.make_template(
+            name="My flyer",
+            slug="my-flyer",
+            category=TemplateCategory.NEW_LISTING,
+            owner=self.profile,
+        )
+        self.authenticate_as(self.agent)
+
+    def test_imported_template_reports_that_it_needs_no_listing(self):
+        response = self.client.get(self.template_detail_url(self.imported))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["is_imported"])
+        self.assertFalse(response.data["requires_listing"])
+
+    def test_library_template_of_the_same_category_still_needs_one(self):
+        """The exemption is about ownership, not about relaxing the category."""
+        response = self.client.get(self.template_detail_url(self.library))
+
+        self.assertFalse(response.data["is_imported"])
+        self.assertTrue(response.data["requires_listing"])
+
+    def test_a_design_opens_on_an_imported_template_with_no_listing(self):
+        response = self.client.post(
+            self.designs_url,
+            {"name": "Mine to edit", "template": self.imported.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(Design.objects.get().listing)
+
+    def test_the_library_equivalent_is_still_refused_without_one(self):
+        response = self.client.post(
+            self.designs_url,
+            {"name": "Needs a property", "template": self.library.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("listing", response.data)
+
+    def test_an_unverified_listing_is_still_refused_on_an_imported_template(self):
+        """Not needing a listing is not the same as accepting an unreviewed one.
+
+        The verification gate exists so unreviewed property data never reaches
+        marketing material. Waiving the requirement must not waive that.
+        """
+        unverified = self.make_listing(self.profile)
+
+        response = self.client.post(
+            self.designs_url,
+            {"name": "Too early", "template": self.imported.pk, "listing": unverified.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("verified", str(response.data["listing"][0]).lower())
+
+    def test_a_verified_listing_can_still_be_attached(self):
+        verified = self.make_verified_listing(self.profile, self.agent)
+
+        response = self.client.post(
+            self.designs_url,
+            {"name": "With a property", "template": self.imported.pk, "listing": verified.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Design.objects.get().listing, verified)
+
+    def test_the_model_agrees_with_the_serializer(self):
+        """`Design.clean` carries the same rule, so a shell cannot diverge."""
+        design = Design(
+            name="From the shell", template=self.imported, agent=self.profile
+        )
+        design.elements = design.ensure_document()
+
+        design.full_clean(exclude=["elements"])  # must not raise
+
+
 class DesignScopingTests(TemplateAPITestCase):
     def setUp(self) -> None:
         super().setUp()

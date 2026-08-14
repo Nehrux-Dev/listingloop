@@ -47,6 +47,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import {
   addDesignElement,
+  createDesign,
   deleteDesign,
   duplicateDesign,
   exportDesign,
@@ -70,24 +71,27 @@ import {
   type ResolvedElement,
   type TemplateDetail,
   type TemplateElement,
+  type TemplateSummary,
   type UploadedImage,
 } from '../api/templates.ts'
 import { fetchDesignCompliance, type ComplianceReport } from '../api/compliance.ts'
 import { fetchListing, type ListingPhoto } from '../api/listings.ts'
 import { fetchMyBrandKit, type BrandKit } from '../api/profiles.ts'
-import { CompliancePanel } from '../components/CompliancePanel.tsx'
+import { usePublishCompliance } from '../components/ComplianceNotice.tsx'
 import Canvas from '../components/design-editor/Canvas.tsx'
 import LeftPanel, {
   isImageElement,
   useLeftPanelTab,
 } from '../components/design-editor/LeftPanel.tsx'
 import EditorHeader from '../components/design-editor/EditorHeader.tsx'
+import ExportDialog from '../components/design-editor/ExportDialog.tsx'
 import PropertiesSidebar from '../components/design-editor/PropertiesSidebar.tsx'
 import TopToolbar from '../components/design-editor/TopToolbar.tsx'
 import VariationsStrip from '../components/design-editor/VariationsStrip.tsx'
-import { Alert, Card } from '../components/FormControls.tsx'
+import { Alert } from '../components/FormControls.tsx'
 import { ElementControls } from '../components/ElementControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
+import { designEditorPath } from '../lib/routes.ts'
 
 /** A field this design needs, and the screen that fills it in. */
 type MissingField = {
@@ -275,8 +279,15 @@ export default function DesignEditorPage() {
   // Starts as the platform default and switches to the template's own native
   // format once loaded — see the effect below. A template composed tall must
   // not open square.
+  // A placeholder until the template says what this design was drawn for —
+  // see the resolved-design effect below, which waits for `dimensionPinned`
+  // rather than fetching on this value.
   const [dimension, setDimension] = useState('instagram_post')
   const [dimensionPinned, setDimensionPinned] = useState(false)
+  /** The dimension as of *now*, readable from inside an async call that
+   *  captured an older one. A save started before a format switch finishes
+   *  after it, and its response must not drag the canvas back. */
+  const dimensionRef = useRef(dimension)
   const [zoom, setZoom] = useState(100)
   const [fitNonce, setFitNonce] = useState(0)
   const [preview, setPreview] = useState<string | null>(null)
@@ -304,6 +315,14 @@ export default function DesignEditorPage() {
   const [compliance, setCompliance] = useState<ComplianceReport | null>(null)
   const [notReady, setNotReady] = useState<MissingField[]>([])
   const [checkingCompliance, setCheckingCompliance] = useState(true)
+  /** Export is a dialog, not a column. It is also where the compliance flags
+   *  are made unavoidable — see ExportDialog. */
+  const [exportOpen, setExportOpen] = useState(false)
+  /** The two secondary surfaces, off by default and toggled from the ⋯ menu. */
+  const [variationsOpen, setVariationsOpen] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  /** The template being opened from the rail's grid, so its tile can say so. */
+  const [pickingTemplate, setPickingTemplate] = useState<number | null>(null)
 
   const isExtraElement = useCallback(
     (key: string) => key.startsWith('added-') || key.startsWith('clone-'),
@@ -359,33 +378,74 @@ export default function DesignEditorPage() {
     }
   }, [designId])
 
-  const loadResolved = useCallback(async () => {
-    try {
-      setBaseResolved(await fetchResolvedDesign(designId, dimension))
-    } catch (error) {
-      setLoadError(error instanceof ApiError ? error.message : 'Could not open this design.')
-    }
-  }, [designId, dimension])
-
   useEffect(() => {
     void loadDesign()
   }, [loadDesign])
 
   // Open in the format the template was drawn for, once — after that the
   // dimension tabs are the agent's to control.
+  //
+  // Pinned as soon as the template is known, even when it names no format,
+  // because the resolved-design load below waits on this: leaving it false
+  // for a template without a `default_dimension` would mean the canvas never
+  // loaded at all.
   useEffect(() => {
-    if (dimensionPinned || !template?.default_dimension) return
-    setDimension(template.default_dimension)
+    if (dimensionPinned || !template) return
+    if (template.default_dimension) setDimension(template.default_dimension)
     setDimensionPinned(true)
-  }, [template?.default_dimension, dimensionPinned])
+  }, [template, dimensionPinned])
 
   useEffect(() => {
-    void loadResolved()
-  }, [loadResolved])
+    dimensionRef.current = dimension
+  }, [dimension])
+
+  /**
+   * Load the resolved canvas — but not before the dimension is settled, and
+   * never letting an older response overwrite a newer one.
+   *
+   * `dimension` starts at a placeholder, because the format a design opens at
+   * belongs to its template and the template has not loaded on first render.
+   * Fetching on that placeholder issued a request for the wrong format, and
+   * the switch to the template's own issued a second; with no cancellation,
+   * whichever landed last was the one that stuck. When the placeholder won,
+   * an A4 flyer was laid out on a 1080x1080 canvas.
+   *
+   * That is not a harmless rescale. Geometry is fractional, so widths scale
+   * by canvas width and heights by canvas height — but font size scales by
+   * min(width, height). Squaring a 1414x2000 page shrinks the type to 76%
+   * while shrinking the box holding it to 54%, so the text outgrows its box,
+   * `overflow:hidden` cuts it off, and what survives collides with whatever
+   * sits beneath it.
+   *
+   * Waiting on `dimensionPinned` means the wrong request is never sent at
+   * all; the stale flag covers the reorderings that remain, such as switching
+   * format twice before the first response arrives.
+   */
+  useEffect(() => {
+    if (!dimensionPinned) return
+    let stale = false
+    void (async () => {
+      try {
+        const fresh = await fetchResolvedDesign(designId, dimension)
+        if (!stale) setBaseResolved(fresh)
+      } catch (error) {
+        if (stale) return
+        setLoadError(error instanceof ApiError ? error.message : 'Could not open this design.')
+      }
+    })()
+    return () => {
+      stale = true
+    }
+  }, [designId, dimension, dimensionPinned])
 
   useEffect(() => {
     void checkCompliance()
   }, [checkCompliance])
+
+  // Hand the current report to the rail's compliance bell. The checks run
+  // exactly as often as they did when this was a pinned panel — only where
+  // the result is shown has changed.
+  usePublishCompliance(compliance, checkingCompliance)
 
   useEffect(() => {
     fetchRenderDimensions().then(setDimensions).catch(() => setDimensions([]))
@@ -699,7 +759,11 @@ export default function DesignEditorPage() {
         // image for the length of a round trip — a visible flash of the old
         // photo after every save that touched one.
         const fresh = await fetchResolvedDesign(designId, dimension)
-        setBaseResolved(fresh)
+        // Only if the agent has not switched format while this was in flight.
+        // The PATCH above landed before this fetch went out, so the canvas
+        // effect's own response already carries the saved image either way —
+        // which is what makes dropping the previews safe regardless.
+        if (dimensionRef.current === dimension) setBaseResolved(fresh)
         setImagePreviews({})
         void checkCompliance()
         return true
@@ -780,6 +844,19 @@ export default function DesignEditorPage() {
     }
   }
 
+  /**
+   * Open the export dialog — the header button does not export by itself.
+   *
+   * Compliance is no longer pinned open beside the canvas, so the dialog is
+   * where the flags become unmissable: they sit directly above the button
+   * that commits the export, whether or not the agent ever opened the badge.
+   */
+  function requestExport() {
+    setMessage(null)
+    setErrors({})
+    setExportOpen(true)
+  }
+
   async function runExport() {
     if (exportDims.length === 0) return
     setBusy(true)
@@ -791,6 +868,7 @@ export default function DesignEditorPage() {
       setDesign(await fetchDesign(designId))
       setCompliance(result.compliance)
       setMessage(`Exported ${exportDims.length} image${exportDims.length === 1 ? '' : 's'}.`)
+      setExportOpen(false)
     } catch (error) {
       // Two different 409s, and telling an agent the wrong one wastes their
       // time: either a rule flagged the copy, or a field the design needs is
@@ -804,13 +882,17 @@ export default function DesignEditorPage() {
         } | null
 
         if (data?.missing?.length) {
+          // Fixing these means leaving for another screen, so the dialog gets
+          // out of the way and the links land in the notices band.
           setNotReady(data.missing)
+          setExportOpen(false)
           setErrors({ detail: data.detail ?? 'This design is missing information.' })
         } else {
+          // Show the server's own report, in full, rather than sending the
+          // agent hunting for it: it is fresher than ours and it is the one
+          // that just refused the export. The dialog stays open around it.
           if (data?.compliance) setCompliance(data.compliance)
-          setErrors({
-            detail: 'This design does not meet the compliance rules yet — see the flags below.',
-          })
+          setErrors({ detail: 'This design does not meet the compliance rules yet.' })
         }
       } else {
         setErrors({
@@ -830,7 +912,39 @@ export default function DesignEditorPage() {
 
   async function handleDuplicate() {
     const copy = await duplicateDesign(designId)
-    void navigate(`/designs/${copy.id}`)
+    void navigate(designEditorPath(copy.id))
+  }
+
+  /**
+   * Pick another template from the left rail.
+   *
+   * Starts a new design rather than re-templating this one. The elements on
+   * this canvas were copied from the current template, so changing it would
+   * throw the whole canvas away — this design is left exactly as it is, and
+   * the new one opens beside it in the list. The panel says as much before
+   * you click.
+   */
+  async function startFromTemplate(picked: TemplateSummary) {
+    if (!design || picked.id === design.template) return
+    setPickingTemplate(picked.id)
+    setErrors({})
+    try {
+      const created = await createDesign({
+        name: `${picked.name} — ${new Date().toLocaleDateString()}`,
+        template: picked.id,
+        // Imported templates take the listing across too: they can bind
+        // property fields without sitting in a listing category, and dropping
+        // it here would quietly unpick the property on switching.
+        listing: picked.requires_listing || picked.is_imported ? design.listing : null,
+      })
+      void navigate(designEditorPath(created.id))
+    } catch (error) {
+      setErrors({
+        detail:
+          error instanceof ApiError ? error.message : 'Could not start that design.',
+      })
+      setPickingTemplate(null)
+    }
   }
 
   /**
@@ -847,7 +961,7 @@ export default function DesignEditorPage() {
     try {
       const copy = await duplicateDesign(designId, `${design.name} (variation)`)
       loadVariations(design.template)
-      void navigate(`/designs/${copy.id}`)
+      void navigate(designEditorPath(copy.id))
     } catch (error) {
       setErrors({
         detail: error instanceof ApiError ? error.message : 'Could not add a variation.',
@@ -962,8 +1076,14 @@ export default function DesignEditorPage() {
   // Paint order, which is what the layers list reverses to show top-first.
   const sortedForLayers = [...resolved.elements].sort((a, b) => a.z_index - b.z_index)
 
+  const hasFieldErrors = Object.keys(errors).some((key) => key !== 'detail')
+  // The export dialog shows its own failure. Repeating it in the band behind
+  // the dialog says the same thing twice and reads as two problems.
+  const bannerDetail = exportOpen ? null : errors.detail
+  const hasNotices = Boolean(message || bannerDetail || notReady.length > 0 || hasFieldErrors)
+
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex h-screen flex-col overflow-hidden bg-app">
       <EditorHeader
         designName={design.name}
         updatedAt={design.updated_at}
@@ -976,79 +1096,91 @@ export default function DesignEditorPage() {
         onFit={() => setFitNonce((current) => current + 1)}
         onPreview={() => void runPreview()}
         onSave={() => void save()}
-        onExport={() => void runExport()}
+        onExport={requestExport}
         saveState={saveState}
         saveError={saveError}
         busy={busy}
         onRename={() => void handleRename()}
         onDuplicate={() => void handleDuplicate()}
         onDelete={() => void handleDelete()}
+        variationsOpen={variationsOpen}
+        onToggleVariations={() => setVariationsOpen((open) => !open)}
+        advancedOpen={advancedOpen}
+        onToggleAdvanced={() => setAdvancedOpen((open) => !open)}
       />
 
-      <div className="flex-1 space-y-4 px-4 py-4">
-      {message && <Alert kind="success">{message}</Alert>}
-      {errors.detail && <Alert kind="error">{errors.detail}</Alert>}
+      {/* A band under the header, and only when there is something in it —
+          the workspace is a fixed height now, so a permanently reserved
+          notices strip would cost the canvas that much forever. */}
+      {hasNotices && (
+        <div className="shrink-0 space-y-2 border-b border-line bg-surface px-4 py-3">
+          {message && <Alert kind="success">{message}</Alert>}
+          {bannerDetail && <Alert kind="error">{bannerDetail}</Alert>}
 
-      {/* The requirement is real, but this is the first moment it is real —
-          so it arrives with the way to satisfy it, not just a refusal. */}
-      {notReady.length > 0 && (
-        <div className="rounded-md border border-amber-200 bg-amber-50 p-4">
-          <p className="text-sm font-medium text-amber-900">
-            Fill these in and the export will go through:
-          </p>
-          <ul className="mt-3 flex flex-wrap gap-2">
-            {notReady.map((field) => (
-              <li key={field.element}>
-                <Link
-                  to={field.fix_path}
-                  className="inline-block rounded-md border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-900 transition hover:border-amber-500"
-                >
-                  {field.label} — {field.step_label} →
-                </Link>
-              </li>
-            ))}
-          </ul>
+          {/* The requirement is real, but this is the first moment it is real —
+              so it arrives with the way to satisfy it, not just a refusal. */}
+          {notReady.length > 0 && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 p-4">
+              <p className="text-sm font-medium text-amber-900">
+                Fill these in and the export will go through:
+              </p>
+              <ul className="mt-3 flex flex-wrap gap-2">
+                {notReady.map((field) => (
+                  <li key={field.element}>
+                    <Link
+                      to={field.fix_path}
+                      className="inline-block rounded-md border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-900 transition hover:border-amber-500"
+                    >
+                      {field.label} — {field.step_label} →
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {hasFieldErrors && (
+            <Alert kind="error">Some changes were rejected. See the highlighted element.</Alert>
+          )}
         </div>
       )}
-      {Object.keys(errors).some((key) => key !== 'detail') && (
-        <Alert kind="error">Some changes were rejected. See the highlighted element.</Alert>
-      )}
 
-      <div className="grid gap-4 lg:grid-cols-[340px_minmax(0,1fr)_340px]">
-        <div className="lg:sticky lg:top-4 lg:h-[calc(100vh-6rem)] lg:self-start">
-          <LeftPanel
-            tab={leftTab}
-            onTabChange={setLeftTab}
-            template={template}
-            elements={sortedForLayers}
-            selectedKey={selectedKey}
-            onSelect={(key) => {
-              setSelectedKey(key)
-              setEditingKey(null)
-            }}
-            canReorder={(element) => editableFieldsFor(element).includes('z_index')}
-            onReorder={(movedKey, targetKey) => void reorderElement(movedKey, targetKey)}
-            onRemoveElement={(element) => void removeElement(element)}
-            onAddElement={(kind) => void addElement(kind)}
-            adding={addingElement}
-            listingPhotos={listingPhotos}
-            uploads={uploads}
-            onUploadFile={(file) => void uploadToLibrary(file)}
-            uploading={uploadingImage}
-            selectedElement={selectedElement}
-            brandKit={brandKit}
-            onApplyImage={
-              selectedElement &&
-              isImageElement(selectedElement) &&
-              selectedEditableFields.includes('image_key')
-                ? (imageKey, previewUrl) =>
-                    replaceImage(selectedElement.key, imageKey, previewUrl)
-                : null
-            }
-          />
-        </div>
+      <div className="flex min-h-0 flex-1">
+        <LeftPanel
+          tab={leftTab}
+          onTabChange={setLeftTab}
+          template={template}
+          elements={sortedForLayers}
+          selectedKey={selectedKey}
+          onSelect={(key) => {
+            setSelectedKey(key)
+            setEditingKey(null)
+          }}
+          canReorder={(element) => editableFieldsFor(element).includes('z_index')}
+          onReorder={(movedKey, targetKey) => void reorderElement(movedKey, targetKey)}
+          onRemoveElement={(element) => void removeElement(element)}
+          onAddElement={(kind) => void addElement(kind)}
+          adding={addingElement}
+          onPickTemplate={(picked) => void startFromTemplate(picked)}
+          pickingTemplate={pickingTemplate}
+          hasListing={design.listing !== null}
+          listingPhotos={listingPhotos}
+          uploads={uploads}
+          onUploadFile={(file) => void uploadToLibrary(file)}
+          uploading={uploadingImage}
+          selectedElement={selectedElement}
+          brandKit={brandKit}
+          onApplyImage={
+            selectedElement &&
+            isImageElement(selectedElement) &&
+            selectedEditableFields.includes('image_key')
+              ? (imageKey, previewUrl) =>
+                  replaceImage(selectedElement.key, imageKey, previewUrl)
+              : null
+          }
+        />
 
-        <div className="flex min-h-0 flex-col gap-3 lg:h-[calc(100vh-6rem)]">
+        <main className="flex min-w-0 flex-1 flex-col gap-2 p-3">
           <div className="flex flex-wrap gap-1">
             {dimensions.map((option) => (
               <button
@@ -1114,202 +1246,132 @@ export default function DesignEditorPage() {
             fitNonce={fitNonce}
           />
 
-          <VariationsStrip
-            variations={variations}
-            currentId={designId}
-            aspect={resolved.width / resolved.height}
-            backgroundColor={
-              typeof template.layout_definition.background_color === 'string'
-                ? template.layout_definition.background_color
-                : '#FFFFFF'
-            }
-            busy={busy}
-            onOpen={(id) => void navigate(`/designs/${id}`)}
-            onAdd={() => void addVariation()}
-            onDuplicate={(target) => void duplicateVariation(target)}
-            onRename={(target) => void renameVariation(target)}
-            onDelete={(target) => void deleteVariation(target)}
-          />
+          {/* Secondary surfaces. Both are off by default and toggled from the
+              header's ⋯ menu: neither is part of designing, and both used to
+              take permanent height from the thing that is. */}
+          {variationsOpen && (
+            <VariationsStrip
+              variations={variations}
+              currentId={designId}
+              aspect={resolved.width / resolved.height}
+              backgroundColor={
+                typeof template.layout_definition.background_color === 'string'
+                  ? template.layout_definition.background_color
+                  : '#FFFFFF'
+              }
+              busy={busy}
+              onOpen={(id) => void navigate(designEditorPath(id))}
+              onAdd={() => void addVariation()}
+              onDuplicate={(target) => void duplicateVariation(target)}
+              onRename={(target) => void renameVariation(target)}
+              onDelete={(target) => void deleteVariation(target)}
+            />
+          )}
 
-                    {/* The real, browser-rendered PNG this design would export as —
-              a secondary sanity check now that the canvas above is the
-              primary, structural view rather than a flat image. */}
-          <details className="rounded-md border border-slate-200 bg-white">
-            <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-slate-600">
-              Compare to the actual rendered export
-            </summary>
-            <div className="space-y-2 border-t border-slate-200 p-3">
-              <SecondaryButton onClick={() => void runPreview()}>
-                {busy ? 'Rendering…' : 'Render exact preview'}
-              </SecondaryButton>
-              {preview && (
-                <div className="flex items-center justify-center rounded-md border border-slate-200 bg-slate-50 p-2">
-                  <img src={preview} alt="Rendered export preview" className="max-h-64 w-auto" />
-                </div>
-              )}
-              {previewMs !== null && (
-                <p className="text-[11px] text-slate-400">Rendered in {previewMs} ms</p>
-              )}
-            </div>
-          </details>
-
-          {/* The pre-canvas editing surface. Kept because it is still the
-              only place to work through every element in one list, but it is
-              no longer how the design is meant to be edited. */}
-          <details className="rounded-md border border-slate-200 bg-white">
-            <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-slate-600">
-              Advanced — edit every element as a list ({resolved.elements.length})
-            </summary>
-            <ul className="space-y-3 border-t border-slate-200 p-3">
-              {resolved.elements.map((element) => (
-                <ElementControls
-                  key={element.key}
-                  element={element}
-                  editableFields={editableFieldsFor(element)}
-                  override={overrideFor(element)}
-                  onChange={(field, value) => changeField(element.key, field, value)}
-                  onClear={() => clearElement(element.key)}
-                  error={errors[element.key]}
-                />
-              ))}
-            </ul>
-          </details>
-        </div>
-
-        <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          <PropertiesSidebar
-            element={selectedElement}
-            editableFields={selectedEditableFields}
-            override={overrideFor(selectedElement)}
-            onChange={(field, value) =>
-              selectedElement && changeField(selectedElement.key, field, value)
-            }
-            onCommit={commitEdits}
-            onClear={() => selectedElement && clearElement(selectedElement.key)}
-            listingPhotos={listingPhotos}
-            onPickPhoto={(imageKey, previewUrl) =>
-              selectedElement && replaceImage(selectedElement.key, imageKey, previewUrl)
-            }
-            onUploadFile={(file) =>
-              selectedElement && void uploadAndReplaceImage(selectedElement.key, file)
-            }
-            uploading={uploadingImage}
-            error={selectedElement ? errors[selectedElement.key] : undefined}
-          />
-
-          <Card title="Compliance" description="Checked against the current rule set before export.">
-            <CompliancePanel report={compliance} loading={checkingCompliance} />
-          </Card>
-
-          <Card title="Export" description="One design, every platform size.">
-            <div className="space-y-1.5">
-              {dimensions.map((option) => (
-                <label key={option.key} className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={exportDims.includes(option.key)}
-                    onChange={(event) =>
-                      setExportDims((current) =>
-                        event.target.checked
-                          ? [...current, option.key]
-                          : current.filter((key) => key !== option.key),
-                      )
-                    }
-                    className="accent-slate-900"
-                  />
-                  <span>{option.label}</span>
-                  <span className="ml-auto text-xs text-slate-400">
-                    {option.width}×{option.height}
-                  </span>
-                </label>
-              ))}
-            </div>
-
-            <div className="flex items-center gap-2">
-              {(['png', 'jpg', 'pdf'] as const).map((format) => (
+          {advancedOpen && (
+            <div className="max-h-[40vh] shrink-0 overflow-y-auto rounded-panel border border-line bg-surface">
+              <div className="sticky top-0 flex items-center gap-2 border-b border-line bg-surface px-3 py-2">
+                <span className="text-xs font-semibold text-ink">
+                  Every element as a list ({resolved.elements.length})
+                </span>
                 <button
-                  key={format}
                   type="button"
-                  onClick={() => setExportFormat(format)}
-                  className={`rounded-md px-2.5 py-1 text-xs font-medium uppercase transition ${
-                    exportFormat === format
-                      ? 'bg-slate-900 text-white'
-                      : 'text-slate-600 hover:bg-slate-100'
-                  }`}
+                  onClick={() => setAdvancedOpen(false)}
+                  className="ml-auto rounded px-1.5 text-base leading-none text-muted transition hover:bg-hover hover:text-ink"
+                  aria-label="Close the element list"
                 >
-                  {format}
+                  ×
                 </button>
-              ))}
-              <button
-                type="button"
-                disabled={busy || exportDims.length === 0}
-                onClick={() => void runExport()}
-                className="ml-auto rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-emerald-700 disabled:opacity-50"
-              >
-                Export
-              </button>
-            </div>
-          </Card>
-
-          {design.exports.length > 0 && (
-            <Card title={`Exports (${design.exports.length})`}>
-              <ul className="space-y-2 text-sm">
-                {design.exports.map((item) => (
-                  <li key={item.id} className="flex items-center gap-2">
-                    {item.image_url && (
-                      <img
-                        src={item.image_url}
-                        alt=""
-                        className="size-9 rounded border border-slate-200 object-cover"
-                      />
-                    )}
-                    <span className="min-w-0 flex-1 truncate">
-                      {item.dimension_label}
-                      <span className="ml-1 text-xs uppercase text-slate-400">
-                        {item.export_format}
-                      </span>
-                    </span>
-                    {item.image_url && (
-                      <a
-                        href={item.image_url}
-                        download
-                        className="shrink-0 text-xs font-medium text-slate-600 underline underline-offset-2 hover:text-slate-900"
-                      >
-                        Download
-                      </a>
-                    )}
-                  </li>
+              </div>
+              <ul className="space-y-3 p-3">
+                {resolved.elements.map((element) => (
+                  <ElementControls
+                    key={element.key}
+                    element={element}
+                    editableFields={editableFieldsFor(element)}
+                    override={overrideFor(element)}
+                    onChange={(field, value) => changeField(element.key, field, value)}
+                    onClear={() => clearElement(element.key)}
+                    error={errors[element.key]}
+                  />
                 ))}
               </ul>
-            </Card>
+            </div>
           )}
-        </div>
-      </div>
-      </div>
-    </div>
-  )
-}
+        </main>
 
-function SecondaryButton({
-  children,
-  onClick,
-  danger,
-}: {
-  children: React.ReactNode
-  onClick: () => void
-  danger?: boolean
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`rounded-md border px-3 py-2 text-sm font-medium transition ${
-        danger
-          ? 'border-rose-200 text-rose-600 hover:bg-rose-50'
-          : 'border-slate-300 text-slate-700 hover:bg-slate-50'
-      }`}
-    >
-      {children}
-    </button>
+        {/* Only on selection. With nothing selected there is nothing for this
+            column to say, and an empty panel is 320px of the workspace spent
+            on the words "Nothing selected". */}
+        {selectedElement && (
+          <aside className="w-[320px] shrink-0 overflow-y-auto border-l border-line bg-app p-3">
+            <PropertiesSidebar
+              element={selectedElement}
+              editableFields={selectedEditableFields}
+              override={overrideFor(selectedElement)}
+              onChange={(field, value) => changeField(selectedElement.key, field, value)}
+              onCommit={commitEdits}
+              onClear={() => clearElement(selectedElement.key)}
+              listingPhotos={listingPhotos}
+              onPickPhoto={(imageKey, previewUrl) =>
+                replaceImage(selectedElement.key, imageKey, previewUrl)
+              }
+              onUploadFile={(file) =>
+                void uploadAndReplaceImage(selectedElement.key, file)
+              }
+              uploading={uploadingImage}
+              error={errors[selectedElement.key]}
+            />
+          </aside>
+        )}
+      </div>
+
+      {exportOpen && (
+        <ExportDialog
+          designName={design.name}
+          dimensions={dimensions}
+          selected={exportDims}
+          onSelectedChange={setExportDims}
+          format={exportFormat}
+          onFormatChange={setExportFormat}
+          compliance={compliance}
+          checkingCompliance={checkingCompliance}
+          exports={design.exports}
+          busy={busy}
+          error={errors.detail ?? null}
+          onExport={() => void runExport()}
+          onClose={() => setExportOpen(false)}
+        />
+      )}
+
+      {/* The real, browser-rendered export, over the canvas rather than under
+          it: the point is to compare the two, which needs the same space. */}
+      {preview && (
+        <div
+          role="dialog"
+          aria-label="Rendered export preview"
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-slate-900/70 p-6"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setPreview(null)
+          }}
+        >
+          <img
+            src={preview}
+            alt="Rendered export preview"
+            className="max-h-[80vh] w-auto rounded-panel bg-white shadow-pop"
+          />
+          <div className="flex items-center gap-3 text-xs text-white/90">
+            {previewMs !== null && <span>Rendered in {previewMs} ms</span>}
+            <button
+              type="button"
+              onClick={() => setPreview(null)}
+              className="rounded-md border border-white/40 px-2.5 py-1 font-medium transition hover:bg-white/10"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
