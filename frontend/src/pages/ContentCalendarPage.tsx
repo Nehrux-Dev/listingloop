@@ -10,6 +10,7 @@ import {
 } from '../api/templates.ts'
 import { Alert } from '../components/FormControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
+import { designEditorPath } from '../lib/routes.ts'
 
 /**
  * The content calendar: what is coming up, and what to post about it.
@@ -61,7 +62,7 @@ export default function ContentCalendarPage() {
         listing: null,
         calendar_event: event.id,
       })
-      void navigate(`/designs/${design.id}`)
+      void navigate(designEditorPath(design.id))
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not start that design.')
       setCreating(false)

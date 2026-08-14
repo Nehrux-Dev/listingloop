@@ -1,6 +1,13 @@
 /**
  * The left rail: what you can put into the design, and what is already in it.
  *
+ * A THIN RAIL WITH A FLYOUT, NOT A SECOND COLUMN
+ * ---------------------------------------------------------------------------
+ * The icons are always there; the panel beside them is not. Clicking a tool
+ * opens it, clicking the open tool again closes it, and with everything shut
+ * the canvas has the whole workspace. That is the difference between a rail
+ * and a column: a column costs 340px whether or not you are using it.
+ *
  * Seven tools — Templates, Elements, Uploads, Text, Images, Brand, Layers.
  * Everything that adds an element goes through `POST /elements/add/`, which
  * writes to the agent's own `Design.extra_elements` and never to the
@@ -18,16 +25,18 @@
  * on what exists.
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import type { ListingPhoto } from '../../api/listings.ts'
 import type { BrandKit } from '../../api/profiles.ts'
-import type {
-  ElementType,
-  ResolvedElement,
-  TemplateDetail,
-  UploadedImage,
+import {
+  fetchTemplates,
+  type ElementType,
+  type ResolvedElement,
+  type TemplateDetail,
+  type TemplateSummary,
+  type UploadedImage,
 } from '../../api/templates.ts'
 import {
   IconArrowRight,
@@ -42,6 +51,7 @@ import {
   IconText,
   IconUpload,
 } from '../icons.tsx'
+import TemplateThumb from '../TemplateThumb.tsx'
 import LayersPanel from './LayersPanel.tsx'
 import { elementKind } from './elementKind.ts'
 
@@ -159,8 +169,9 @@ function readRecent(): ElementType[] {
 }
 
 type Props = {
-  tab: LeftPanelTab
-  onTabChange: (tab: LeftPanelTab) => void
+  /** The open tool, or null when the rail is collapsed to icons only. */
+  tab: LeftPanelTab | null
+  onTabChange: (tab: LeftPanelTab | null) => void
 
   template: TemplateDetail
   elements: ResolvedElement[]
@@ -176,6 +187,15 @@ type Props = {
   onAddElement: (kind: ElementType) => void
   adding: boolean
 
+  /** Start a new design from another template. See TemplatesTab for why this
+   *  starts one rather than swapping the current design's. */
+  onPickTemplate: (template: TemplateSummary) => void
+  /** The template being opened, so its tile can say so. */
+  pickingTemplate: number | null
+  /** Whether this design has a listing, which decides if the property
+   *  templates in the grid are usable from here. */
+  hasListing: boolean
+
   listingPhotos: ListingPhoto[]
   uploads: UploadedImage[]
   onUploadFile: (file: File) => void
@@ -187,16 +207,20 @@ type Props = {
 
 export default function LeftPanel(props: Props) {
   return (
-    <div className="flex h-full min-h-0 overflow-hidden rounded-panel border border-line bg-surface shadow-panel">
-      <nav className="flex w-[74px] shrink-0 flex-col gap-1 border-r border-line bg-subtle p-2">
+    <div className="flex h-full min-h-0 shrink-0">
+      <nav className="flex w-[74px] shrink-0 flex-col gap-1 overflow-y-auto border-r border-line bg-subtle p-2">
         {TABS.map((entry) => {
           const active = props.tab === entry.key
           return (
             <button
               key={entry.key}
               type="button"
-              onClick={() => props.onTabChange(entry.key)}
+              // Clicking the open tool closes it. The rail is a toggle, not a
+              // set of radio buttons — there has to be a way back to a bare
+              // canvas that isn't "pick the least useful panel".
+              onClick={() => props.onTabChange(active ? null : entry.key)}
               aria-pressed={active}
+              aria-expanded={active}
               className={`flex flex-col items-center gap-1 rounded-control px-1 py-2 text-[10px] font-medium transition ${
                 active
                   ? 'bg-active text-brand'
@@ -210,8 +234,14 @@ export default function LeftPanel(props: Props) {
         })}
       </nav>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        {props.tab === 'templates' && <TemplatesTab template={props.template} />}
+      <div
+        className={`flex min-h-0 min-w-0 flex-col border-r border-line bg-surface ${
+          // Templates is a grid to pick from, not a list to read, so it gets
+          // the width two columns of thumbnails actually need.
+          props.tab === 'templates' ? 'w-[344px] shrink-0' : props.tab ? 'w-[300px] shrink-0' : 'hidden'
+        }`}
+      >
+        {props.tab === 'templates' && <TemplatesTab {...props} />}
         {props.tab === 'elements' && <ElementsTab {...props} />}
         {props.tab === 'uploads' && <UploadsTab {...props} />}
         {props.tab === 'text' && <TextTab {...props} />}
@@ -568,39 +598,151 @@ function AiImageGeneratorCard() {
 
 // -- Templates ---------------------------------------------------------------
 
-function TemplatesTab({ template }: { template: TemplateDetail }) {
-  return (
-    <Scroll>
-      <div className="space-y-3">
-        <SectionHeader title="Template" />
-        <div className="rounded-control border border-line p-2.5">
-          <p className="text-[12px] font-semibold text-ink">{template.name}</p>
-          <p className="mt-0.5 text-[11px] text-muted">
-            {template.category_display} · {template.style_display}
-          </p>
-          <p className="mt-2 text-[11px] text-muted">
-            {template.elements.length} elements ·{' '}
-            {template.allows_added_elements ? 'allows added elements' : 'fixed layout'}
-          </p>
-        </div>
+/**
+ * The template grid: thumbnails to pick from, not a card describing the one
+ * you already have.
+ *
+ * PICKING ONE STARTS A DESIGN — IT DOES NOT SWAP THIS ONE'S TEMPLATE
+ * ---------------------------------------------------------------------------
+ * Every element on this canvas was copied from the current template, so
+ * changing the template under them replaces the canvas: your edits, your
+ * added elements, your moved photo, gone. That is a "start a new design"
+ * action wearing a panel's clothes, so it is labelled and behaves as one —
+ * the design you are in is left exactly as it was.
+ *
+ * The explanation for that lives on the header's help affordance rather than
+ * as a paragraph in the panel. A grid you pick from should be thumbnails
+ * top-to-bottom; prose you have already read is dead weight in the middle
+ * of it.
+ */
+function TemplatesTab({
+  template,
+  onPickTemplate,
+  pickingTemplate,
+  hasListing,
+}: Props) {
+  const [all, setAll] = useState<TemplateSummary[] | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [query, setQuery] = useState('')
 
-        {/* Deliberately not a template switcher. Every override and added
-            element is keyed to this template's elements; swapping the template
-            underneath them would discard the design's content, which is a
-            "start a new design" action, not a panel toggle. */}
-        <Hint>
-          A design keeps the template it was started from — its edits are tied to that
-          template's elements. To use a different one, start a new design.
-        </Hint>
+  useEffect(() => {
+    fetchTemplates()
+      .then((page) => setAll(page.results))
+      .catch(() => setFailed(true))
+  }, [])
+
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    if (!all) return []
+    if (!needle) return all
+    return all.filter((entry) =>
+      `${entry.name} ${entry.category_display} ${entry.style_display}`
+        .toLowerCase()
+        .includes(needle),
+    )
+  }, [all, query])
+
+  return (
+    <>
+      <div className="space-y-2.5 border-b border-line p-3">
+        <SectionHeader
+          title="Templates"
+          action={
+            <span
+              tabIndex={0}
+              role="note"
+              title={
+                'A design keeps the template it was started from — its elements were ' +
+                'copied from it. Picking another one here starts a new design and ' +
+                'leaves this one untouched.'
+              }
+              className="flex size-4 cursor-help items-center justify-center rounded-full bg-subtle text-[9px] font-bold text-muted transition hover:bg-hover hover:text-ink"
+            >
+              ?
+            </span>
+          }
+        />
+        <div className="relative">
+          <IconSearch className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search templates..."
+            className="w-full rounded-control border border-line bg-subtle py-2 pl-8 pr-2.5 text-[12px] outline-none transition placeholder:text-muted focus:border-brand focus:bg-surface"
+          />
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {failed && <Hint>Could not load the template library.</Hint>}
+        {!all && !failed && <Hint>Loading…</Hint>}
+
+        {all && visible.length === 0 && (
+          <p className="rounded-control border border-dashed border-line bg-subtle px-3 py-6 text-center text-[11px] text-muted">
+            {query ? `Nothing matches “${query}”.` : 'No templates yet.'}
+          </p>
+        )}
+
+        {visible.length > 0 && (
+          <ul className="grid grid-cols-2 gap-2">
+            {visible.map((entry) => {
+              const current = entry.id === template.id
+              const blocked = entry.requires_listing && !hasListing
+              return (
+                <li key={entry.id}>
+                  <button
+                    type="button"
+                    disabled={current || blocked || pickingTemplate !== null}
+                    onClick={() => onPickTemplate(entry)}
+                    title={
+                      current
+                        ? 'This design is built on this template'
+                        : blocked
+                          ? 'This template describes a property. Attach a listing to use it.'
+                          : `Start a new design from ${entry.name}`
+                    }
+                    className={`w-full overflow-hidden rounded-control border text-left transition disabled:cursor-not-allowed ${
+                      current
+                        ? 'border-brand ring-1 ring-brand/40'
+                        : 'border-line hover:border-brand/50 hover:shadow-panel disabled:opacity-50'
+                    }`}
+                  >
+                    <TemplateThumb template={entry} className="h-20" showStyleLabel={false}>
+                      {current && (
+                        <span className="absolute left-1.5 top-1.5 rounded bg-brand px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white">
+                          Current
+                        </span>
+                      )}
+                      {pickingTemplate === entry.id && (
+                        <span className="absolute inset-0 flex items-center justify-center bg-white/80 text-[10px] font-semibold text-ink">
+                          Opening…
+                        </span>
+                      )}
+                    </TemplateThumb>
+                    <div className="p-2">
+                      <p className="truncate text-[11px] font-semibold text-ink">{entry.name}</p>
+                      <span className="mt-1 inline-block rounded-full bg-subtle px-1.5 py-0.5 text-[9px] font-medium text-muted">
+                        {entry.category_display}
+                      </span>
+                    </div>
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+
+      <div className="border-t border-line p-3">
         <Link
           to="/templates"
           className="inline-flex items-center gap-1.5 rounded-control border border-line px-2.5 py-1.5 text-[12px] font-medium text-ink transition hover:bg-hover"
         >
-          Browse template library
+          Open the full library
           <IconArrowRight className="size-3.5 text-muted" />
         </Link>
       </div>
-    </Scroll>
+    </>
   )
 }
 
@@ -881,8 +1023,8 @@ export function isImageElement(element: ResolvedElement | null): boolean {
   return element !== null && elementKind(element) === 'image'
 }
 
-/** Tracks which tool is open, defaulting to Layers — the tool that describes
- *  what is already there rather than what could be added. */
-export function useLeftPanelTab(initial: LeftPanelTab = 'layers') {
-  return useState<LeftPanelTab>(initial)
+/** Tracks which tool is open. Nothing, by default: the editor opens on the
+ *  design, and every panel is one click away on the rail. */
+export function useLeftPanelTab(initial: LeftPanelTab | null = null) {
+  return useState<LeftPanelTab | null>(initial)
 }

@@ -22,6 +22,7 @@ compliance says the shape is right, not that the contents are true. That is
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
@@ -111,16 +112,33 @@ def _build_client():
 
 
 def complete_json(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     schema: dict[str, Any],
     *,
     schema_name: str = "listing_caption",
     model: str | None = None,
     temperature: float | None = None,
+    max_output_tokens: int | None = None,
+    timeout: float | None = None,
 ) -> CompletionResult:
-    """Call the API and return the parsed JSON object plus usage."""
+    """Call the API and return the parsed JSON object plus usage.
+
+    ``messages`` follows the provider's own shape, so a message's ``content``
+    may be a plain string or a list of parts — which is how an image is
+    attached. See ``image_part``.
+
+    ``max_output_tokens`` and ``timeout`` default to the caption-sized settings.
+    They are arguments rather than fixed reads because the jobs sharing this
+    function are not the same size: a caption is a paragraph, a template
+    extraction is several hundred numbers, and one budget cannot be right for
+    both without being wrong for one of them.
+    """
     client = _build_client()
     model = model or settings.OPENAI_MODEL
+    if timeout is not None:
+        # `with_options` returns a configured copy; mutating the shared client
+        # would leak a long timeout into every later caption call.
+        client = client.with_options(timeout=timeout)
 
     started = time.monotonic()
     try:
@@ -130,7 +148,7 @@ def complete_json(
             temperature=(
                 settings.OPENAI_TEMPERATURE if temperature is None else temperature
             ),
-            max_tokens=settings.OPENAI_MAX_OUTPUT_TOKENS,
+            max_tokens=max_output_tokens or settings.OPENAI_MAX_OUTPUT_TOKENS,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -180,3 +198,23 @@ def complete_json(
         total_tokens=getattr(usage, "total_tokens", 0) or 0,
         duration_ms=duration_ms,
     )
+
+
+def image_part(png_bytes: bytes, *, detail: str = "high") -> dict[str, Any]:
+    """One image, as a message content part.
+
+    Inlined as a data URI rather than passed as a URL. A URL would mean the
+    provider fetching from us, which requires the file to be publicly reachable
+    — and template artwork sits behind the same auth as everything else. The
+    bytes go out over the same TLS connection as the prompt instead.
+
+    ``detail="high"`` is not the default for a cost reason on the provider's
+    side, and is non-negotiable here: at low detail the image is downsampled to
+    a thumbnail, and a model asked to measure element geometry against a
+    thumbnail returns numbers that look precise and are not.
+    """
+    encoded = base64.b64encode(png_bytes).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{encoded}", "detail": detail},
+    }

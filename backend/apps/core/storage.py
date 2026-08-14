@@ -99,6 +99,27 @@ def template_asset_upload_to(instance, filename: str) -> str:
     return build_upload_key("templates/assets", filename)
 
 
+def template_import_upload_to(instance, filename: str) -> str:
+    """Storage key for the artwork a template was imported from.
+
+    The original upload, kept exactly as it arrived. Retained after the import
+    finishes rather than deleted: it is the only evidence of what the extractor
+    was actually looking at, so a template whose geometry came out wrong can be
+    re-imported without the user having to find the file again.
+    """
+    return build_upload_key("templates/imports", filename)
+
+
+def template_source_page_upload_to(instance, filename: str) -> str:
+    """Storage key for the rasterised page an import was extracted from.
+
+    A PNG of the source artwork at render resolution. It is what the gallery
+    shows as the template's thumbnail — the one place in the product where a
+    template has a real picture of itself rather than a coloured swatch.
+    """
+    return build_upload_key("templates/sources", filename)
+
+
 def delete_stored_file(file_field) -> None:
     """Delete the file behind a ``FieldFile``, if any, via the storage API.
 

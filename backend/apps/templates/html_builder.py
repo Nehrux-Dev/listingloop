@@ -52,6 +52,30 @@ SAFE_FONT_STACK = (
     "'DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Helvetica Neue', Arial, sans-serif"
 )
 
+#: What each ``font_family`` role resolves to. The roles are the vocabulary a
+#: template speaks (see ``document.FONT_FAMILIES``); these stacks are the only
+#: place a real family name appears, and every family named here is installed
+#: by renderer/Dockerfile.
+#:
+#: ``display`` is condensed on purpose. Artwork imported from a real flyer is
+#: almost always set in a narrow display face, and laying that headline out in
+#: a normal-width family reflows it onto an extra line or two — which reads as
+#: broken geometry rather than as a missing font.
+FONT_STACKS: dict[str, str] = {
+    "body": SAFE_FONT_STACK,
+    "display": (
+        "'Roboto Condensed', 'Liberation Sans Narrow', 'DejaVu Sans Condensed', "
+        + SAFE_FONT_STACK
+    ),
+    "serif": "'Liberation Serif', 'DejaVu Serif', Georgia, serif",
+    "mono": "'Liberation Mono', 'DejaVu Sans Mono', monospace",
+}
+
+
+def font_stack(style: dict) -> str:
+    """The CSS font stack for one element. Unknown roles fall back to body."""
+    return FONT_STACKS.get(str(style.get("font_family") or "body"), SAFE_FONT_STACK)
+
 
 def _format_value(value: Any, fmt: str | None) -> str:
     if value is None:
@@ -122,22 +146,41 @@ def resolve_content(element: dict, context: dict, images: dict) -> Any:
 
     Order of precedence, and the reasoning for it:
 
-      1. A resolved image for this element id — the caller turned a storage key
-         into a data URI, because only it has storage access.
-      2. The element's bound/sourced value, when it has one and the agent has
+      1. The element's bound/sourced value, when it has one and the agent has
          not typed over it. This is what makes a price correction reach every
          design that shows the price.
+      2. A resolved image for this element id — the caller turned a storage key
+         into a data URI, because only it has storage access.
       3. The element's own stored content, interpolated — the agent's words,
          or the template's default text where they never changed it.
+
+    IMAGES: WHY THE BINDING OUTRANKS THE STORED KEY
+    ---------------------------------------------------------------------
+    An imported template carries a crop of the source artwork in every photo
+    slot, *and* a binding to ``listing.photos[n]``. The crop is there so the
+    design opens looking like the flyer it came from instead of showing empty
+    boxes; the binding is there so attaching a property fills it with that
+    property's own photographs. Only one of them can be right at a time, and
+    it is the binding — a marketing asset that keeps showing stock artwork
+    after a real listing was attached is the failure that actually reaches a
+    client.
+
+    The agent's own choice still wins over both: replacing an image sets
+    ``manually_overridden``, which takes the binding out of the running and
+    leaves their pick as the stored key.
     """
     element_type = element.get("type", "")
     stored = element.get("content") or ""
 
     if carries_image(element_type, stored):
+        if element.get("content_source") and not element.get("manually_overridden"):
+            bound = resolve_path(context, element["content_source"])
+            if bound not in (None, "", []):
+                return bound
+            # No listing attached, or that slot is empty: fall through to the
+            # template's baked artwork rather than rendering a hole.
         if element["id"] in images:
             return images[element["id"]]
-        if element.get("content_source") and not element.get("manually_overridden"):
-            return resolve_path(context, element["content_source"])
         return None
 
     if element.get("content_source") and not element.get("manually_overridden"):
@@ -184,6 +227,29 @@ def type_scale_reference(dimension: Dimension) -> float:
     ratio, which is the property that actually matters.
     """
     return float(min(dimension.width, dimension.height))
+
+
+def _clip_path(points: Any) -> str:
+    """``clip-path`` for an element whose visible edge is not its box.
+
+    Angled and chevron photo edges are ordinary in property flyers, and this is
+    what lets an imported one keep its shape — including after the agent drops
+    a different photograph into the slot, which a shape baked into the image's
+    own alpha channel could never survive.
+
+    The CSS is assembled here from numbers that ``document._validate_clip_polygon``
+    has already proved are numbers. Nothing string-shaped from an element ever
+    reaches this property: ``clip-path`` takes a function, and a function is
+    somewhere a crafted string could hide a ``url(...)`` and make the renderer
+    fetch from a host the user chose.
+    """
+    if not isinstance(points, (list, tuple)) or len(points) < 6 or len(points) % 2:
+        return ""
+    pairs = [
+        f"{float(points[index]):.3f}% {float(points[index + 1]):.3f}%"
+        for index in range(0, len(points), 2)
+    ]
+    return f"clip-path:polygon({','.join(pairs)})"
 
 
 def _image_framing(style: dict) -> str:
@@ -250,6 +316,9 @@ def element_html(element: dict, context: dict, dimension: Dimension, images: dic
         css.append(f"opacity:{float(style['opacity'])}")
     if style.get("background_gradient"):
         css.append(f"background-image:{style['background_gradient']}")
+    clip = _clip_path(style.get("clip_polygon"))
+    if clip:
+        css.append(clip)
     # A border is only drawn when it has a real width — a colour on its own
     # would silently do nothing, and `border-style:solid` with width 0 is a
     # no-op that still costs a CSS declaration. Width scales with the canvas
@@ -314,7 +383,7 @@ def element_html(element: dict, context: dict, dimension: Dimension, images: dic
             f"font-style:{style.get('font_style', 'normal')}",
             f"line-height:{style.get('line_height', 1.2)}",
             f"color:{_resolve_color(style.get('color', '#000000'), context)}",
-            f"font-family:{SAFE_FONT_STACK}",
+            f"font-family:{font_stack(style)}",
         ]
     )
     if style.get("letter_spacing_em"):

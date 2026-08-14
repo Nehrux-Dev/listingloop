@@ -42,6 +42,10 @@ const ZOOM_STEPS = [25, 50, 75, 100, 125, 150, 200]
 const MIN_ZOOM = ZOOM_STEPS[0]
 const MAX_ZOOM = ZOOM_STEPS[ZOOM_STEPS.length - 1]
 
+/** Total breathing room the fit calculation leaves around the design, in
+ *  screen pixels. Matches the mat's `p-5` on both sides. */
+const MAT_PADDING = 40
+
 /** On-screen pixels, converted to canvas-frame by dividing by the current
  *  zoom scale — keeps the "feel" of snapping constant across zoom levels
  *  rather than snapping too eagerly zoomed-out or barely at all zoomed-in. */
@@ -197,10 +201,21 @@ export default function Canvas({
     const id = window.requestAnimationFrame(() => {
       const container = containerRef.current
       if (container) {
-        // Leave a little breathing room rather than butting the design
-        // against the panel edge.
-        const available = container.clientWidth - 32
-        const pct = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (available / design.width) * 100))
+        // Both axes, not just the width. Fitting the width alone opens a
+        // 1080x1920 Story scaled to the panel's width and running a screen
+        // and a half off the bottom — which reads as "it opened zoomed in",
+        // because it did. The tighter of the two ratios is the one that puts
+        // the whole design on screen.
+        //
+        // MAT_PADDING is subtracted so the design has breathing room rather
+        // than butting against the panel edges.
+        const availableWidth = container.clientWidth - MAT_PADDING
+        const availableHeight = container.clientHeight - MAT_PADDING
+        const ratio = Math.min(
+          availableWidth / design.width,
+          availableHeight / design.height,
+        )
+        const pct = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, ratio * 100))
         onZoomChangeRef.current(Math.round(pct))
       }
       setAutoFitted(true)

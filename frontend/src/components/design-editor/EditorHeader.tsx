@@ -58,6 +58,14 @@ type Props = {
   onRename: () => void
   onDuplicate: () => void
   onDelete: () => void
+
+  /** The secondary surfaces. They used to be stacked under the canvas, where
+   *  they competed with the design for the workspace; they are drawers now,
+   *  and this menu is how you get at them. */
+  variationsOpen: boolean
+  onToggleVariations: () => void
+  advancedOpen: boolean
+  onToggleAdvanced: () => void
 }
 
 /** "2 minutes ago" — precise enough to reassure, vague enough to stay true
@@ -94,6 +102,10 @@ export default function EditorHeader({
   onRename,
   onDuplicate,
   onDelete,
+  variationsOpen,
+  onToggleVariations,
+  advancedOpen,
+  onToggleAdvanced,
 }: Props) {
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -237,9 +249,16 @@ export default function EditorHeader({
           </button>
 
           {menuOpen && (
-            <div className="absolute right-0 top-full z-30 mt-1.5 w-44 overflow-hidden rounded-panel border border-line bg-surface py-1 shadow-pop">
+            <div className="absolute right-0 top-full z-30 mt-1.5 w-56 overflow-hidden rounded-panel border border-line bg-surface py-1 shadow-pop">
               <MenuItem onClick={() => { setMenuOpen(false); onRename() }}>Rename…</MenuItem>
               <MenuItem onClick={() => { setMenuOpen(false); onDuplicate() }}>Duplicate</MenuItem>
+              <div className="my-1 h-px bg-line" />
+              <MenuItem checked={variationsOpen} onClick={() => { setMenuOpen(false); onToggleVariations() }}>
+                Variations
+              </MenuItem>
+              <MenuItem checked={advancedOpen} onClick={() => { setMenuOpen(false); onToggleAdvanced() }}>
+                Every element as a list
+              </MenuItem>
               <div className="my-1 h-px bg-line" />
               <MenuItem danger onClick={() => { setMenuOpen(false); onDelete() }}>
                 Delete design
@@ -321,20 +340,29 @@ function HeaderIconButton({
 function MenuItem({
   onClick,
   danger,
+  checked,
   children,
 }: {
   onClick: () => void
   danger?: boolean
+  /** Present on the entries that toggle a drawer, so the menu says whether
+   *  the thing is currently showing rather than only how to show it. */
+  checked?: boolean
   children: React.ReactNode
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`block w-full px-3 py-2 text-left text-[13px] font-medium transition hover:bg-hover ${
+      role={checked === undefined ? undefined : 'menuitemcheckbox'}
+      aria-checked={checked}
+      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] font-medium transition hover:bg-hover ${
         danger ? 'text-danger' : 'text-ink'
       }`}
     >
+      {checked !== undefined && (
+        <span className={`w-3 shrink-0 text-brand ${checked ? '' : 'opacity-0'}`}>✓</span>
+      )}
       {children}
     </button>
   )

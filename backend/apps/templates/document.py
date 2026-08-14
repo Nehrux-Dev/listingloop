@@ -281,6 +281,16 @@ GRADIENT_RE = re.compile(
 )
 
 FONT_WEIGHTS = {"300", "400", "500", "600", "700", "800", "900"}
+
+#: Type *roles*, not family names. A template says "this is display type" and
+#: ``html_builder.FONT_STACKS`` decides which installed family that is.
+#:
+#: Naming families directly was the alternative and is worse in both
+#: directions: a family the renderer does not have falls back to whatever
+#: fontconfig picks, so the export silently disagrees with the editor; and an
+#: arbitrary string is one more value being interpolated into a ``style``
+#: attribute. Four roles cover what a property flyer actually uses.
+FONT_FAMILIES = {"body", "display", "serif", "mono"}
 TEXT_ALIGNMENTS = {"left", "center", "right"}
 VERTICAL_ALIGNMENTS = {"flex-start", "center", "flex-end"}
 FONT_STYLES = {"normal", "italic"}
@@ -316,6 +326,7 @@ NUMERIC_STYLE_RANGES: dict[str, tuple[float, float]] = {
 
 STRING_STYLE_CHOICES: dict[str, set[str]] = {
     "font_weight": FONT_WEIGHTS,
+    "font_family": FONT_FAMILIES,
     "text_align": TEXT_ALIGNMENTS,
     "vertical_align": VERTICAL_ALIGNMENTS,
     "font_style": FONT_STYLES,
@@ -330,13 +341,18 @@ COLOR_STYLE_FIELDS = frozenset(
     {"color", "background_color", "border_color", "tint_color"}
 )
 
+#: A polygon needs at least a triangle; past a few dozen vertices it is
+#: tracing noise rather than describing a cut edge, and every vertex is more
+#: CSS for the renderer to parse.
+MIN_CLIP_POINTS, MAX_CLIP_POINTS = 3, 64
+
 #: Everything an element's ``style`` may contain. A key not listed is dropped
 #: rather than rejected — see ``_validate_style``.
 STYLE_FIELDS = (
     frozenset(NUMERIC_STYLE_RANGES)
     | frozenset(STRING_STYLE_CHOICES)
     | COLOR_STYLE_FIELDS
-    | frozenset({"background_gradient", "format"})
+    | frozenset({"background_gradient", "format", "clip_polygon"})
 )
 
 
@@ -440,6 +456,8 @@ def _validate_style(key: str, raw: Any) -> dict:
                     % {"field": field, "options": ", ".join(sorted(options))},
                 )
             clean[field] = str(value)
+        elif field == "clip_polygon":
+            clean[field] = _validate_clip_polygon(key, value)
         elif field == "background_gradient":
             text = str(value).strip()
             if not GRADIENT_RE.match(text):
@@ -453,6 +471,40 @@ def _validate_style(key: str, raw: Any) -> dict:
             clean[field] = str(value)
 
     return clean
+
+
+def _validate_clip_polygon(key: str, raw: Any) -> list[float]:
+    """A cut edge, as percentages of the element's own box.
+
+    Stored as a flat ``[x1, y1, x2, y2, ...]`` list of plain numbers and
+    *never* as a CSS string. That is the whole point: ``clip-path`` takes a
+    function, and a function is a place a string could smuggle a ``url(...)``
+    into the renderer — the same hole ``background_gradient`` is matched whole
+    against a grammar to close. Numbers cannot express a URL, so
+    ``html_builder`` formats the polygon itself and there is nothing to
+    sanitise.
+
+    Percentages rather than pixels because everything else about an element's
+    geometry is a fraction of its box, and a shape measured in pixels would
+    stop matching its element the moment the canvas changed size.
+    """
+    if not isinstance(raw, (list, tuple)):
+        _fail(key, _("clip_polygon must be a list of numbers."))
+    if len(raw) % 2:
+        _fail(key, _("clip_polygon needs an x and a y for every point."))
+    if not (MIN_CLIP_POINTS * 2 <= len(raw) <= MAX_CLIP_POINTS * 2):
+        _fail(
+            key,
+            _("clip_polygon must have between %(low)s and %(high)s points.")
+            % {"low": MIN_CLIP_POINTS, "high": MAX_CLIP_POINTS},
+        )
+
+    points: list[float] = []
+    for value in raw:
+        # Generously bounded rather than clamped to 0..100: a cut edge may run
+        # outside the element's box, and CSS handles that fine.
+        points.append(_validate_number(key, "clip_polygon", value, -1000.0, 1000.0))
+    return points
 
 
 def _validate_transform(key: str, raw: Any) -> dict:
@@ -523,10 +575,18 @@ def element_from_template(element, index: int = 0) -> dict:
     # Static graphics stop being a special type here: the template's own asset
     # is copied in as ordinary image content, so nothing downstream needs a
     # branch for it. See TYPE_FROM_TEMPLATE.
+    #
+    # Any image-carrying element may bring an asset across, not only a static
+    # graphic. That is what an imported template needs: the photo region cut
+    # out of the source artwork is copied in as content, so a design opens
+    # looking like the flyer it came from — while `content_source` still points
+    # at listing.photos[n], so attaching a property replaces it. The asset is
+    # the floor, not the ceiling; see html_builder.resolve_content for which
+    # of the two wins.
     content = ""
-    if element.element_type == ElementType.STATIC_GRAPHIC:
+    if carries_image(element_type, None) or element.element_type == ElementType.STATIC_GRAPHIC:
         content = element.static_asset.name if element.static_asset else ""
-    elif not carries_image(element_type, None):
+    else:
         content = element.default_content or ""
 
     return {

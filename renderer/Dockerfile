@@ -8,9 +8,17 @@ WORKDIR /app
 
 # Fonts must be installed here, not in Django: this is the process that lays
 # out text, and a missing family means the wrong glyphs in every export.
+#
+# `fonts-roboto` earns its place beyond the defaults. Templates imported from
+# real artwork are set in the faces designers actually use, and a headline
+# measured against a condensed face reflows into three lines when it is laid
+# out in DejaVu Sans — which is wider than almost anything a flyer is set in.
+# Roboto ships a Condensed cut, so the two shapes that matter (a normal body
+# face and a narrow display one) are both covered. See html_builder.FONT_STACKS
+# for the families a template is allowed to name.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        fonts-dejavu-core fonts-liberation2 ca-certificates curl \
+        fonts-dejavu-core fonts-liberation2 fonts-roboto ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json ./

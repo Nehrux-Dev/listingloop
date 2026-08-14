@@ -23,9 +23,20 @@ const STATUS_STYLE: Record<string, string> = {
 export function CompliancePanel({
   report,
   loading,
+  collapsible,
 }: {
   report: ComplianceReport | null
   loading?: boolean
+  /**
+   * Show the one-line verdict, and put the per-rule detail behind a
+   * disclosure.
+   *
+   * For the export dialog, where the summary is what the decision turns on
+   * ("1 warning — you can still export") and the rule-by-rule breakdown is
+   * what you read only if that sentence gives you pause. The badge popover
+   * leaves this off: it was opened precisely to see the detail.
+   */
+  collapsible?: boolean
 }) {
   if (loading) {
     return <p className="text-xs text-slate-500">Checking compliance…</p>
@@ -35,29 +46,11 @@ export function CompliancePanel({
   const failures = report.results.filter((result) => result.status === 'fail')
   const ruleErrors = report.results.filter((result) => result.status === 'rule_error')
   const passed = report.results.filter((result) => result.status === 'pass').length
+  const hasDetail =
+    failures.length > 0 || ruleErrors.length > 0 || report.used_placeholder_rules
 
-  return (
-    <div className="space-y-2">
-      <div className={`rounded-md border px-3 py-2 text-sm ${STATUS_STYLE[report.status]}`}>
-        {report.status === 'passed' && (
-          <span>All {passed} compliance checks passed.</span>
-        )}
-        {report.status === 'flagged' && (
-          <span>
-            {report.warning_count} warning{report.warning_count === 1 ? '' : 's'} — you
-            can still export.
-          </span>
-        )}
-        {report.status === 'failed' && (
-          <span>
-            <strong>
-              {report.error_count} issue{report.error_count === 1 ? '' : 's'} must be
-              fixed before this can be exported.
-            </strong>
-          </span>
-        )}
-      </div>
-
+  const detail = (
+    <>
       {failures.length > 0 && (
         <ul className="space-y-1.5">
           {failures.map((result) => (
@@ -85,6 +78,43 @@ export function CompliancePanel({
           review.
         </p>
       )}
+    </>
+  )
+
+  return (
+    <div className="space-y-2">
+      <div className={`rounded-md border px-3 py-2 text-sm ${STATUS_STYLE[report.status]}`}>
+        {report.status === 'passed' && (
+          <span>All {passed} compliance checks passed.</span>
+        )}
+        {report.status === 'flagged' && (
+          <span>
+            {report.warning_count} warning{report.warning_count === 1 ? '' : 's'} — you
+            can still export.
+          </span>
+        )}
+        {report.status === 'failed' && (
+          <span>
+            <strong>
+              {report.error_count} issue{report.error_count === 1 ? '' : 's'} must be
+              fixed before this can be exported.
+            </strong>
+          </span>
+        )}
+      </div>
+
+      {hasDetail &&
+        (collapsible ? (
+          <details className="group">
+            <summary className="cursor-pointer select-none text-[11px] font-medium text-slate-600 underline underline-offset-2 hover:text-slate-900">
+              <span className="group-open:hidden">Show detail</span>
+              <span className="hidden group-open:inline">Hide detail</span>
+            </summary>
+            <div className="mt-2 space-y-2">{detail}</div>
+          </details>
+        ) : (
+          detail
+        ))}
     </div>
   )
 }

@@ -167,8 +167,8 @@ export function AiContentPanel({
     return (
       <Card title="AI caption">
         <p className="text-sm text-slate-500">
-          Verify this listing first. Copy is only generated from facts an agent has
-          confirmed.
+          Confirm this listing's details first. Copy is only generated from facts
+          you have confirmed yourself.
         </p>
       </Card>
     )

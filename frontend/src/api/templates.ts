@@ -209,9 +209,17 @@ export type TemplateSummary = {
   style: TemplateStyle
   style_display: string
   element_count: number
-  /** False for seasonal and agent-led templates — those need no property. */
+  /** False for seasonal and agent-led templates — those need no property —
+   *  and for anything you imported, whatever its category: your own artwork
+   *  carries its own words and pictures, so it opens without one. */
   requires_listing: boolean
   is_seasonal: boolean
+  /** True for a template you imported from your own artwork. The shared
+   *  Nehrux library is false, and is not yours to remove. */
+  is_imported: boolean
+  /** The rasterised source page for an imported template — a real picture of
+   *  the design, not a style swatch. Null for library templates. */
+  source_image_url: string | null
   /** Whether the editor offers to add new elements. A hint about how the
    *  layout is meant to be used, not a restriction on the elements a design
    *  already has — those are the agent's to change. */
@@ -256,7 +264,13 @@ export function fetchEventTemplates(
 }
 
 export type Facet = { value: string; label: string; count: number }
-export type TemplateFacets = { categories: Facet[]; styles: Facet[] }
+export type TemplateFacets = {
+  /** Occasion: New Listing, Just Sold, Diwali, ... */
+  categories: Facet[]
+  styles: Facet[]
+  /** The format each template was composed for — Instagram Post, Story, ... */
+  dimensions: Facet[]
+}
 
 /** Matches ExportFormat on the backend. PDF goes through a different
  *  Chromium pipeline in the renderer (page.pdf, not page.screenshot) but is
@@ -397,6 +411,58 @@ export function fetchTemplate(id: number): Promise<TemplateDetail> {
 
 export function fetchTemplateFacets(): Promise<TemplateFacets> {
   return apiRequest<TemplateFacets>('/api/templates/facets/')
+}
+
+// -- importing artwork into a template ---------------------------------------
+
+export type ImportStatus = 'queued' | 'running' | 'succeeded' | 'failed'
+
+/**
+ * One attempt at turning an uploaded PDF or image into a template.
+ *
+ * The upload returns this immediately with `status: 'queued'` — extraction is
+ * a minute-scale vision call that runs on a worker, so the request cannot wait
+ * for it. Poll until `is_finished`, then read `template_detail`.
+ */
+export type TemplateImport = {
+  id: number
+  original_filename: string
+  status: ImportStatus
+  status_display: string
+  /** True once the job reached `succeeded` or `failed` — stop polling. */
+  is_finished: boolean
+  /** Written to be shown to the user as-is. Empty unless status is 'failed'. */
+  error: string
+  template: number | null
+  /** The finished template, inline, so the grid needs no second request at
+   *  the moment it has something new to show. */
+  template_detail: TemplateSummary | null
+  element_count: number
+  created_at: string
+  finished_at: string | null
+}
+
+/** Start an import. Resolves as soon as the file is stored and queued. */
+export function importTemplate(input: {
+  file: File
+  name?: string
+  category: TemplateCategory
+  style: TemplateStyle
+}): Promise<TemplateImport> {
+  const body = new FormData()
+  body.append('file', input.file)
+  if (input.name) body.append('name', input.name)
+  body.append('category', input.category)
+  body.append('style', input.style)
+  return apiRequest<TemplateImport>('/api/template-imports/', { method: 'POST', body })
+}
+
+export function fetchTemplateImport(id: number): Promise<TemplateImport> {
+  return apiRequest<TemplateImport>(`/api/template-imports/${id}/`)
+}
+
+export function fetchTemplateImports(): Promise<Paginated<TemplateImport>> {
+  return apiRequest<Paginated<TemplateImport>>('/api/template-imports/')
 }
 
 export function fetchRenderDimensions(): Promise<RenderDimension[]> {
@@ -636,7 +702,12 @@ function applyOverride(element: DesignElement, override: Record<string, unknown>
     else if (field === 'hidden') next.visible = !value
     else if (field === 'text' || field === 'image_key') {
       next.content = String(value)
-      next.manually_overridden = field === 'text' && Boolean(next.bound_to)
+      // Both count as typing over the binding. `image_key` has to, now that a
+      // bound photo slot can also carry the template's own baked artwork: the
+      // server resolves a live binding ahead of any stored key, so without
+      // this flag an agent's chosen photo would be replaced by the listing's
+      // on the very next render. See html_builder.resolve_content.
+      next.manually_overridden = Boolean(next.bound_to)
     } else {
       next.style = { ...next.style, [field]: value }
     }

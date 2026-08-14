@@ -1,7 +1,7 @@
 """Template library and design endpoints.
 
     /api/templates/                 browse the library (read-only, filterable)
-    /api/templates/facets/          category and style options for the filters
+    /api/templates/facets/          category, style and format options + counts
     /api/designs/                   CRUD
     /api/designs/{id}/duplicate/    copy
     /api/designs/{id}/rename/       rename
@@ -21,13 +21,16 @@ from django.conf import settings
 from django.core.files.storage import default_storage
 from django.db.models import Count, QuerySet
 from django.utils import timezone
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
+from apps.accounts.models import AgentProfile
 from apps.core.storage import build_upload_key
 from apps.templates.document import (
     BLANK_ELEMENTS,
@@ -43,11 +46,14 @@ from apps.templates.models import (
     Design,
     DesignExport,
     ExportFormat,
+    ImportStatus,
     Template,
     TemplateCategory,
+    TemplateImport,
     TemplateStyle,
 )
 from apps.templates.permissions import DesignPermission
+from apps.templates.tasks import import_template_artwork
 from apps.templates.render_context import build_context, resolve_path
 from apps.templates.rendering import (
     describe_design_for_editor,
@@ -63,10 +69,27 @@ from apps.templates.serializers import (
     DesignRenameSerializer,
     DesignSerializer,
     TemplateDetailSerializer,
+    TemplateImportCreateSerializer,
+    TemplateImportSerializer,
     TemplateListSerializer,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TemplateLibraryPagination(PageNumberPagination):
+    """A gallery's page, not a record list's.
+
+    The project default of 25 suits rows an agent reads one at a time. The
+    template library is scanned a screenful at a time in a four-column grid,
+    where 25 is two and a bit rows — paging that often turns browsing into
+    clicking. Still bounded: `max_page_size` stops a crafted `page_size` from
+    asking for the whole table.
+    """
+
+    page_size = 60
+    page_size_query_param = "page_size"
+    max_page_size = 120
 
 
 class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
@@ -78,6 +101,7 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [IsAuthenticated]
+    pagination_class = TemplateLibraryPagination
 
     def get_serializer_class(self):
         return (
@@ -87,16 +111,47 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def get_queryset(self) -> QuerySet[Template]:
-        queryset = Template.objects.filter(is_active=True).prefetch_related("elements")
+        # `visible_to` is what keeps one agent's imported artwork out of every
+        # other agent's gallery. The shared Nehrux library (owner IS NULL) is
+        # visible to all; an import belongs to whoever uploaded it.
+        queryset = (
+            Template.objects.visible_to(self.request.user)
+            .filter(is_active=True)
+            .prefetch_related("elements")
+        )
 
         params = self.request.query_params
-        category = params.get("category")
-        if category in TemplateCategory.values:
-            queryset = queryset.filter(category=category)
 
-        style = params.get("style")
-        if style in TemplateStyle.values:
-            queryset = queryset.filter(style=style)
+        def chosen(name: str, allowed: list[str]) -> list[str]:
+            """Comma-separated values, filtered to ones that exist.
+
+            Multi-value because the library's filters are checkboxes: an
+            agent narrowing to "Just Sold or Open House" is one question, and
+            answering it with two requests the client then has to merge would
+            get the counts and the paging wrong.
+
+            A single value is still a single value, so callers written before
+            this are unaffected. Unknown values are dropped rather than
+            rejected — a stale bookmark should show the library, not a 400.
+            """
+            raw = params.get(name, "")
+            return [value for value in raw.split(",") if value in allowed]
+
+        categories = chosen("category", TemplateCategory.values)
+        if categories:
+            queryset = queryset.filter(category__in=categories)
+
+        styles = chosen("style", TemplateStyle.values)
+        if styles:
+            queryset = queryset.filter(style__in=styles)
+
+        # The format the template was composed for. Agents browse by "what am
+        # I posting this to" at least as often as by occasion, and that is a
+        # different axis from `category` — a Just Sold exists as a Post and as
+        # a Story.
+        dimensions = chosen("dimension", list(SOCIAL_DIMENSIONS))
+        if dimensions:
+            queryset = queryset.filter(default_dimension__in=dimensions)
 
         search = params.get("search")
         if search:
@@ -111,33 +166,163 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
             queryset = queryset.exclude(category__in=SEASONAL_CATEGORIES)
 
         if params.get("no_listing_required") == "true":
-            queryset = queryset.exclude(category__in=LISTING_CATEGORIES)
+            # Must mirror Template.requires_listing, which exempts imported
+            # templates whatever their category — see that property for why.
+            # Expressed as a query rather than reusing it because this filters
+            # in the database, so the two have to be kept in step by hand: an
+            # import left out here would be openable everywhere except the one
+            # list that exists to name what is openable.
+            queryset = queryset.exclude(
+                category__in=LISTING_CATEGORIES, owner__isnull=True
+            )
 
         return queryset
 
     @action(detail=False, methods=["get"], url_path="facets")
     def facets(self, request: Request) -> Response:
-        """Filter options, with counts, so the UI need not hardcode them."""
-        active = Template.objects.filter(is_active=True)
+        """Filter options, with counts, so the UI need not hardcode them.
+
+        Every option is listed whether or not anything matches it, including
+        the zeroes — the caller decides whether to show an empty filter, and
+        an option that silently vanishes from the sidebar reads as a bug.
+
+        Counted with one grouped query per axis rather than one per option:
+        three axes over twenty-odd options is a lot of `COUNT(*)` for what is
+        a page of checkboxes.
+
+        Scoped exactly like the list it describes. A count that includes
+        templates the caller cannot see sends them to a filter that comes back
+        empty, which reads as a bug rather than as a permission boundary.
+        """
+        active = Template.objects.visible_to(request.user).filter(is_active=True)
+
+        def tally(field: str) -> dict[str, int]:
+            # `.order_by()` first, and not for tidiness. Template.Meta orders
+            # by (category, style, name), and Django folds a model's default
+            # ordering into the GROUP BY of a values().annotate() — leaving it
+            # in would group by all three columns and count combinations
+            # rather than categories. Clearing it is what makes this one row
+            # per value.
+            return {
+                row[field]: row["total"]
+                for row in active.order_by().values(field).annotate(total=Count("id"))
+            }
+
+        by_category = tally("category")
+        by_style = tally("style")
+        by_dimension = tally("default_dimension")
+
         return Response(
             {
                 "categories": [
-                    {
-                        "value": value,
-                        "label": label,
-                        "count": active.filter(category=value).count(),
-                    }
+                    {"value": value, "label": label, "count": by_category.get(value, 0)}
                     for value, label in TemplateCategory.choices
                 ],
                 "styles": [
-                    {
-                        "value": value,
-                        "label": label,
-                        "count": active.filter(style=value).count(),
-                    }
+                    {"value": value, "label": label, "count": by_style.get(value, 0)}
                     for value, label in TemplateStyle.choices
                 ],
+                "dimensions": [
+                    {
+                        "value": key,
+                        "label": dimension.label,
+                        "count": by_dimension.get(key, 0),
+                    }
+                    for key, dimension in SOCIAL_DIMENSIONS.items()
+                ],
             }
+        )
+
+
+class TemplateImportViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Turn uploaded artwork into a template.
+
+        POST /api/template-imports/    upload a PDF or image, returns 202
+        GET  /api/template-imports/    this agent's imports, newest first
+        GET  /api/template-imports/1/  poll one
+
+    No update and no delete. An import is a record of something that happened;
+    editing one would make the audit trail a suggestion, and deleting one
+    would orphan the template it produced.
+
+    The work runs on a Celery worker: extraction is a minute-scale vision call,
+    and holding an HTTP request open for it means a gateway timeout is
+    indistinguishable from a failure — with nothing left behind to look at.
+    """
+
+    serializer_class = TemplateImportSerializer
+    permission_classes = [IsAuthenticated]
+    # multipart only: this endpoint exists to receive a file.
+    parser_classes = [MultiPartParser, FormParser]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "template_import"
+
+    def get_queryset(self) -> QuerySet[TemplateImport]:
+        # Strictly the caller's own. Unlike designs, an import is not
+        # brokerage-visible work: it is a file somebody dragged in, and the
+        # error messages on a failed one can quote their filename.
+        return (
+            TemplateImport.objects.filter(agent__user=self.request.user)
+            .select_related("template")
+            .prefetch_related("template__elements")
+        )
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        """Accept the file, queue the extraction, return the job to poll."""
+        profile = AgentProfile.objects.filter(user=request.user).first()
+        if profile is None:
+            return Response(
+                {
+                    "detail": (
+                        "You need an agent profile before importing templates."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = TemplateImportCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        upload = serializer.validated_data["file"]
+
+        job = TemplateImport.objects.create(
+            agent=profile,
+            source_file=upload,
+            # Kept separately from the storage key, which is a random UUID by
+            # design (see core/storage.py) and so cannot carry the name back.
+            original_filename=upload.name[:255],
+            requested_name=serializer.validated_data.get("name", ""),
+            category=serializer.validated_data["category"],
+            style=serializer.validated_data["style"],
+        )
+
+        # Queued after the row is committed, so the worker cannot look for a
+        # record that is not there yet.
+        try:
+            import_template_artwork.delay(job.pk)
+        except Exception:
+            # A broker that is down must not swallow the upload silently: the
+            # file is already stored, so the job is marked failed with
+            # something a user can act on rather than left queued forever.
+            logger.exception("Could not queue template import %s", job.pk)
+            job.status = ImportStatus.FAILED
+            job.error = (
+                "The import queue is unavailable right now. Your file was "
+                "saved — try importing it again shortly."
+            )
+            job.finished_at = timezone.now()
+            job.save(update_fields=["status", "error", "finished_at", "updated_at"])
+
+        logger.info(
+            "Queued template import %s (%r) for user %s",
+            job.pk, job.original_filename, request.user.pk,
+        )
+        return Response(
+            self.get_serializer(job).data, status=status.HTTP_202_ACCEPTED
         )
 
 
@@ -176,10 +361,12 @@ class CalendarEventViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_serializer_context(self) -> dict:
         context = super().get_serializer_context()
-        # Counted once for the whole page rather than per row.
+        # Counted once for the whole page rather than per row, and scoped to
+        # what this user can actually open.
         context["template_counts"] = {
             row["category"]: row["total"]
-            for row in Template.objects.filter(is_active=True)
+            for row in Template.objects.visible_to(self.request.user)
+            .filter(is_active=True)
             .values("category")
             .annotate(total=Count("id"))
         }
@@ -192,7 +379,9 @@ class CalendarEventViewSet(viewsets.ReadOnlyModelViewSet):
         None of them need a listing — that is the point of the calendar.
         """
         event = self.get_object()
-        templates = Template.objects.filter(category=event.category, is_active=True)
+        templates = Template.objects.visible_to(request.user).filter(
+            category=event.category, is_active=True
+        )
         return Response(
             {
                 "event": self.get_serializer(event).data,

@@ -1,6 +1,11 @@
 import type { Listing } from '../api/listings.ts'
 
-/** Small status pill. Verified is the exception, so it is the one that stands out. */
+/** Small status pill. Verified is the exception, so it is the one that stands out.
+ *
+ *  The unverified label is "Not confirmed", not "Needs review": there is no
+ *  reviewer. The agent who owns the listing confirms their own data, and
+ *  wording that implied a pending approval had them waiting for one.
+ */
 export function VerificationBadge({ listing }: { listing: Listing }) {
   const verified = listing.is_verified
   return (
@@ -11,7 +16,7 @@ export function VerificationBadge({ listing }: { listing: Listing }) {
           : 'bg-amber-50 text-amber-700 ring-1 ring-amber-200'
       }`}
     >
-      {verified ? 'Verified' : 'Needs review'}
+      {verified ? 'Verified' : 'Not confirmed'}
     </span>
   )
 }

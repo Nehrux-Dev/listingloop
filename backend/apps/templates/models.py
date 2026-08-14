@@ -36,7 +36,12 @@ from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from apps.core.models import TimeStampedModel
-from apps.core.storage import design_export_upload_to, template_asset_upload_to
+from apps.core.storage import (
+    design_export_upload_to,
+    template_asset_upload_to,
+    template_import_upload_to,
+    template_source_page_upload_to,
+)
 from apps.core.validators import ImageUploadValidator
 
 #: One shared instance, same pattern as apps/accounts/profiles.py — the size
@@ -136,8 +141,64 @@ class ElementType(models.TextChoices):
     STATIC_GRAPHIC = "static_graphic", _("Static graphic")
 
 
+class TemplateQuerySet(models.QuerySet):
+    def visible_to(self, user):
+        """The library one user may browse.
+
+        Two kinds of template share this table and they are not the same thing.
+        A template with no ``owner`` is *product content* — seeded by Nehrux,
+        curated, and shown to everybody. A template with an owner was imported
+        from artwork that one agent uploaded, and belongs to them.
+
+        Mixing the second kind into everyone's gallery is the failure this
+        method exists to prevent: an agent's own flyer, with their brokerage's
+        wording still in it, appearing in a competitor's template picker.
+
+        Brokerage admins deliberately do *not* see their agents' imports. The
+        scoping on designs and listings is about oversight of published work;
+        an unfinished template someone dragged in is not that, and widening the
+        rule here would be a surprise rather than a feature.
+        """
+        if not user.is_authenticated:
+            return self.none()
+        if user.is_nehrux_admin:
+            return self
+        return self.filter(models.Q(owner__isnull=True) | models.Q(owner__user=user))
+
+
 class Template(TimeStampedModel):
     """A reusable design: canvas, background, and a set of elements."""
+
+    #: Who imported this, or NULL for a Nehrux-authored library template.
+    #:
+    #: NULL is the meaningful default and the reason this is nullable rather
+    #: than pointing at a "system" profile: every template that existed before
+    #: imports were possible is product content, and a migration that had to
+    #: invent an owner for them would have to invent the wrong answer.
+    owner = models.ForeignKey(
+        "accounts.AgentProfile",
+        on_delete=models.CASCADE,
+        related_name="templates",
+        null=True,
+        blank=True,
+        verbose_name=_("owner"),
+        help_text=_(
+            "The agent who imported this template. Blank for the shared "
+            "Nehrux library, which every agent can see."
+        ),
+    )
+
+    #: The artwork this template was extracted from, rasterised. Shown as the
+    #: gallery thumbnail — see TemplateThumb on the frontend, which falls back
+    #: to a style swatch when this is empty. Carries no validator: it is
+    #: written by the import pipeline from bytes Pillow has already decoded,
+    #: never from an upload.
+    source_image = models.ImageField(
+        _("source artwork"),
+        upload_to=template_source_page_upload_to,
+        blank=True,
+        null=True,
+    )
 
     name = models.CharField(_("name"), max_length=160)
     slug = models.SlugField(_("slug"), max_length=160, unique=True)
@@ -185,14 +246,24 @@ class Template(TimeStampedModel):
         ),
     )
 
+    objects = TemplateQuerySet.as_manager()
+
     class Meta:
         verbose_name = _("template")
         verbose_name_plural = _("templates")
         ordering = ("category", "style", "name")
-        indexes = [models.Index(fields=["category", "style", "is_active"])]
+        indexes = [
+            models.Index(fields=["category", "style", "is_active"]),
+            models.Index(fields=["owner", "is_active"]),
+        ]
 
     def __str__(self) -> str:
         return self.name
+
+    @property
+    def is_imported(self) -> bool:
+        """Whether this came from uploaded artwork rather than the library."""
+        return self.owner_id is not None
 
     @property
     def is_seasonal(self) -> bool:
@@ -206,7 +277,23 @@ class Template(TimeStampedModel):
         with no listing has nothing to say, and a Diwali card has nothing to do
         with one. Deriving it means a new seasonal category cannot forget to
         set the flag.
+
+        An **imported** template is exempt whatever its category. The extractor
+        keeps the artwork's own wording as ``default_content`` and its own
+        pictures as ``static_asset``, so the layout opens fully formed with
+        nothing attached — a listing binding overwrites text that is already
+        there rather than filling a hole. Gating it would mean an agent cannot
+        customise artwork they uploaded themselves until they have verified an
+        unrelated property, which is the one case where the template is
+        unambiguously theirs to work on. The category still describes the
+        occasion and still drives browsing; it just no longer decides this.
+
+        Attaching a listing remains entirely possible — and still has to be a
+        verified one. This governs whether a property is *required*, never
+        whether an unreviewed one may be used.
         """
+        if self.is_imported:
+            return False
         return self.category in LISTING_CATEGORIES
 
 
@@ -265,6 +352,119 @@ class TemplateElement(models.Model):
 
     def __str__(self) -> str:
         return f"{self.template_id}:{self.key}"
+
+
+class ImportStatus(models.TextChoices):
+    QUEUED = "queued", _("Queued")
+    RUNNING = "running", _("Running")
+    SUCCEEDED = "succeeded", _("Succeeded")
+    FAILED = "failed", _("Failed")
+
+
+#: States from which no further work happens. Used to stop a redelivered Celery
+#: task re-running — and re-billing — a job that already finished.
+TERMINAL_IMPORT_STATUSES: frozenset[str] = frozenset(
+    {ImportStatus.SUCCEEDED, ImportStatus.FAILED}
+)
+
+
+class TemplateImport(TimeStampedModel):
+    """One attempt at turning uploaded artwork into a template.
+
+    WHY THIS IS A ROW AND NOT JUST A REQUEST
+    ------------------------------------------------------------------------
+    Extraction is a minute-scale call to a vision model. Doing it inside the
+    POST would mean a gateway timeout is indistinguishable from a failure, and
+    a failure leaves nothing behind to look at. So the upload creates this row
+    and returns immediately; the worker fills it in.
+
+    The row outlives the job on purpose. ``error`` is what the user is shown
+    when extraction fails, and ``source_file`` is kept so a bad extraction can
+    be retried against the same artwork rather than asking them to find the
+    file again.
+    """
+
+    agent = models.ForeignKey(
+        "accounts.AgentProfile",
+        on_delete=models.CASCADE,
+        related_name="template_imports",
+        verbose_name=_("agent"),
+    )
+
+    #: The upload, exactly as it arrived. Not an ImageField: this is the one
+    #: place a PDF is a first-class input, and ImageField's validation would
+    #: reject it before the rasteriser ever saw it.
+    source_file = models.FileField(
+        _("source file"), upload_to=template_import_upload_to
+    )
+    original_filename = models.CharField(
+        _("original filename"), max_length=255, blank=True
+    )
+
+    status = models.CharField(
+        _("status"),
+        max_length=16,
+        choices=ImportStatus.choices,
+        default=ImportStatus.QUEUED,
+        db_index=True,
+    )
+    #: Shown to the user verbatim when the import fails, so it is written to be
+    #: read by one — never a raw provider exception, which can carry request
+    #: details and says nothing actionable.
+    error = models.TextField(_("error"), blank=True)
+
+    #: Set once extraction succeeds. NULL while running, and NULL forever on a
+    #: failure — which is what makes "did this produce anything?" a single
+    #: check rather than a status string comparison.
+    template = models.ForeignKey(
+        Template,
+        on_delete=models.SET_NULL,
+        related_name="imports",
+        null=True,
+        blank=True,
+        verbose_name=_("template"),
+    )
+
+    #: What the user asked the extracted template to be filed under. Applied to
+    #: the Template on success; kept here so a retry does not have to ask again.
+    requested_name = models.CharField(_("requested name"), max_length=160, blank=True)
+    category = models.CharField(
+        _("category"),
+        max_length=32,
+        choices=TemplateCategory.choices,
+        default=TemplateCategory.NEW_LISTING,
+    )
+    style = models.CharField(
+        _("style"),
+        max_length=32,
+        choices=TemplateStyle.choices,
+        default=TemplateStyle.MINIMAL,
+    )
+
+    #: Observability for a call that costs money. Same fields the content
+    #: generator records, for the same reason: an import that quietly starts
+    #: costing five times what it did is invisible without them.
+    element_count = models.PositiveIntegerField(_("elements found"), default=0)
+    model_used = models.CharField(_("model"), max_length=80, blank=True)
+    prompt_tokens = models.PositiveIntegerField(_("prompt tokens"), default=0)
+    completion_tokens = models.PositiveIntegerField(_("completion tokens"), default=0)
+    duration_ms = models.PositiveIntegerField(_("duration (ms)"), default=0)
+
+    started_at = models.DateTimeField(_("started at"), null=True, blank=True)
+    finished_at = models.DateTimeField(_("finished at"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("template import")
+        verbose_name_plural = _("template imports")
+        ordering = ("-created_at",)
+        indexes = [models.Index(fields=["agent", "-created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.original_filename or self.source_file.name} ({self.status})"
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status in TERMINAL_IMPORT_STATUSES
 
 
 class CalendarEvent(TimeStampedModel):
