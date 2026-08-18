@@ -780,6 +780,61 @@ class SmartGeometryTestCase(TemplateAPITestCase):
 
 
 @override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class TextFitTestCase(TemplateAPITestCase):
+    """A text box measured too tight for the substitute font is widened.
+
+    Page is 800x1000, so the type scale reference is 800px.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+
+    def _price(self, width, align="left", x=80.0):
+        return layout_payload(
+            [
+                element_payload(
+                    id="price",
+                    type="text",
+                    role="price",
+                    binding="",
+                    text="$1,300,000",
+                    transform={"x": x, "y": 500.0, "width": width, "height": 90.0},
+                    style={"font_size_px": 80.0, "text_align": align},
+                )
+            ]
+        )
+
+    def test_a_too_narrow_price_box_is_widened_to_fit(self):
+        # 10 glyphs at ~80px in the substitute body font need ~470px; the box is
+        # 200px, which is what clips "$1,300,000" to "$1,300,00".
+        [element] = normalise_elements(self._price(200.0), self.page)
+        self.assertGreater(element.geometry["width"], 200.0 / 800.0)
+
+    def test_a_box_already_wide_enough_is_left_alone(self):
+        [element] = normalise_elements(self._price(700.0), self.page)
+        self.assertAlmostEqual(element.geometry["width"], 700.0 / 800.0, places=3)
+
+    def test_a_right_aligned_box_grows_leftward_keeping_its_right_edge(self):
+        before = self._price(200.0, align="right", x=500.0)
+        right_before = 500.0 + 200.0
+        [element] = normalise_elements(before, self.page)
+        right_after = (element.geometry["x"] + element.geometry["width"]) * 800.0
+        self.assertLess(element.geometry["x"] * 800.0, 500.0)
+        self.assertAlmostEqual(right_after, right_before, delta=3.0)
+
+    def test_widening_never_leaves_the_canvas(self):
+        [element] = normalise_elements(self._price(200.0, x=700.0), self.page)
+        right = (element.geometry["x"] + element.geometry["width"]) * 800.0
+        self.assertLessEqual(right, 800.0 + 0.5)
+
+    @override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=False)
+    def test_the_flag_off_leaves_the_box_as_measured(self):
+        [element] = normalise_elements(self._price(200.0), self.page)
+        self.assertAlmostEqual(element.geometry["width"], 200.0 / 800.0, places=3)
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
 class CropPreservationTestCase(TemplateAPITestCase):
     """A photo whose box bleeds off the page keeps its visible composition."""
 

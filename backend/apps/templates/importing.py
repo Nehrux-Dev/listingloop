@@ -1219,6 +1219,9 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
             "higher-resolution version, or a PNG export of the design."
         )
 
+    if smart:
+        _fit_text_boxes(elements, page)
+
     # Rewrite alignment relationships from the reader's throwaway ids onto the
     # stored keys, dropping any peer that did not survive normalisation. A
     # relationship pointing at nothing is worse than no relationship, so an
@@ -1244,6 +1247,99 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
 #: Template types that display words. A BADGE is a filled shape with a label
 #: inside it, so it carries text too.
 _TEXT_ELEMENT_TYPES = frozenset({ElementType.TEXT, ElementType.BADGE})
+
+#: Rough average glyph advance as a fraction of the font size, per family role.
+#: Used only to estimate whether a text box is too narrow for its content — not
+#: to lay type out, which the renderer does for real. The substitute families
+#: (html_builder.FONT_STACKS) are what these approximate; ``display`` and
+#: ``script`` are condensed, ``mono`` is wide. Digits and a currency symbol sit
+#: near the top of this range, so a price is estimated on the generous side,
+#: which is the safe direction: it errs toward giving the box room.
+_GLYPH_ADVANCE = {
+    "display": 0.54,
+    "body": 0.58,
+    "serif": 0.54,
+    "mono": 0.62,
+    "script": 0.46,
+}
+_DEFAULT_ADVANCE = 0.58
+
+#: A box is never widened past this multiple of its measured width, nor past the
+#: canvas edge. A text run that needs more than this to fit is a measurement the
+#: renderer's shrink-to-fit should handle, not one to rescue by dragging the
+#: element halfway across the page and onto its neighbour.
+_MAX_TEXT_WIDEN = 1.6
+
+#: A whisker of slack past the estimate so the fit pass is not sitting exactly
+#: on the box edge, where a rounding difference still clips.
+_TEXT_FIT_MARGIN = 1.03
+
+
+def _fit_text_boxes(elements: list[ExtractedElement], page: RasterPage) -> int:
+    """Widen a text box just enough that its content is not clipped on render.
+
+    The import measures a headline in the artwork's own typeface; the renderer
+    draws it in a substitute, which is usually wider, so a box cut tight to the
+    original clips the last glyph — "$1,300,000" comes out "$1,300,00". The
+    renderer's shrink-to-fit only shrinks to ``FIT_MIN_SCALE`` (0.5) and then
+    lets ``overflow:hidden`` cut the rest, so a box a few percent too narrow at
+    that floor still loses a character.
+
+    This gives the box room at import, anchored by the element's own text-align
+    so the text does not appear to jump: a left-aligned box grows rightward, a
+    right-aligned box leftward, a centred one both ways. It never crosses the
+    canvas edge and never grows past ``_MAX_TEXT_WIDEN`` — a wildly wrong
+    measurement is left to the shrink pass rather than dragged across the page.
+
+    The estimate does not need to be exact: the renderer's fit pass is still the
+    real guarantee against overflow. All this has to do is stop that pass from
+    bottoming out on a box that was only a little too tight. Returns how many
+    boxes it widened.
+    """
+    scale_ref = float(min(page.width, page.height))
+    widened = 0
+    for element in elements:
+        if element.element_type not in _TEXT_ELEMENT_TYPES:
+            continue
+        text = (element.default_content or "").strip()
+        if not text:
+            continue
+        style = element.style_properties or {}
+        ratio = float(style.get("font_size_ratio") or 0)
+        if ratio <= 0:
+            continue
+
+        font_px = ratio * scale_ref
+        longest = max((len(line) for line in text.splitlines()), default=len(text))
+        if longest <= 0:
+            continue
+        advance = _GLYPH_ADVANCE.get(str(style.get("font_family") or "body"), _DEFAULT_ADVANCE)
+        needed_px = longest * font_px * advance * _TEXT_FIT_MARGIN
+
+        box_px = float(element.geometry.get("width", 0.0)) * page.width
+        if box_px <= 0 or needed_px <= box_px:
+            continue
+
+        new_px = min(needed_px, box_px * _MAX_TEXT_WIDEN, float(page.width))
+        if new_px <= box_px:
+            continue
+
+        x_px = float(element.geometry.get("x", 0.0)) * page.width
+        align = str(style.get("text_align") or "left")
+        grow = new_px - box_px
+        if align == "right":
+            new_x = x_px - grow
+        elif align == "center":
+            new_x = x_px - grow / 2
+        else:
+            new_x = x_px
+        # Keep the widened box on the canvas.
+        new_x = max(0.0, min(new_x, page.width - new_px))
+
+        element.geometry["x"] = round(new_x / page.width, 4)
+        element.geometry["width"] = round(new_px / page.width, 4)
+        widened += 1
+    return widened
 
 #: The longest literal string worth keeping as default content. Well past a
 #: flyer's description paragraph; short of a model that has started
