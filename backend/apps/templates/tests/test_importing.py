@@ -30,6 +30,7 @@ from apps.templates.document import elements_from_template
 from apps.templates.importing import (
     RasterPage,
     TemplateImportError,
+    align_and_group,
     bake_assets,
     build_template,
     closest_dimension,
@@ -660,6 +661,184 @@ class ClosestDimensionTestCase(TemplateAPITestCase):
         # 5:1 is nothing in SOCIAL_DIMENSIONS; forcing it into the nearest
         # would crop the composition without saying so.
         self.assertEqual(closest_dimension(2000, 400), "instagram_post")
+
+
+# ---------------------------------------------------------------------------
+# Step 2b — smart geometry (size-aware snap, spacing, alignment, crop)
+# ---------------------------------------------------------------------------
+
+
+def _box(eid, x, y, w, h, kind="text"):
+    """A minimal aligned-payload element in pixel space."""
+    return {
+        "id": eid,
+        "type": kind,
+        "role": "",
+        "binding": "",
+        "text": "x",
+        "mask": [],
+        "transform": {"x": x, "y": y, "width": w, "height": h, "rotation": 0, "z_index": 0},
+        "style": {},
+    }
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class SmartGeometryTestCase(TemplateAPITestCase):
+    """The deterministic tidy-up that runs on either reader's output.
+
+    Pixel space, since ``align_and_group`` runs before normalisation converts
+    to fractions. The page is 1000x1000, so the snap tolerance is 5px.
+    """
+
+    W = H = 1000
+
+    def align(self, elements):
+        payload = {"page": {}, "elements": elements}
+        return align_and_group(payload, self.W, self.H, smart=True)["elements"]
+
+    def test_a_column_of_near_equal_cards_is_given_one_shared_edge(self):
+        # Two left-aligned cards whose right edges are 3px apart were meant to
+        # line up. Position-only snapping cannot fix this — the widths differ.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 403, 50, "image")
+        self.align([a, b])
+        self.assertEqual(a["transform"]["width"], b["transform"]["width"])
+        self.assertAlmostEqual(
+            a["transform"]["x"] + a["transform"]["width"],
+            b["transform"]["x"] + b["transform"]["width"],
+            places=2,
+        )
+
+    def test_genuinely_different_widths_are_left_alone(self):
+        # Right edges 200px apart: a design decision, not placement slop.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 600, 50, "image")
+        self.align([a, b])
+        self.assertEqual(a["transform"]["width"], 400)
+        self.assertEqual(b["transform"]["width"], 600)
+
+    def test_a_nearly_even_column_is_regularised_to_one_rhythm(self):
+        # Gaps of 24 / 24 / 25 px collapse to a single mean gap.
+        run = [
+            _box("t1", 100, 0, 200, 50),
+            _box("t2", 100, 74, 200, 50),
+            _box("t3", 100, 148, 200, 50),
+            _box("t4", 100, 223, 200, 50),
+        ]
+        self.align(run)
+        ys = [e["transform"]["y"] for e in run]
+        gaps = [ys[i + 1] - (ys[i] + 50) for i in range(3)]
+        self.assertLess(max(gaps) - min(gaps), 0.05)
+
+    def test_an_intentionally_uneven_column_is_preserved(self):
+        run = [
+            _box("t1", 100, 0, 200, 50),
+            _box("t2", 100, 60, 200, 50),
+            _box("t3", 100, 150, 200, 50),
+        ]
+        before = [e["transform"]["y"] for e in run]
+        self.align(run)
+        self.assertEqual([e["transform"]["y"] for e in run], before)
+
+    def test_confident_alignment_is_recorded_as_a_relationship(self):
+        a = _box("a", 100, 100, 200, 50)
+        b = _box("b", 100, 300, 200, 50)
+        self.align([a, b])
+        left = a["style"].get("layout_constraints", {}).get("align_left_with", [])
+        self.assertIn("b", left)
+
+    def test_recorded_relationships_survive_normalisation_as_stored_keys(self):
+        # align_and_group records peers by the reader's throwaway ids; after
+        # normalisation those must point at the keys actually stored, or the
+        # relationship references nothing.
+        page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+        payload = {
+            "page": {"background_color": "#FFFFFF"},
+            "elements": [
+                _box("raw_a", 100, 100, 200, 50),
+                _box("raw_b", 100, 300, 200, 50),
+            ],
+        }
+        align_and_group(payload, 800, 1000, smart=True)
+        elements = normalise_elements(payload, page)
+        keys = {e.key for e in elements}
+        for element in elements:
+            for peers in (element.style_properties.get("layout_constraints") or {}).values():
+                for peer in peers:
+                    self.assertIn(peer, keys)
+                    self.assertNotIn(peer, {"raw_a", "raw_b"})
+
+    @override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=False)
+    def test_the_flag_off_is_exactly_the_old_behaviour(self):
+        # No size changes, no relationships — only the original position snap.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 403, 50, "image")
+        self.align([a, b])
+        self.assertEqual(a["transform"]["width"], 400)
+        self.assertEqual(b["transform"]["width"], 403)
+        self.assertNotIn("layout_constraints", a["style"])
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class CropPreservationTestCase(TemplateAPITestCase):
+    """A photo whose box bleeds off the page keeps its visible composition."""
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+
+    def test_a_bleeding_photo_renders_the_region_that_is_actually_there(self):
+        # A hero photo running 100px off the right and bottom edges. The crop is
+        # clamped to the page; the render geometry must follow it, or cover
+        # would slide the visible region.
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="hero",
+                    type="image",
+                    role="hero",
+                    binding="photo_1",
+                    text="",
+                    transform={"x": 600.0, "y": 700.0, "width": 300.0, "height": 400.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        # Visible width is 800-600=200 of 800 -> 0.25; height 1000-700=300 -> 0.30.
+        self.assertAlmostEqual(element.geometry["width"], 0.25, places=3)
+        self.assertAlmostEqual(element.geometry["height"], 0.30, places=3)
+        self.assertIn("source_box", element.style_properties)
+
+    def test_a_photo_inside_the_page_is_geometry_unchanged(self):
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="p",
+                    type="image",
+                    role="photo",
+                    binding="photo_1",
+                    text="",
+                    transform={"x": 100.0, "y": 100.0, "width": 200.0, "height": 200.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        self.assertAlmostEqual(element.geometry["x"], 0.125, places=3)
+        self.assertAlmostEqual(element.geometry["width"], 0.25, places=3)
+        self.assertNotIn("source_box", element.style_properties)
+
+    def test_a_flat_background_is_never_cropped_into_a_screenshot(self):
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="bg", type="background", role="page", binding="", text="",
+                    transform={"x": 0.0, "y": 0.0, "width": 800.0, "height": 1000.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        self.assertEqual(element.element_type, ElementType.COLOR_BLOCK)
+        self.assertIsNone(element.crop_box)
 
 
 # ---------------------------------------------------------------------------

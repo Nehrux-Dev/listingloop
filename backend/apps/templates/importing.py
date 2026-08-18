@@ -633,13 +633,25 @@ def _snap_axis(elements: list[dict], pos: str, size: str, tolerance: float) -> N
                 settled.add(marker)
 
 
-def align_and_group(payload: dict, width: int, height: int) -> dict:
+def align_and_group(
+    payload: dict, width: int, height: int, *, smart: bool | None = None
+) -> dict:
     """Snap near-alignments and label visual groups. Returns the payload.
 
     Runs on whatever either reader produced, so the vision model and the PDF
     reader are tidied by the same rules rather than each having its own idea of
     what "aligned" means.
+
+    ``smart`` turns on the deterministic geometry clean-up added on top of the
+    original position snap: reconciling shared edges and equal sizes (which the
+    position-only snap structurally cannot do), regularising even spacing, and
+    recording the alignment relationships it is confident about. ``None`` reads
+    the ``TEMPLATE_IMPORT_SMART_GEOMETRY`` setting; an explicit bool overrides
+    it, which is what the tests use. Off is exactly the pre-existing behaviour.
     """
+    if smart is None:
+        smart = bool(getattr(settings, "TEMPLATE_IMPORT_SMART_GEOMETRY", True))
+
     elements = [
         element
         for element in payload.get("elements", [])
@@ -651,11 +663,182 @@ def align_and_group(payload: dict, width: int, height: int) -> dict:
     short_side = max(1.0, min(width, height))
     tolerance = max(_SNAP_FLOOR_PX, short_side * _SNAP_RATIO)
 
+    meta = payload.setdefault("extraction_meta", {})
+    if getattr(settings, "TEMPLATE_IMPORT_DEBUG", False):
+        # The boxes as either reader measured them, before any snapping. Kept
+        # for the debug overlay so "what did the tidy-up move" is a diff rather
+        # than a guess. Pixel space, matching the transforms at this point.
+        meta["pre_align_boxes"] = [
+            {
+                "id": str(element.get("id") or ""),
+                "type": element.get("type", ""),
+                "x": float(element["transform"].get("x", 0.0)),
+                "y": float(element["transform"].get("y", 0.0)),
+                "width": float(element["transform"].get("width", 0.0)),
+                "height": float(element["transform"].get("height", 0.0)),
+            }
+            for element in elements
+        ]
+
+    # The original position snap always runs: it is the behaviour every existing
+    # import was built on, and the smart steps refine its output rather than
+    # replacing it.
     _snap_axis(elements, "x", "width", tolerance)
     _snap_axis(elements, "y", "height", tolerance)
 
+    if smart:
+        # Order matters: edges/sizes first so a run's members share an exact
+        # leading edge before spacing is measured between them; then spacing;
+        # then relationships, recorded from the final, settled geometry.
+        meta["edge_corrections"] = _reconcile_edges(elements, tolerance)
+        meta["spacing_corrections"] = _regularize_spacing(elements, tolerance)
+        meta["alignment_relationships"] = _record_alignment(elements, tolerance)
+
     _assign_groups(elements, short_side, width * height)
     return payload
+
+
+#: A width/height equalisation is only made when the two boxes are already this
+#: close, as a multiple of the snap tolerance. Past it the difference is a
+#: design decision, not placement slop, and forcing it would be the "do NOT
+#: resize the photo to match the button" case the spec calls out.
+_SIZE_RECONCILE_FACTOR = 1.0
+
+#: An evenly-spaced run is only regularised when its gaps already agree this
+#: closely (max gap minus min gap, against the tolerance). A run whose gaps
+#: genuinely differ is left alone — the spacing was intended.
+_SPACING_AGREE_FACTOR = 1.0
+
+
+def _edge_clusters(
+    elements: list[dict], pos: str, tolerance: float
+) -> list[list[dict]]:
+    """Elements grouped by a shared leading edge on one axis.
+
+    The position snap has already pulled near-equal leading edges onto one
+    value, so "shares a left edge" is now an exact-equality question within a
+    hair. Each returned run is the raw material for equalising width and for
+    finding an evenly spaced column.
+    """
+    ordered = sorted(elements, key=lambda e: float(e["transform"][pos]))
+    clusters: list[list[dict]] = []
+    for element in ordered:
+        value = float(element["transform"][pos])
+        if clusters and value - float(clusters[-1][0]["transform"][pos]) <= tolerance:
+            clusters[-1].append(element)
+        else:
+            clusters.append([element])
+    return [cluster for cluster in clusters if len(cluster) >= 2]
+
+
+def _reconcile_edges(elements: list[dict], tolerance: float) -> int:
+    """Give boxes that share one edge a shared *opposite* edge too, by size.
+
+    The position snap can align leading edges, centres or trailing edges, but
+    only ever by *moving* a box — it can never change a width, so two panels
+    meant to share both a left and a right edge (a column of cards) come out
+    left-aligned and a few pixels apart on the right. This closes that gap:
+    within a run that already shares a leading edge, boxes whose trailing edges
+    are within tolerance are given a common size, so the shared edge becomes
+    exact. Boxes further apart than the tolerance are left alone — that width
+    difference is the design, not slop.
+    """
+    corrections = 0
+    for pos, size in (("x", "width"), ("y", "height")):
+        for cluster in _edge_clusters(elements, pos, tolerance):
+            lead = min(float(e["transform"][pos]) for e in cluster)
+            trailing = [float(e["transform"][pos]) + float(e["transform"][size]) for e in cluster]
+            if max(trailing) - min(trailing) > tolerance * _SIZE_RECONCILE_FACTOR:
+                continue
+            shared_size = sum(trailing) / len(trailing) - lead
+            if shared_size <= 0:
+                continue
+            for element in cluster:
+                current = float(element["transform"][size])
+                if abs(current - shared_size) > 1e-6:
+                    element["transform"][pos] = round(lead, 2)
+                    element["transform"][size] = round(shared_size, 2)
+                    corrections += 1
+    return corrections
+
+
+def _regularize_spacing(elements: list[dict], tolerance: float) -> int:
+    """Even out the gaps in a column or row that is already nearly even.
+
+    A stack of three text blocks measured at 24 / 24 / 25 px apart was set on a
+    24px rhythm; the one-pixel drift is measurement noise that becomes visible
+    once the design is re-rendered at another size. When a run of three or more
+    left- or top-aligned boxes has gaps that already agree within tolerance,
+    the gaps are set to their mean. A run whose gaps genuinely differ is a
+    deliberate layout and is left untouched.
+    """
+    corrections = 0
+    for pos, size, other in (("x", "width", "y"), ("y", "height", "x")):
+        for cluster in _edge_clusters(elements, other, tolerance):
+            run = sorted(cluster, key=lambda e: float(e["transform"][pos]))
+            if len(run) < 3:
+                continue
+            gaps = [
+                float(run[i + 1]["transform"][pos])
+                - (float(run[i]["transform"][pos]) + float(run[i]["transform"][size]))
+                for i in range(len(run) - 1)
+            ]
+            if any(gap < 0 for gap in gaps):
+                continue
+            if max(gaps) - min(gaps) > tolerance * _SPACING_AGREE_FACTOR:
+                continue
+            target = sum(gaps) / len(gaps)
+            cursor = float(run[0]["transform"][pos]) + float(run[0]["transform"][size])
+            for element in run[1:]:
+                new_pos = cursor + target
+                if abs(new_pos - float(element["transform"][pos])) > 1e-6:
+                    element["transform"][pos] = round(new_pos, 2)
+                    corrections += 1
+                cursor = new_pos + float(element["transform"][size])
+    return corrections
+
+
+def _record_alignment(elements: list[dict], tolerance: float) -> int:
+    """Note, on each element, which others it is confidently aligned with.
+
+    Additive metadata under ``style.layout_constraints`` — the ids that share
+    this element's left, centre, right, top or bottom line. Nothing renders
+    from it today; it is recorded so a later editor can *maintain* an alignment
+    the agent did not deliberately break, and so the debug report can show why
+    two boxes were treated as a column. Only exact-within-tolerance matches are
+    recorded: the spec's rule is that no relationship beats a wrong one.
+    """
+
+    def anchor(element: dict, pos: str, size: str, which: str) -> float:
+        start = float(element["transform"][pos])
+        extent = float(element["transform"][size])
+        return {"start": start, "center": start + extent / 2, "end": start + extent}[which]
+
+    keys = {
+        "align_left_with": ("x", "width", "start"),
+        "align_center_with": ("x", "width", "center"),
+        "align_right_with": ("x", "width", "end"),
+        "align_top_with": ("y", "height", "start"),
+        "align_bottom_with": ("y", "height", "end"),
+    }
+    recorded = 0
+    for element in elements:
+        constraints: dict[str, list[str]] = {}
+        for name, (pos, size, which) in keys.items():
+            mine = anchor(element, pos, size, which)
+            peers = [
+                str(other.get("id"))
+                for other in elements
+                if other is not element
+                and other.get("id")
+                and abs(anchor(other, pos, size, which) - mine) <= tolerance
+            ]
+            if peers:
+                constraints[name] = peers
+        if constraints:
+            element.setdefault("style", {})["layout_constraints"] = constraints
+            recorded += 1
+    return recorded
 
 
 def _assign_groups(elements: list[dict], short_side: float, page_area: float) -> None:
@@ -889,8 +1072,14 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         )
 
     scale_reference = float(min(page.width, page.height))
+    smart = bool(getattr(settings, "TEMPLATE_IMPORT_SMART_GEOMETRY", True))
     elements: list[ExtractedElement] = []
     used_keys: set[str] = set()
+    # Raw extraction id -> the stable key it became, so the alignment
+    # relationships recorded pre-normalisation can be rewritten to point at the
+    # keys that are actually stored. Without this they would reference the
+    # throwaway ids the reader used and resolve to nothing.
+    raw_id_to_key: dict[str, str] = {}
 
     for index, raw in enumerate(raw_elements):
         if not isinstance(raw, dict):
@@ -917,6 +1106,8 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         if key in used_keys:  # pragma: no cover - _slug_key suffixes with index
             key = f"{key}_{len(used_keys)}"
         used_keys.add(key)
+        if raw.get("id"):
+            raw_id_to_key[str(raw["id"])] = key
 
         raw_style = raw.get("style") if isinstance(raw.get("style"), dict) else {}
         binding = raw.get("binding") if raw.get("binding") in BINDING_CHOICES else ""
@@ -948,6 +1139,13 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         if clip:
             style["clip_polygon"] = clip
 
+        # Alignment relationships the tidy-up pass was confident about. Recorded
+        # under the raw style by ``_record_alignment``; carried onto the stored
+        # element so the debug report and any future constraint-aware editor can
+        # read it. Purely additive — nothing renders from it.
+        if smart and isinstance(raw_style.get("layout_constraints"), dict):
+            style["layout_constraints"] = raw_style["layout_constraints"]
+
         # Crop from what the element *became*, not what it was called.
         #
         # A flat page background resolves to a COLOR_BLOCK a dozen lines up,
@@ -963,16 +1161,44 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
             else None
         )
 
+        # The visible box, as a fraction of the page. For an image whose box
+        # bled off the canvas the crop was clamped to what is actually there,
+        # and the render geometry has to follow it: leaving geometry on the raw
+        # off-canvas box would stretch the clamped crop across empty space with
+        # object-fit:cover and slide the visible region sideways — the "images
+        # cropped differently from the original" failure. Re-deriving geometry
+        # from the crop keeps the pixels that were baked lined up with the box
+        # they render into. Non-image elements keep their raw box (a full-bleed
+        # colour panel is legitimately off-canvas).
+        gx, gy, gw, gh = x_px, y_px, w_px, h_px
+        if smart and crop_box is not None and element_type == ElementType.IMAGE:
+            cl, ct, cr, cb = crop_box
+            if (cr - cl) > 0 and (cb - ct) > 0 and (
+                abs(cl - x_px) > 0.5
+                or abs(ct - y_px) > 0.5
+                or abs((cr - cl) - w_px) > 0.5
+                or abs((cb - ct) - h_px) > 0.5
+            ):
+                gx, gy, gw, gh = cl, ct, cr - cl, cb - ct
+                # What region of the source this crop is, kept so a replaced
+                # photo can be framed the same way rather than re-centred.
+                style["source_box"] = {
+                    "x": round(cl / page.width, 4),
+                    "y": round(ct / page.height, 4),
+                    "width": round((cr - cl) / page.width, 4),
+                    "height": round((cb - ct) / page.height, 4),
+                }
+
         elements.append(
             ExtractedElement(
                 key=key,
                 label=(role.replace("_", " ").strip().title() or f"Element {index + 1}")[:120],
                 element_type=element_type,
                 geometry={
-                    "x": round(x_px / page.width, 4),
-                    "y": round(y_px / page.height, 4),
-                    "width": round(w_px / page.width, 4),
-                    "height": round(h_px / page.height, 4),
+                    "x": round(gx / page.width, 4),
+                    "y": round(gy / page.height, 4),
+                    "width": round(gw / page.width, 4),
+                    "height": round(gh / page.height, 4),
                     "rotation": round(_clamp(transform.get("rotation"), -360, 360), 2),
                 },
                 style_properties=style,
@@ -992,6 +1218,26 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
             "Nothing usable could be extracted from that page. Try a "
             "higher-resolution version, or a PNG export of the design."
         )
+
+    # Rewrite alignment relationships from the reader's throwaway ids onto the
+    # stored keys, dropping any peer that did not survive normalisation. A
+    # relationship pointing at nothing is worse than no relationship, so an
+    # emptied set is removed entirely.
+    if raw_id_to_key:
+        for element in elements:
+            constraints = element.style_properties.get("layout_constraints")
+            if not isinstance(constraints, dict):
+                continue
+            remapped: dict[str, list[str]] = {}
+            for relation, peers in constraints.items():
+                mapped = [raw_id_to_key[p] for p in peers if p in raw_id_to_key]
+                if mapped:
+                    remapped[relation] = mapped
+            if remapped:
+                element.style_properties["layout_constraints"] = remapped
+            else:
+                element.style_properties.pop("layout_constraints", None)
+
     return elements
 
 
@@ -1323,6 +1569,7 @@ def build_template(
     elements: list[ExtractedElement],
     payload: dict,
     description: str = "",
+    fidelity: dict | None = None,
 ) -> Template:
     """Persist the extraction as a Template the editor can open.
 
@@ -1331,6 +1578,19 @@ def build_template(
     """
     background = _colour(payload.get("page", {}).get("background_color")) or "#FFFFFF"
 
+    layout_definition = {
+        "background_color": background,
+        # Kept so a later re-extraction, or anyone debugging geometry, knows
+        # the coordinate space these fractions were measured in.
+        "source_width": page.width,
+        "source_height": page.height,
+    }
+    # A fidelity score, when the validation stage ran. Additive JSON on an
+    # existing field — no migration — and read by the serializer to warn on a
+    # reconstruction that came back looking unlike the source.
+    if fidelity:
+        layout_definition["import_fidelity"] = fidelity
+
     template = Template.objects.create(
         owner=owner,
         name=name,
@@ -1338,13 +1598,7 @@ def build_template(
         description=description,
         category=category,
         style=style,
-        layout_definition={
-            "background_color": background,
-            # Kept so a later re-extraction, or anyone debugging geometry, knows
-            # the coordinate space these fractions were measured in.
-            "source_width": page.width,
-            "source_height": page.height,
-        },
+        layout_definition=layout_definition,
         default_dimension=closest_dimension(page.width, page.height),
         allows_added_elements=True,
         is_active=True,
@@ -1370,6 +1624,47 @@ def build_template(
         row.save()
 
     return template
+
+
+# ---------------------------------------------------------------------------
+# Optional validation and debug — off the cheap path, never fatal
+# ---------------------------------------------------------------------------
+
+
+def _maybe_validate(result, elements, page):
+    """Render-and-compare the extraction if enabled. Returns a result or None.
+
+    Structural PDF reads are exempt: their geometry is the document's own, so
+    there is nothing a screenshot could disagree with, and the point of the
+    structural path is that it costs nothing. Any failure inside validation is
+    swallowed there and surfaces here as None.
+    """
+    if not getattr(settings, "TEMPLATE_IMPORT_VALIDATE", False):
+        return None
+    if getattr(result, "model", "") == "pdf-structure":
+        return None
+
+    from apps.templates.extraction_validation import validate_extraction
+
+    background = _colour(result.payload.get("page", {}).get("background_color")) or "#FFFFFF"
+    outcome = validate_extraction(elements, page, background)
+    if outcome.ok:
+        logger.info(
+            "Import validation scored %.3f with %s element issue(s)",
+            outcome.score,
+            len(outcome.issues),
+        )
+    return outcome
+
+
+def _write_debug(job, page, result, elements, fidelity) -> None:
+    """Write the debug gallery. Best-effort; never disturbs the import."""
+    try:
+        from apps.templates.extraction_debug import write_debug_gallery
+
+        write_debug_gallery(job.pk, page, result.payload, elements, fidelity)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Import debug gallery failed for job %s", job.pk, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1405,6 +1700,15 @@ def run_import(job) -> Template:
     elements = normalise_elements(result.payload, page)
     baked = bake_assets(elements, page)
 
+    # Optional render-and-compare. Skipped for a structural PDF read (its
+    # geometry is the file's own, not a measurement to check) and whenever the
+    # flag is off, so the cheap path stays cheap. It never rewrites geometry and
+    # never fails the import — a low score, or no score at all, is only a note.
+    fidelity = _maybe_validate(result, elements, page)
+
+    if getattr(settings, "TEMPLATE_IMPORT_DEBUG", False):
+        _write_debug(job, page, result, elements, fidelity)
+
     template = build_template(
         owner=job.agent,
         name=_template_name(job.requested_name, result.payload, job.original_filename),
@@ -1418,6 +1722,11 @@ def run_import(job) -> Template:
             f"{len(elements)} elements, {baked} with artwork extracted from the "
             f"page. Every element is editable — attach a listing to fill the "
             f"photos and details with a real property."
+        ),
+        fidelity=(
+            {"score": fidelity.score, "issues": len(fidelity.issues)}
+            if fidelity is not None and fidelity.ok
+            else None
         ),
     )
 

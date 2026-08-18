@@ -251,7 +251,7 @@ class TemplateImportSerializer(serializers.ModelSerializer):
         template = job.template
         if template is None:
             return []
-        return [
+        warnings = [
             {
                 "element": element.label or element.key,
                 "issue": _WARNING_TEXT[fill_type],
@@ -261,6 +261,29 @@ class TemplateImportSerializer(serializers.ModelSerializer):
             for fill_type in [str((element.style_properties or {}).get("fill_type", ""))]
             if fill_type in _WARNING_TEXT
         ]
+
+        # A whole-page fidelity note, when the render-and-compare stage ran and
+        # scored the reconstruction below the threshold. Derived, like the
+        # above, from what was stored on the template rather than a second copy
+        # on the job — and absent entirely when validation was off, which is the
+        # default, so this adds nothing to the common import.
+        fidelity = (template.layout_definition or {}).get("import_fidelity") or {}
+        score = fidelity.get("score")
+        threshold = getattr(settings, "TEMPLATE_IMPORT_VALIDATE_MIN_SCORE", 0.9)
+        if isinstance(score, (int, float)) and score < threshold:
+            warnings.append(
+                {
+                    "element": "",
+                    "issue": (
+                        "The rebuilt layout came back looking noticeably "
+                        f"different from the upload (similarity {score:.0%}). "
+                        "Check the positions and photos in the editor before "
+                        "publishing."
+                    ),
+                    "fill_type": "low_fidelity",
+                }
+            )
+        return warnings
 
 
 class CalendarEventSerializer(serializers.ModelSerializer):
