@@ -438,8 +438,20 @@ export type TemplateImport = {
    *  the moment it has something new to show. */
   template_detail: TemplateSummary | null
   element_count: number
+  /** Elements the extractor could not describe with confidence, surfaced at
+   *  upload time so a half-worked import stops looking like one that worked.
+   *  Derived from the template's own elements, so fixing one in the editor
+   *  clears it rather than leaving a stale complaint behind. */
+  warnings: TemplateImportWarning[]
   created_at: string
   finished_at: string | null
+}
+
+export type TemplateImportWarning = {
+  /** The element's label, so it can be found on the canvas. */
+  element: string
+  issue: string
+  fill_type: string
 }
 
 /** Start an import. Resolves as soon as the file is stored and queued. */
@@ -455,6 +467,46 @@ export function importTemplate(input: {
   body.append('category', input.category)
   body.append('style', input.style)
   return apiRequest<TemplateImport>('/api/template-imports/', { method: 'POST', body })
+}
+
+/**
+ * Move an imported template into the shared library — the Upload button.
+ *
+ * An import lands owned by whoever uploaded it, which makes it a private
+ * draft only they can see. Clearing that owner server-side is what puts it in
+ * front of every agent in every brokerage. Nehrux Admins only; the endpoint
+ * returns 403 to anyone else regardless of what the UI offers.
+ */
+export function publishTemplateToLibrary(id: number): Promise<TemplateDetail> {
+  return apiRequest<TemplateDetail>(`/api/templates/${id}/publish/`, { method: 'POST' })
+}
+
+/** What removing a template did. See `deleteTemplate`. */
+export type TemplateRemoval = {
+  /** True when designs already exist from it, so it was retired rather than
+   *  deleted. Either way it is gone from every agent's gallery. */
+  retired: boolean
+  designs: number
+  detail: string
+}
+
+/**
+ * Take a template out of every agent's Templates panel.
+ *
+ * Two outcomes, and the API reports which: an unused template is deleted
+ * outright (204); one that designs were made from is retired instead (200 with
+ * a body), because `Design.template` is PROTECT and an agent's finished flyer
+ * must not vanish because the library was tidied. Both remove it from the
+ * gallery — the difference only matters for what the UI should say afterwards.
+ *
+ * Nehrux Admins only; the endpoint returns 403 to anyone else.
+ */
+export async function deleteTemplate(id: number): Promise<TemplateRemoval> {
+  const result = await apiRequest<TemplateRemoval | null>(`/api/templates/${id}/`, {
+    method: 'DELETE',
+  })
+  // 204 comes back as null — nothing referenced it, so it is simply gone.
+  return result ?? { retired: false, designs: 0, detail: 'Template deleted.' }
 }
 
 export function fetchTemplateImport(id: number): Promise<TemplateImport> {
@@ -480,18 +532,54 @@ export function fetchDesign(id: number): Promise<Design> {
   return apiRequest<Design>(`/api/designs/${id}/`).then(withDesignCompat)
 }
 
+/**
+ * Attach a property to a design that already exists.
+ *
+ * This is the whole of "Apply to design". Nothing about the elements is sent:
+ * every element that was built to show a property field already carries the
+ * binding, and the server resolves it at render time. So the price arrives in
+ * the price slot and the photos arrive in the photo slots, while anything the
+ * agent typed over themselves is marked `manually_overridden` and is left
+ * exactly as they left it.
+ */
+export function attachListingToDesign(
+  designId: number,
+  listingId: number | null,
+): Promise<Design> {
+  return apiRequest<Design>(`/api/designs/${designId}/`, {
+    method: 'PATCH',
+    body: { listing: listingId },
+  }).then(withDesignCompat)
+}
+
 export function fetchResolvedDesign(id: number, dimension: string): Promise<ResolvedDesign> {
   return apiRequest<ResolvedDesign>(
     `/api/designs/${id}/resolved/?dimension=${dimension}`,
   ).then(withResolvedDesignCompat)
 }
 
+/**
+ * Open a template as a design — resuming yours if you already have one.
+ *
+ * NOT ALWAYS A CREATE, DESPITE THE NAME AND THE VERB
+ * ---------------------------------------------------------------------------
+ * The server hands back the design you already made from this template rather
+ * than adding a near-duplicate, and answers 200 instead of 201 when it does.
+ * That is the whole fix for the designs list filling with copies: opening a
+ * template was the step that duplicated, and four different screens did it.
+ *
+ * Pass `fresh: true` to insist on a new one anyway — the "Start a fresh copy"
+ * button, and nothing else.
+ */
 export function createDesign(payload: {
   name: string
   template: number
   listing?: number | null
-  /** Ties a seasonal design to the occasion it was made for. */
+  /** Ties a seasonal design to the occasion it was made for. Part of the
+   *  server's identity check, so Diwali 2027 does not resume Diwali 2026. */
   calendar_event?: number | null
+  /** Make a second design from this template on purpose. */
+  fresh?: boolean
 }): Promise<Design> {
   // The server copies the template's elements into the new design here. The
   // client deliberately does not send an `elements` array: a design that

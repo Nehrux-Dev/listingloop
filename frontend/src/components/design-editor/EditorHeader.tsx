@@ -16,10 +16,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
+import { DESIGNS_HOME } from '../../lib/routes.ts'
 import {
   IconChevronRight,
   IconCheckCircle,
   IconEye,
+  IconListings,
   IconMinus,
   IconMore,
   IconPanel,
@@ -54,6 +56,14 @@ type Props = {
   saveState: SaveState
   saveError: string | null
   busy: boolean
+
+  /** Leaves for the listings panel to pick or create a property. Present
+   *  always, because a design with the wrong property attached needs the same
+   *  trip as one with none. */
+  onImportListing: () => void
+  /** The address currently feeding this design, when there is one — so the
+   *  button can say whether it is filling a blank or changing an answer. */
+  listingAddress: string | null
 
   onRename: () => void
   onDuplicate: () => void
@@ -99,6 +109,8 @@ export default function EditorHeader({
   saveState,
   saveError,
   busy,
+  onImportListing,
+  listingAddress,
   onRename,
   onDuplicate,
   onDelete,
@@ -131,7 +143,7 @@ export default function EditorHeader({
     <header className="flex h-16 shrink-0 items-center gap-3 border-b border-line bg-surface px-4">
       {/* -- where you are --------------------------------------------- */}
       <Link
-        to="/designs"
+        to={DESIGNS_HOME}
         title="Back to designs"
         className="flex size-9 shrink-0 items-center justify-center rounded-control border border-line text-muted transition hover:bg-hover hover:text-ink"
       >
@@ -141,7 +153,7 @@ export default function EditorHeader({
       <div className="min-w-0">
         <div className="flex min-w-0 items-center gap-1.5">
           <Link
-            to="/designs"
+            to={DESIGNS_HOME}
             className="shrink-0 text-[13px] font-medium text-muted transition hover:text-ink"
           >
             Designs
@@ -208,6 +220,30 @@ export default function EditorHeader({
 
       {/* -- document actions ------------------------------------------ */}
       <div className="flex shrink-0 items-center gap-2">
+        {/* First in the row because it is first in the job: a property flyer
+            with no property in it is what an agent is looking at when they
+            arrive here from a blank template. */}
+        <button
+          type="button"
+          onClick={onImportListing}
+          disabled={busy}
+          title={
+            listingAddress
+              ? `Currently showing ${listingAddress}. Pick a different property.`
+              : 'Bring a property into this design'
+          }
+          className={`flex items-center gap-1.5 rounded-control border px-3 py-2 text-[13px] font-medium transition disabled:opacity-50 ${
+            listingAddress
+              ? 'border-line hover:bg-hover'
+              : 'border-brand/40 bg-brand-soft text-brand hover:bg-brand-soft/70'
+          }`}
+        >
+          <IconListings className="size-4" />
+          <span className="max-w-40 truncate">
+            {listingAddress ?? 'Import listing'}
+          </span>
+        </button>
+
         <button
           type="button"
           onClick={onPreview}

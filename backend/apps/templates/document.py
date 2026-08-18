@@ -289,8 +289,13 @@ FONT_WEIGHTS = {"300", "400", "500", "600", "700", "800", "900"}
 #: directions: a family the renderer does not have falls back to whatever
 #: fontconfig picks, so the export silently disagrees with the editor; and an
 #: arbitrary string is one more value being interpolated into a ``style``
-#: attribute. Four roles cover what a property flyer actually uses.
-FONT_FAMILIES = {"body", "display", "serif", "mono"}
+#: attribute.
+#:
+#: ``script`` was the fifth, added because luxury property artwork routinely
+#: sets its headline in flowing calligraphy — "Dream House" across a hero shot
+#: — and rendering that in a serif is the single most obvious way an imported
+#: template stops looking like the flyer it came from.
+FONT_FAMILIES = {"body", "display", "serif", "mono", "script"}
 TEXT_ALIGNMENTS = {"left", "center", "right"}
 VERTICAL_ALIGNMENTS = {"flex-start", "center", "flex-end"}
 FONT_STYLES = {"normal", "italic"}
@@ -303,6 +308,28 @@ OBJECT_POSITIONS = {
     "left bottom", "center bottom", "right bottom",
 }
 BORDER_STYLES = {"solid", "dashed", "dotted"}
+
+#: How a shape's interior is filled.
+#:
+#: Recorded rather than inferred, because "what colour is this panel" has no
+#: single answer for three of these five. A dotted ground flattened to one hex
+#: is a different design; a gradient sampled at its midpoint is a colour that
+#: appears nowhere on the page. `unsupported_pattern` is the honest outcome
+#: when a fill is none of the others — it says "a human should look at this"
+#: instead of quietly picking a plausible wrong colour.
+FILL_TYPES = {
+    "solid_color",
+    "dot_pattern",
+    "gradient",
+    "image_texture",
+    "unsupported_pattern",
+}
+
+#: What an element's outline actually is. A bounding box is the right answer
+#: for a rectangle and a lie for anything else: a rounded tab squared off at
+#: the corners, or a blob rendered as the box around it, is a different shape
+#: in a way anybody looking at the page can see.
+SHAPE_TYPES = {"rectangle", "rounded_rect", "ellipse", "blob"}
 
 #: Numeric style fields and the range each is allowed. Both ends of every range
 #: are still a design somebody might want; outside them the result is either
@@ -322,6 +349,13 @@ NUMERIC_STYLE_RANGES: dict[str, tuple[float, float]] = {
     "image_scale": (1.0, 4.0),
     "image_offset_x": (-1.0, 1.0),
     "image_offset_y": (-1.0, 1.0),
+    #: A dotted ground, kept as a pattern rather than flattened into one solid
+    #: rectangle. Every measure is a fraction of the canvas's smaller side, the
+    #: same scale font sizes use, so the pattern survives a change of output
+    #: size instead of turning into specks or dinner plates.
+    "dot_radius_ratio": (0.0002, 0.1),
+    "dot_spacing_x_ratio": (0.001, 0.5),
+    "dot_spacing_y_ratio": (0.001, 0.5),
 }
 
 STRING_STYLE_CHOICES: dict[str, set[str]] = {
@@ -335,10 +369,12 @@ STRING_STYLE_CHOICES: dict[str, set[str]] = {
     "object_fit": OBJECT_FITS,
     "object_position": OBJECT_POSITIONS,
     "border_style": BORDER_STYLES,
+    "fill_type": FILL_TYPES,
+    "shape_type": SHAPE_TYPES,
 }
 
 COLOR_STYLE_FIELDS = frozenset(
-    {"color", "background_color", "border_color", "tint_color"}
+    {"color", "background_color", "border_color", "tint_color", "dot_color"}
 )
 
 #: A polygon needs at least a triangle; past a few dozen vertices it is
@@ -352,7 +388,7 @@ STYLE_FIELDS = (
     frozenset(NUMERIC_STYLE_RANGES)
     | frozenset(STRING_STYLE_CHOICES)
     | COLOR_STYLE_FIELDS
-    | frozenset({"background_gradient", "format", "clip_polygon"})
+    | frozenset({"background_gradient", "format", "clip_polygon", "group_id"})
 )
 
 
@@ -420,6 +456,27 @@ def _validate_image_key(key: str, value: Any) -> str:
     return value
 
 
+#: A group label is a plain slug the extractor invented — "group_3". Bounded
+#: and character-restricted because it is the one style value that is neither a
+#: colour, a number nor a fixed choice, and an unbounded string on an element is
+#: how a document grows a payload nobody validates.
+GROUP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+
+def _validate_group_id(key: str, value: Any) -> str:
+    """Which visual group this element belongs to, if any.
+
+    Stored on the style rather than as its own column so a group survives the
+    template-to-design copy without a migration — `style_properties` is already
+    the bag that travels intact, and grouping is a property of the element in
+    exactly the way a colour is.
+    """
+    text = str(value).strip().lower()
+    if not GROUP_ID_RE.match(text):
+        _fail(key, _("group_id must be a short slug."))
+    return text
+
+
 def _validate_style(key: str, raw: Any) -> dict:
     """Clean one element's style.
 
@@ -456,6 +513,8 @@ def _validate_style(key: str, raw: Any) -> dict:
                     % {"field": field, "options": ", ".join(sorted(options))},
                 )
             clean[field] = str(value)
+        elif field == "group_id":
+            clean[field] = _validate_group_id(key, value)
         elif field == "clip_polygon":
             clean[field] = _validate_clip_polygon(key, value)
         elif field == "background_gradient":

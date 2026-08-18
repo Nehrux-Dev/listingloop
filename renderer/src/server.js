@@ -23,6 +23,14 @@ const TOKEN = process.env.RENDERER_TOKEN ?? ''
 const MAX_BODY_BYTES = 24 * 1024 * 1024
 const MAX_PIXELS = 30_000_000
 
+/** Shrink-to-fit floor, as a fraction of the size the template asked for.
+ *  Past this the type is too small to read, and a clipped word is a more
+ *  honest failure than an illegible one. */
+const FIT_MIN_SCALE = 0.5
+/** Halving steps in the fit search. Fixed rather than "until it fits" so the
+ *  result is deterministic and the editor canvas lands on the same pixel. */
+const FIT_STEPS = 8
+
 function send(response, status, body, contentType = 'application/json') {
   const payload = contentType === 'application/json' ? JSON.stringify(body) : body
   response.writeHead(status, {
@@ -92,6 +100,48 @@ async function handleRender(request, response) {
 
     await page.setContent(html, { waitUntil: 'load' })
     await page.evaluate(() => document.fonts.ready)
+
+    // Shrink-to-fit.
+    //
+    // A template's font size is a ratio of the page, measured off artwork set
+    // in a typeface we do not have. Text can therefore render wider here than
+    // it did there and outgrow the box it was measured into; `overflow:hidden`
+    // then cuts "$700,000" down to "$700,0", which is a plausible-looking
+    // wrong number rather than an obvious failure.
+    //
+    // This runs HERE, and not as a <script> in the document, because pages are
+    // rendered with javaScriptEnabled:false — see browser.js. That stays: the
+    // markup carries user-influenced content and nothing in a template should
+    // need scripting. `page.evaluate` is renderer code, not page code, and
+    // still runs with scripting off.
+    //
+    // After document.fonts.ready on purpose: the pass measures real glyph
+    // widths, and against the fallback face it would size text for a font the
+    // image is not going to be drawn in.
+    //
+    // The editor canvas runs this identical loop — same floor, same fixed step
+    // count, same overflow test — so what an agent lays out is what exports.
+    // See FIT_MIN_SCALE / FIT_STEPS in ElementLayer.tsx; change one, change both.
+    await page.evaluate(
+      ({ minScale, steps }) => {
+        const over = (el) =>
+          el.scrollWidth > el.clientWidth + 0.5 || el.scrollHeight > el.clientHeight + 0.5
+        for (const el of document.querySelectorAll('[data-fit]')) {
+          const base = parseFloat(el.style.fontSize)
+          if (!(base > 0) || !over(el)) continue
+          let lo = base * minScale
+          let hi = base
+          for (let step = 0; step < steps; step += 1) {
+            const mid = (lo + hi) / 2
+            el.style.fontSize = `${mid}px`
+            if (over(el)) hi = mid
+            else lo = mid
+          }
+          el.style.fontSize = `${lo}px`
+        }
+      },
+      { minScale: FIT_MIN_SCALE, steps: FIT_STEPS },
+    )
 
     let buffer, contentType
     if (format === 'pdf') {

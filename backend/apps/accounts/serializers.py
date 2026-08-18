@@ -125,10 +125,31 @@ class RegisterSerializer(serializers.ModelSerializer):
 class LoginSerializer(serializers.Serializer):
     """Validates credentials and returns the matching user in ``validated_data``."""
 
-    email = serializers.EmailField()
+    # A CharField, not an EmailField, because the identifier may be a plain
+    # name. Accounts are still keyed by e-mail — USERNAME_FIELD has not moved —
+    # but the staff accounts this product is administered from are given out as
+    # a name and a password, not as an address, and rejecting that at the form
+    # before it ever reaches `authenticate` makes them unable to sign in at all.
+    # `_resolve_identifier` turns a bare name back into the address it belongs to.
+    email = serializers.CharField()
     password = serializers.CharField(
         write_only=True, style={"input_type": "password"}, trim_whitespace=False
     )
+
+    @staticmethod
+    def _resolve_identifier(raw: str) -> str:
+        """A bare name -> the e-mail it identifies, when exactly one does.
+
+        Ambiguity is left unresolved on purpose: two accounts whose addresses
+        start `nehrux@` cannot be told apart from the name alone, and picking
+        one would let somebody sign in as an account they did not name. An
+        unresolved identifier simply fails to authenticate, which is the same
+        answer an unknown one gets.
+        """
+        if "@" in raw:
+            return raw
+        matches = User.objects.filter(email__istartswith=f"{raw}@")[:2]
+        return matches[0].email if len(matches) == 1 else raw
 
     def validate(self, attrs: dict) -> dict:
         # `authenticate` also rejects inactive users (ModelBackend runs
@@ -137,7 +158,7 @@ class LoginSerializer(serializers.Serializer):
         # exist.
         user = authenticate(
             request=self.context.get("request"),
-            username=attrs["email"].strip().lower(),
+            username=self._resolve_identifier(attrs["email"].strip().lower()),
             password=attrs["password"],
         )
 

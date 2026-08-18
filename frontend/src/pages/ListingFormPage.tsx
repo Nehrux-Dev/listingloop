@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 import {
   LISTING_STATUSES,
@@ -28,7 +28,14 @@ import {
   fieldErrors,
 } from '../components/FormControls.tsx'
 import { VerificationBadge } from '../components/VerificationBadge.tsx'
+import { attachListingToDesign } from '../api/templates.ts'
 import { ApiError } from '../lib/apiClient.ts'
+import {
+  designEditorPath,
+  designIdFromParams,
+  keepForDesign,
+  listingsForDesignPath,
+} from '../lib/routes.ts'
 
 const FIELD_LABELS: Record<string, string> = {
   address: 'street address',
@@ -40,8 +47,13 @@ const FIELD_LABELS: Record<string, string> = {
 export default function ListingFormPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [params] = useSearchParams()
   const isNew = id === undefined
   const listingId = isNew ? null : Number(id)
+
+  /** Set when the agent came from a design that is waiting for a property. */
+  const forDesign = designIdFromParams(params)
+  const [applying, setApplying] = useState(false)
 
   const [listing, setListing] = useState<Listing | null>(null)
   const [form, setForm] = useState<ListingInput>(emptyListingInput())
@@ -80,6 +92,25 @@ export default function ListingFormPage() {
     setFeatureDraft('')
   }
 
+  /** Attach this listing to the waiting design and go back to the canvas. */
+  async function applyToDesign() {
+    if (forDesign === null || listingId === null || applying) return
+    setApplying(true)
+    setErrors({})
+    try {
+      await attachListingToDesign(forDesign, listingId)
+      void navigate(designEditorPath(forDesign), { replace: true })
+    } catch (error) {
+      setErrors({
+        detail:
+          error instanceof ApiError
+            ? error.message
+            : 'That property could not be applied to the design.',
+      })
+      setApplying(false)
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setSaving(true)
@@ -89,7 +120,10 @@ export default function ListingFormPage() {
     try {
       if (listingId === null) {
         const created = await createListing(form)
-        void navigate(`/listings/${created.id}`, { replace: true })
+        // Straight on to the created listing, still carrying the design that
+        // is waiting for it — a new listing starts unverified, and that
+        // screen is where it gets verified and applied.
+        void navigate(keepForDesign(`/listings/${created.id}`, params), { replace: true })
         return
       }
       const updated = await updateListing(listingId, form)
@@ -220,6 +254,34 @@ export default function ListingFormPage() {
         </div>
         {listing && <VerificationBadge listing={listing} />}
       </div>
+
+      {/* The design that sent them here, and the one control that finishes
+          the trip. Verification is the gate the server enforces, so an
+          unverified listing says what is still missing instead of offering a
+          button that would be refused. */}
+      {forDesign !== null && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-300 bg-slate-50 px-4 py-3">
+          <p className="mr-auto text-sm text-slate-700">
+            {listing?.verification_status === 'verified'
+              ? 'This property is ready to use in your design.'
+              : 'Verify this listing and you can apply it to your design.'}
+          </p>
+          <Link
+            to={listingsForDesignPath(forDesign)}
+            className="shrink-0 text-sm font-medium text-slate-600 underline underline-offset-2 transition hover:text-slate-900"
+          >
+            Choose a different one
+          </Link>
+          <button
+            type="button"
+            onClick={() => void applyToDesign()}
+            disabled={applying || listing?.verification_status !== 'verified'}
+            className="shrink-0 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {applying ? 'Applying…' : 'Apply to design'}
+          </button>
+        </div>
+      )}
 
       {message && <Alert kind="success">{message}</Alert>}
       {errors.detail && <Alert kind="error">{errors.detail}</Alert>}

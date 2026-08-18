@@ -313,6 +313,15 @@ export const IconArrowRight = (p: IconProps) => (
   </Svg>
 )
 
+/** Leaves this tab — used only where the click really does open a new one. */
+export const IconExternal = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M13.5 4.5H19.5V10.5" />
+    <path d="M19.5 4.5 11 13" />
+    <path d="M18 14.5v4a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6h4" />
+  </Svg>
+)
+
 // -- canvas dock -------------------------------------------------------------
 
 export const IconCursor = (p: IconProps) => (

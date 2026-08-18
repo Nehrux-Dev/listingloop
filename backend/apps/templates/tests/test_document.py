@@ -116,19 +116,27 @@ class TemplateToDesignCopyTests(DocumentTestCase):
         )
 
     def test_the_template_endpoint_is_read_only(self):
-        """The other half of the same promise, checked at the door."""
+        """The other half of the same promise, checked at the door.
+
+        DELETE answers 403 rather than 405, and the difference is real: the
+        method exists now, for the platform owner removing something from the
+        shared library (see RemoveFromLibraryTests). An agent is refused by
+        permission instead of by the method not being there at all. Editing a
+        template is still nobody's — 405 for everyone, whatever their role.
+        """
         url = self.template_detail_url(self.template)
         for method, payload in (
             (self.client.put, {"name": "Hijacked"}),
             (self.client.patch, {"name": "Hijacked"}),
-            (self.client.delete, None),
         ):
             with self.subTest(method=method.__name__):
-                response = method(url, payload, format="json") if payload else method(url)
-                self.assertEqual(response.status_code, 405)
+                self.assertEqual(method(url, payload, format="json").status_code, 405)
+
+        self.assertEqual(self.client.delete(url).status_code, 403)
 
         self.template.refresh_from_db()
         self.assertEqual(self.template.name, "Test Template")
+        self.assertTrue(self.template.is_active)
 
     def test_a_design_made_outside_the_api_still_gets_a_document(self):
         """The admin, a shell, a fixture. An empty canvas is not a state a

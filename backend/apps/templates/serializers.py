@@ -178,6 +178,22 @@ def _looks_like_image(uploaded) -> bool:
         uploaded.seek(0)
 
 
+#: Fill types that mean "a person should look at this", and what to tell them.
+#: Anything not listed here extracted cleanly and is not worth a warning —
+#: a review list that cries wolf is one nobody reads.
+_WARNING_TEXT = {
+    "unsupported_pattern": (
+        "The fill could not be identified — it may be a gradient, a texture or "
+        "a tiling pattern. The shape is there but has no colour; set one in the "
+        "editor."
+    ),
+    "image_texture": (
+        "A photographic or textured fill, kept as a plain shape. Replace it with "
+        "an image in the editor if it matters."
+    ),
+}
+
+
 class TemplateImportSerializer(serializers.ModelSerializer):
     """One import job, as the gallery polls it.
 
@@ -189,6 +205,7 @@ class TemplateImportSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source="get_status_display", read_only=True)
     template_detail = TemplateListSerializer(source="template", read_only=True)
     is_finished = serializers.BooleanField(read_only=True)
+    warnings = serializers.SerializerMethodField()
 
     class Meta:
         model = TemplateImport
@@ -199,6 +216,7 @@ class TemplateImportSerializer(serializers.ModelSerializer):
             "status_display",
             "is_finished",
             "error",
+            "warnings",
             "template",
             "template_detail",
             "element_count",
@@ -206,6 +224,43 @@ class TemplateImportSerializer(serializers.ModelSerializer):
             "finished_at",
         )
         read_only_fields = fields
+
+    def get_warnings(self, job) -> list[dict]:
+        """Elements the extractor could not describe with confidence.
+
+        WHY THIS IS SURFACED RATHER THAN SWALLOWED
+        --------------------------------------------------------------------
+        An import that half-worked used to look exactly like one that worked:
+        a shape with a fill nothing could classify was dropped or flattened to
+        a guess, and the first anyone knew was noticing the flyer looked wrong
+        weeks later. A silent partial failure is the expensive kind.
+
+        So anything unclassified keeps its box and says so, and this reports
+        those at the moment of upload — when the person who chose the file is
+        still looking at the screen and can fix them in the editor before
+        publishing to every agent.
+
+        DERIVED, NOT STORED
+        --------------------------------------------------------------------
+        Read from the template's own elements rather than kept in a column on
+        the job. The flag already lives in `style_properties.fill_type`, so a
+        second copy would need a migration and could then disagree with the
+        thing it describes — an element fixed in the editor would still be
+        reported as broken.
+        """
+        template = job.template
+        if template is None:
+            return []
+        return [
+            {
+                "element": element.label or element.key,
+                "issue": _WARNING_TEXT[fill_type],
+                "fill_type": fill_type,
+            }
+            for element in template.elements.all()
+            for fill_type in [str((element.style_properties or {}).get("fill_type", ""))]
+            if fill_type in _WARNING_TEXT
+        ]
 
 
 class CalendarEventSerializer(serializers.ModelSerializer):
@@ -279,6 +334,15 @@ class DesignSerializer(serializers.ModelSerializer):
     exports = DesignExportSerializer(many=True, read_only=True)
     listing_address = serializers.CharField(source="listing.full_address", read_only=True)
 
+    #: "Yes, I really do want a second one." See `create` for why the default
+    #: is the opposite, and why this lives on the server rather than being a
+    #: rule each screen remembers to follow.
+    fresh = serializers.BooleanField(write_only=True, required=False, default=False)
+
+    #: Set by `create` when it handed back a design that already existed, so
+    #: the viewset can answer 200 rather than claiming it made something.
+    reused_existing = False
+
     class Meta:
         model = Design
         fields = (
@@ -292,6 +356,7 @@ class DesignSerializer(serializers.ModelSerializer):
             "calendar_event",
             "elements",
             "exports",
+            "fresh",
             "created_at",
             "updated_at",
         )
@@ -368,18 +433,20 @@ class DesignSerializer(serializers.ModelSerializer):
         if template is None:
             raise serializers.ValidationError({"template": "A template is required."})
 
-        # A seasonal template needs no property; a "Just Sold" one is
-        # meaningless without it and would render with empty fields.
-        listing = attrs.get("listing", getattr(self.instance, "listing", None))
-        if template.requires_listing and listing is None:
-            raise serializers.ValidationError(
-                {
-                    "listing": (
-                        f"“{template.name}” describes a specific property, so it "
-                        f"needs a listing."
-                    )
-                }
-            )
+        # A property template no longer demands its property up front.
+        #
+        # It used to: creating a "Just Sold" without a listing was refused
+        # here. That forced the choice of property to happen in the gallery,
+        # before the agent had seen the design — so the library defaulted it to
+        # their most recent listing, and every template they opened silently
+        # became about that property whether they meant it or not.
+        #
+        # The requirement has not been dropped, it has moved to the moment it
+        # is actually real. `readiness.assess_design` refuses to export any
+        # design whose bound elements resolve to nothing, names the empty
+        # fields, and links to the listing screen — so an empty flyer still
+        # cannot reach a client, and an agent can lay one out before deciding
+        # which property it is for.
 
         # The whole canvas arrives in one autosave and is re-checked in full.
         # Not for permission — there is none — but because every value here is
@@ -398,6 +465,8 @@ class DesignSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data: dict) -> Design:
+        fresh = validated_data.pop("fresh", False)
+
         if not validated_data.get("agent"):
             request = self.context.get("request")
             profile = AgentProfile.objects.filter(user=request.user).first()
@@ -406,6 +475,43 @@ class DesignSerializer(serializers.ModelSerializer):
                     {"agent": "You need an agent profile before creating designs."}
                 )
             validated_data["agent"] = profile
+
+        # ONE DESIGN PER TEMPLATE, UNLESS A SECOND IS ASKED FOR.
+        #
+        # Opening a template you have already customised resumes that design
+        # rather than starting another. Without this, every visit to a template
+        # left a new row: an agent who opened "Just Listed" on three days had
+        # three near-identical designs and no way to tell which held the edits
+        # they actually made.
+        #
+        # This is enforced here, and not in the screens that open templates,
+        # because there are four of them — the gallery, the content calendar,
+        # the editor's own template picker, and anything added later. Three of
+        # the four had the bug; a rule each screen has to remember is a rule
+        # that gets forgotten, so the endpoint keeps it instead.
+        #
+        # `calendar_event` is part of the identity: Diwali 2026 and Diwali 2027
+        # are different events on the same seasonal template, and collapsing
+        # them would make this year's post overwrite last year's. Everything
+        # else — the listing especially — is not, because attaching a property
+        # is something you do to a design *after* opening it.
+        #
+        # Deliberate copies are untouched: `fresh=true` is the "Start a fresh
+        # copy" button, and Duplicate / Add variation are a different endpoint
+        # entirely.
+        if not fresh:
+            existing = (
+                Design.objects.filter(
+                    agent=validated_data["agent"],
+                    template=validated_data["template"],
+                    calendar_event=validated_data.get("calendar_event"),
+                )
+                .order_by("-updated_at")
+                .first()
+            )
+            if existing is not None:
+                self.reused_existing = True
+                return existing
 
         # THE COPY. Opening a template for editing gives the agent their own
         # elements, there and then — not a reference to the template's, and not

@@ -91,7 +91,7 @@ import VariationsStrip from '../components/design-editor/VariationsStrip.tsx'
 import { Alert } from '../components/FormControls.tsx'
 import { ElementControls } from '../components/ElementControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
-import { designEditorPath } from '../lib/routes.ts'
+import { DESIGNS_HOME, designEditorPath, listingsForDesignPath } from '../lib/routes.ts'
 
 /** A field this design needs, and the screen that fills it in. */
 type MissingField = {
@@ -918,11 +918,16 @@ export default function DesignEditorPage() {
   /**
    * Pick another template from the left rail.
    *
-   * Starts a new design rather than re-templating this one. The elements on
-   * this canvas were copied from the current template, so changing it would
-   * throw the whole canvas away — this design is left exactly as it is, and
-   * the new one opens beside it in the list. The panel says as much before
-   * you click.
+   * Moves to *that template's* design rather than re-templating this one. The
+   * elements on this canvas were copied from the current template, so changing
+   * it would throw the whole canvas away — this design is left exactly as it
+   * is, and the other one opens in its place.
+   *
+   * "That template's design" and not "a new design": if the agent has already
+   * customised the template they are picking, the server hands that back
+   * instead of adding another near-identical row to their designs panel. This
+   * call site was one of the ones producing them — switching templates twice
+   * in one session used to leave two abandoned designs behind.
    */
   async function startFromTemplate(picked: TemplateSummary) {
     if (!design || picked.id === design.template) return
@@ -935,6 +940,9 @@ export default function DesignEditorPage() {
         // Imported templates take the listing across too: they can bind
         // property fields without sitting in a listing category, and dropping
         // it here would quietly unpick the property on switching.
+        //
+        // Ignored when an existing design is resumed — its own listing stands,
+        // because that is a choice the agent already made on that design.
         listing: picked.requires_listing || picked.is_imported ? design.listing : null,
       })
       void navigate(designEditorPath(created.id))
@@ -1009,7 +1017,24 @@ export default function DesignEditorPage() {
   async function handleDelete() {
     if (!window.confirm('Delete this design? Its exports go with it.')) return
     await deleteDesign(designId)
-    void navigate('/designs', { replace: true })
+    void navigate(DESIGNS_HOME, { replace: true })
+  }
+
+  /**
+   * Leave for the listings panel to bring a property into this design.
+   *
+   * The draft is persisted first and deliberately not in the background: this
+   * navigation unmounts the editor, which would take the autosave timer with
+   * it, and coming back to find the last thirty seconds of work missing is
+   * not a trade worth making for one saved request. A failed save cancels the
+   * trip rather than leaving quietly with the work behind.
+   */
+  async function goToListings() {
+    if (dirty) {
+      await persist(draft)
+      if (saveState === 'error') return
+    }
+    void navigate(listingsForDesignPath(designId))
   }
 
   if (loadError) {
@@ -1100,6 +1125,8 @@ export default function DesignEditorPage() {
         saveState={saveState}
         saveError={saveError}
         busy={busy}
+        onImportListing={() => void goToListings()}
+        listingAddress={design.listing_address ?? null}
         onRename={() => void handleRename()}
         onDuplicate={() => void handleDuplicate()}
         onDelete={() => void handleDelete()}

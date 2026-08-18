@@ -48,7 +48,8 @@ import logging
 import re
 import uuid
 
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -63,7 +64,14 @@ from apps.ai_content.client import (
     image_part,
 )
 from apps.templates.dimensions import SOCIAL_DIMENSIONS
-from apps.templates.document import FONT_FAMILIES, HEX_COLOR, PROPERTY_FIELDS_BY_NAME
+from apps.templates.document import (
+    FILL_TYPES,
+    FONT_FAMILIES,
+    HEX_COLOR,
+    PROPERTY_FIELDS_BY_NAME,
+    SHAPE_TYPES,
+)
+from apps.templates.pdf_extraction import extract_pdf_layout, is_text_pdf
 from apps.templates.models import (
     ElementType,
     Template,
@@ -275,6 +283,32 @@ STYLE
 - Colours are hex, like "#1F2937". Use "" where a colour does not apply.
 - Report the colour you actually see, sampled from the artwork.
 
+FILL TYPE — do NOT default to solid_color
+- solid_color: one flat fill. Take the hex from the LARGEST continuous area of
+  that colour, sampled at its CENTRE — never from an edge, a shadow, or a spot
+  where something overlaps it.
+- dot_pattern: a repeating grid of dots. Give dot_color, dot_radius_px,
+  dot_spacing_x_px and dot_spacing_y_px so the grid can be redrawn. Do not
+  flatten it into one solid rectangle, and do not report the dots as hundreds
+  of separate elements.
+- gradient: a fade. Set "gradient" to to_bottom or to_top and give
+  background_color as the solid end of the fade.
+- image_texture: a photographic or noisy fill.
+- unsupported_pattern: anything you cannot describe with the above. Use it.
+
+COLOUR SAMPLING
+- Sample where nothing sits on top: no overlapping element, no shadow, no
+  translucent layer above it. A panel that darkens towards its edges must be
+  sampled from the flattest part of its middle, not from the top or bottom.
+- If you are not confident of a colour, do NOT fall back to black or to any
+  placeholder. Report your best hex, and note the uncertainty by choosing
+  "unsupported_pattern" for the fill so a person reviews it.
+
+SHAPE
+- Do not assume everything is a rectangle. Set shape_type: "rounded_rect" with
+  a border_radius_px, "ellipse" for circles and ovals, "blob" for organic or
+  irregular edges — and for a blob, trace its outline into "mask".
+
 Return every element you can see, including background panels and decorative
 shapes. Do not merge two separate text blocks into one element.
 """
@@ -296,8 +330,16 @@ def _extraction_schema() -> dict:
             "page": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["background_color", "suggested_name"],
+                "required": ["background_color", "suggested_name", "width", "height"],
                 "properties": {
+                    "width": {
+                        "type": "number",
+                        "description": "Canvas width in pixels — echo the size you were given.",
+                    },
+                    "height": {
+                        "type": "number",
+                        "description": "Canvas height in pixels — echo the size you were given.",
+                    },
                     "background_color": {
                         "type": "string",
                         "description": "Hex colour of the page beneath everything.",
@@ -377,11 +419,12 @@ def _extraction_schema() -> dict:
                                 },
                                 "font_family": {
                                     "type": "string",
-                                    "enum": ["body", "display", "serif", "mono", ""],
+                                    "enum": ["body", "display", "serif", "mono", "script", ""],
                                     "description": (
                                         "'display' for a narrow/condensed headline face, "
                                         "'body' for normal-width text, 'serif' for a "
-                                        "serif face, 'mono' for monospaced. '' for "
+                                        "serif face, 'script' for flowing calligraphy or "
+                                        "handwriting, 'mono' for monospaced. '' for "
                                         "non-text elements."
                                     ),
                                 },
@@ -396,6 +439,58 @@ def _extraction_schema() -> dict:
                                 "line_height": {"type": "number"},
                                 "opacity": {"type": "number"},
                                 "border_radius_px": {"type": "number"},
+                                "border_width_px": {
+                                    "type": "number",
+                                    "description": (
+                                        "Outline thickness in page pixels. A rule box "
+                                        "around a strapline is an outline, not a filled "
+                                        "shape — report 0 when there is no border."
+                                    ),
+                                },
+                                "border_color": {"type": "string"},
+                                "fill_type": {
+                                    "type": "string",
+                                    "enum": sorted(FILL_TYPES) + [""],
+                                    "description": (
+                                        "How the interior is filled. Do NOT default to "
+                                        "solid_color. 'dot_pattern' for a repeating grid "
+                                        "of dots, 'gradient' for a fade, 'image_texture' "
+                                        "for photographic or noisy fill, and "
+                                        "'unsupported_pattern' when it is none of these "
+                                        "— guessing a flat colour for a patterned area "
+                                        "is worse than saying you could not tell."
+                                    ),
+                                },
+                                "shape_type": {
+                                    "type": "string",
+                                    "enum": sorted(SHAPE_TYPES) + [""],
+                                    "description": (
+                                        "Do not assume rectangle. 'rounded_rect' with a "
+                                        "border_radius_px, 'ellipse' for a circle or "
+                                        "oval, 'blob' for organic or irregular edges "
+                                        "(give its outline in `mask`)."
+                                    ),
+                                },
+                                "dot_color": {"type": "string"},
+                                "dot_radius_px": {"type": "number"},
+                                "dot_spacing_x_px": {
+                                    "type": "number",
+                                    "description": "Centre-to-centre gap between columns of dots.",
+                                },
+                                "dot_spacing_y_px": {
+                                    "type": "number",
+                                    "description": "Centre-to-centre gap between rows of dots.",
+                                },
+                                "gradient": {
+                                    "type": "string",
+                                    "enum": ["", "to_bottom", "to_top"],
+                                    "description": (
+                                        "Set on a panel that fades from transparent into "
+                                        "its background_color rather than being flat — "
+                                        "the wash a hero photo dissolves into. "
+                                        "'to_bottom' means opaque at the bottom."
+                                    ),
+                                },
                             },
                         },
                     },
@@ -439,6 +534,238 @@ def extract_layout(page: RasterPage) -> CompletionResult:
         raise TemplateImportError(
             "The design could not be analysed just now. Try importing it again."
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Step 2b — tidy what came back
+# ---------------------------------------------------------------------------
+#
+# Both readers measure each element on its own, and neither can see intent. A
+# designer aligned two panels; the extractor reports them four pixels apart.
+# That difference is invisible at source scale and obvious once the template is
+# re-rendered at another size, because the error scales with everything else.
+
+#: How far apart two edges may be and still be called the same edge, as a
+#: fraction of the page's shorter side. Half a percent: a designer working with
+#: snapping produces exact matches, so anything under this is manual-placement
+#: slop rather than a decision. A floor keeps it sane on tiny canvases.
+_SNAP_RATIO, _SNAP_FLOOR_PX = 0.005, 3.0
+
+#: A gap smaller than this, as a fraction of the shorter side, reads as "these
+#: belong together" — an icon and its label, a logo and its tagline.
+_GROUP_GAP_RATIO = 0.02
+
+#: How much two boxes must overlap on the perpendicular axis before adjacency
+#: means anything. Two things side by side are related; two things at opposite
+#: ends of the page that happen to be close in one axis are not.
+_GROUP_OVERLAP = 0.5
+
+#: What can be *in* a group. Panels, grounds and rules are deliberately absent.
+#:
+#: They are containers: a panel touches everything sitting on it, so including
+#: them chains every neighbour to every other neighbour through the thing they
+#: happen to sit on. The first version of this did include them and produced
+#: one group of forty-two elements — technically a connected component, and a
+#: useless answer. A group is an icon and its label, a logo and its tagline:
+#: content that reads as one thing.
+_GROUPABLE_TYPES = frozenset({"text", "image", "icon", "logo"})
+
+#: Past this a "group" is a region of the page, not a thing you would move
+#: together. Oversized components are dropped rather than labelled, because a
+#: wrong group is worse than no group — it makes the editor move elements the
+#: user did not mean to touch.
+_GROUP_MAX_MEMBERS = 6
+
+
+def _snap_axis(elements: list[dict], pos: str, size: str, tolerance: float) -> None:
+    """Pull near-identical edges and centres onto one value, in place.
+
+    Three anchors per axis — leading edge, centre, trailing edge — because a
+    row of centred captions under photos is as deliberate an alignment as a
+    column of left-aligned text, and only one of those shows up in `x`.
+
+    Anchors are applied in priority order and an element is settled by the
+    first one that has anything to say about it. That ordering is what makes
+    the guarantee hold: two boxes whose leading edges are within tolerance are
+    *both* settled by the leading edge, so they come out identical. Letting
+    each element pick whichever anchor moved it least felt more careful and
+    was worse — the two would choose different anchors and land a pixel apart,
+    which is the exact thing this is here to remove.
+
+    Leading edge first because a column of left-aligned text is the commonest
+    alignment there is; centres next, for a row of captions under photos;
+    trailing edges last. Boxes of different widths cannot satisfy two of those
+    at once, so one has to win.
+    """
+
+    def anchors(element: dict) -> dict[str, float]:
+        start = float(element["transform"][pos])
+        extent = float(element["transform"][size])
+        return {"start": start, "center": start + extent / 2, "end": start + extent}
+
+    original = {id(element): anchors(element) for element in elements}
+    settled: set[int] = set()
+
+    for anchor in ("start", "center", "end"):
+        # Cluster this anchor's values. Only runs of two or more mean anything:
+        # a lone value has nothing to be aligned *with*.
+        values = sorted((original[id(e)][anchor], id(e)) for e in elements)
+        clusters: list[list[tuple[float, int]]] = []
+        for value, marker in values:
+            if clusters and value - clusters[-1][0][0] <= tolerance:
+                clusters[-1].append((value, marker))
+            else:
+                clusters.append([(value, marker)])
+
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            shared = sum(value for value, _ in cluster) / len(cluster)
+            for value, marker in cluster:
+                if marker in settled:
+                    continue
+                element = next(e for e in elements if id(e) == marker)
+                shift = shared - value
+                if shift:
+                    element["transform"][pos] = round(
+                        float(element["transform"][pos]) + shift, 2
+                    )
+                settled.add(marker)
+
+
+def align_and_group(payload: dict, width: int, height: int) -> dict:
+    """Snap near-alignments and label visual groups. Returns the payload.
+
+    Runs on whatever either reader produced, so the vision model and the PDF
+    reader are tidied by the same rules rather than each having its own idea of
+    what "aligned" means.
+    """
+    elements = [
+        element
+        for element in payload.get("elements", [])
+        if isinstance(element.get("transform"), dict)
+    ]
+    if len(elements) < 2:
+        return payload
+
+    short_side = max(1.0, min(width, height))
+    tolerance = max(_SNAP_FLOOR_PX, short_side * _SNAP_RATIO)
+
+    _snap_axis(elements, "x", "width", tolerance)
+    _snap_axis(elements, "y", "height", tolerance)
+
+    _assign_groups(elements, short_side, width * height)
+    return payload
+
+
+def _assign_groups(elements: list[dict], short_side: float, page_area: float) -> None:
+    """Label elements that read as one thing, in place.
+
+    Adjacency plus overlap: two boxes are related when the gap between them is
+    small *and* they line up on the other axis. That is what separates an icon
+    from its label — side by side, sharing a middle — from two unrelated things
+    that happen to be near each other in one direction only.
+
+    Backgrounds and large panels are excluded. They touch everything, so
+    including them would collapse the whole page into a single group and make
+    the label useless.
+    """
+
+    def box(element: dict) -> tuple[float, float, float, float]:
+        transform = element["transform"]
+        x, y = float(transform["x"]), float(transform["y"])
+        return x, y, x + float(transform["width"]), y + float(transform["height"])
+
+    joinable = [
+        element for element in elements if element.get("type") in _GROUPABLE_TYPES
+    ]
+    if len(joinable) < 2:
+        return
+
+    gap = short_side * _GROUP_GAP_RATIO
+    parent = {id(element): id(element) for element in joinable}
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parent[a] = b
+
+    def overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+        shared = min(a1, b1) - max(a0, b0)
+        shortest = max(1e-6, min(a1 - a0, b1 - b0))
+        return shared / shortest
+
+    for index, first in enumerate(joinable):
+        fx0, fy0, fx1, fy1 = box(first)
+        for second in joinable[index + 1 :]:
+            sx0, sy0, sx1, sy1 = box(second)
+            side_by_side = (
+                max(sx0 - fx1, fx0 - sx1) <= gap
+                and overlap(fy0, fy1, sy0, sy1) >= _GROUP_OVERLAP
+            )
+            stacked = (
+                max(sy0 - fy1, fy0 - sy1) <= gap
+                and overlap(fx0, fx1, sx0, sx1) >= _GROUP_OVERLAP
+            )
+            if side_by_side or stacked:
+                union(id(first), id(second))
+
+    members: dict[int, list[dict]] = defaultdict(list)
+    for element in joinable:
+        members[find(id(element))].append(element)
+
+    label = 0
+    for group in members.values():
+        # A group of one is just an element; a group of twenty is a region of
+        # the page. Neither is worth a label, and the large one is actively
+        # harmful — the editor would move things the user never selected.
+        if not 2 <= len(group) <= _GROUP_MAX_MEMBERS:
+            continue
+        label += 1
+        for element in group:
+            element.setdefault("style", {})["group_id"] = f"group_{label}"
+
+
+def extract_page(data: bytes, page: RasterPage) -> CompletionResult:
+    """Read the page's layout, the cheapest accurate way available.
+
+    A PDF exported from a design tool already contains its own layout: the
+    strings, boxes, sizes and colours are all in the content stream. Reading
+    them is exact, instant, free, and needs no API key — so that is tried
+    first, and the vision model is what handles a scan, a JPG, or a PDF whose
+    text has been converted to outlines.
+
+    Both paths return the same payload shape, so nothing downstream changes.
+    A structural read reports no tokens because none were spent.
+    """
+    if data[:4] == _PDF_MAGIC and is_text_pdf(data):
+        try:
+            payload = extract_pdf_layout(data, page.width, page.height)
+        except Exception:
+            # Never fatal: a PDF this cannot parse is exactly what the model is
+            # for, and falling through costs an API call rather than the import.
+            logger.warning("Structural PDF read failed; falling back to vision", exc_info=True)
+        else:
+            return CompletionResult(
+                payload=align_and_group(payload, page.width, page.height),
+                raw_text="",
+                model="pdf-structure",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                duration_ms=0,
+            )
+
+    result = extract_layout(page)
+    # The model measures each element independently too, so it gets the same
+    # tidy-up rather than a second, differently-behaved one.
+    return replace(result, payload=align_and_group(result.payload, page.width, page.height))
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +948,20 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         if clip:
             style["clip_polygon"] = clip
 
-        crop_box = _crop_box(x_px, y_px, w_px, h_px, page) if kind in _CROPPED_TYPES else None
+        # Crop from what the element *became*, not what it was called.
+        #
+        # A flat page background resolves to a COLOR_BLOCK a dozen lines up,
+        # and cropping one anyway bakes a picture of the entire flyer — every
+        # heading, price and photo on it — and parks it behind the editable
+        # layout. The canvas then shows each text twice: once as pixels nobody
+        # can retype, once as the real element. The prompt asks the model to
+        # report background panels, so this is the common case on any artwork
+        # with a plain ground, not an edge case.
+        crop_box = (
+            _crop_box(x_px, y_px, w_px, h_px, page)
+            if kind in _CROPPED_TYPES and element_type != ElementType.COLOR_BLOCK
+            else None
+        )
 
         elements.append(
             ExtractedElement(
@@ -733,7 +1073,83 @@ def _style_for(kind: str, raw: dict, scale_reference: float) -> dict:
             _clamp(radius_px / scale_reference, 0.0, 0.5), 4
         )
 
+    # An outlined box — a rule around a strapline — is a shape whose whole
+    # visual identity is its border. Extracted as a filled shape it arrives as
+    # a solid slab; extracted with no border at all it arrives as bare text
+    # floating where a framed line used to be.
+    border_px = _clamp(raw.get("border_width_px"), 0, scale_reference)
+    if border_px > 0:
+        style["border_width_ratio"] = round(
+            _clamp(border_px / scale_reference, 0.0, 0.1), 4
+        )
+        style["border_style"] = "solid"
+        border_colour = _colour(raw.get("border_color")) or colour
+        if border_colour:
+            style["border_color"] = border_colour
+
+    # WHAT KIND OF FILL THIS IS, recorded rather than assumed.
+    #
+    # Defaulting everything to a solid colour is the failure this guards
+    # against: a dotted ground flattened to one hex, or a gradient sampled at
+    # its midpoint, comes back as a colour that appears nowhere on the page.
+    # An unrecognised fill is reported as `unsupported_pattern` — an honest
+    # "a human should look at this" rather than a plausible wrong answer.
+    fill_type = str(raw.get("fill_type") or "")
+    if fill_type in FILL_TYPES:
+        style["fill_type"] = fill_type
+
+    shape_type = str(raw.get("shape_type") or "")
+    if shape_type in SHAPE_TYPES:
+        style["shape_type"] = shape_type
+
+    if fill_type == "dot_pattern":
+        dot_colour = _colour(raw.get("dot_color"))
+        radius_px = _clamp(raw.get("dot_radius_px"), 0, scale_reference)
+        gap_x = _clamp(raw.get("dot_spacing_x_px"), 0, scale_reference)
+        gap_y = _clamp(raw.get("dot_spacing_y_px"), 0, scale_reference)
+        if dot_colour and radius_px > 0 and gap_x > 0 and gap_y > 0:
+            style["dot_color"] = dot_colour
+            style["dot_radius_ratio"] = round(
+                _clamp(radius_px / scale_reference, 0.0002, 0.1), 5
+            )
+            style["dot_spacing_x_ratio"] = round(
+                _clamp(gap_x / scale_reference, 0.001, 0.5), 5
+            )
+            style["dot_spacing_y_ratio"] = round(
+                _clamp(gap_y / scale_reference, 0.001, 0.5), 5
+            )
+            # The dots are the fill. A flat colour underneath them would be the
+            # very flattening this branch exists to avoid.
+            style.pop("background_color", None)
+        else:
+            # Told it was a pattern but not given enough to rebuild one. Saying
+            # so beats drawing a solid rectangle and calling it the design.
+            style["fill_type"] = "unsupported_pattern"
+
+    # A wash, not a fill: the band where a hero photograph dissolves into the
+    # panel below it. Built here from a direction and the element's own colour
+    # rather than accepting a CSS string, for the same reason clip_polygon is
+    # built from numbers — `background-image` is a place a `url(...)` could be
+    # smuggled into the renderer. document.GRADIENT_RE re-checks the result.
+    direction = str(raw.get("gradient") or "")
+    if direction in ("to_bottom", "to_top") and background:
+        stops = _rgb_stops(background)
+        style["background_gradient"] = (
+            f"linear-gradient({'180deg' if direction == 'to_bottom' else '0deg'}, "
+            f"{stops[0]} 0%, {stops[1]} 100%)"
+        )
+        # The gradient supplies the colour; leaving the flat fill underneath
+        # would make the transparent end opaque anyway.
+        style.pop("background_color", None)
+
     return style
+
+
+def _rgb_stops(hex_colour: str) -> tuple[str, str]:
+    """``#784E2A`` -> a transparent and an opaque stop of the same colour."""
+    value = hex_colour.lstrip("#")
+    red, green, blue = (int(value[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red},{green},{blue},0)", f"rgba({red},{green},{blue},1)"
 
 
 #: A shape needs at least a triangle, and past a few dozen vertices it is
@@ -984,7 +1400,7 @@ def run_import(job) -> Template:
         raise TemplateImportError("The uploaded file could not be read back.") from exc
 
     page = rasterise(data, job.original_filename)
-    result = extract_layout(page)
+    result = extract_page(data, page)
 
     elements = normalise_elements(result.payload, page)
     baked = bake_assets(elements, page)
