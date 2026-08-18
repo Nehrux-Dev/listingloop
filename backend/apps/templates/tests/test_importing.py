@@ -501,6 +501,55 @@ class BakeAssetsTestCase(TemplateAPITestCase):
         self.assertEqual(bake_assets(elements, self.page), 0)
         self.assertIsNone(elements[0].asset)
 
+    def test_a_flat_page_background_is_not_baked(self):
+        """The prompt asks the model to report background panels, so a plain
+        page ground arrives on most artwork.
+
+        Cropping one bakes a picture of the whole flyer — every heading, price
+        and photo — and parks it behind the editable layout, so the canvas
+        shows each text twice: once as pixels nobody can retype, once as the
+        real element.
+        """
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="ground",
+                    type="background",
+                    role="page_background",
+                    binding="",
+                    text="",
+                    transform={"x": 0, "y": 0, "width": 800, "height": 1000},
+                    style={"background_color": "#ECE3D9"},
+                )
+            ]
+        )
+        elements = normalise_elements(payload, self.page)
+
+        self.assertEqual(elements[0].element_type, ElementType.COLOR_BLOCK)
+        self.assertIsNone(elements[0].crop_box)
+        self.assertEqual(bake_assets(elements, self.page), 0)
+
+    def test_a_photographic_background_is_still_baked(self):
+        """The other half of the rule: a background the model bound to a photo
+        is a real image and keeps its pixels."""
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="ground",
+                    type="background",
+                    role="page_background",
+                    binding="photo_1",
+                    text="",
+                    transform={"x": 0, "y": 0, "width": 800, "height": 1000},
+                )
+            ]
+        )
+        elements = normalise_elements(payload, self.page)
+
+        self.assertEqual(elements[0].element_type, ElementType.IMAGE)
+        self.assertIsNotNone(elements[0].crop_box)
+        self.assertEqual(bake_assets(elements, self.page), 1)
+
 
 class ClipPolygonSafetyTestCase(TemplateAPITestCase):
     """``clip-path`` takes a *function*, which is the interesting part.

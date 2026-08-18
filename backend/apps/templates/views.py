@@ -31,6 +31,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 
 from apps.accounts.models import AgentProfile
+from apps.accounts.permissions import IsNehruxAdmin
 from apps.core.storage import build_upload_key
 from apps.templates.document import (
     BLANK_ELEMENTS,
@@ -92,16 +93,74 @@ class TemplateLibraryPagination(PageNumberPagination):
     max_page_size = 120
 
 
-class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
+class TemplateViewSet(mixins.DestroyModelMixin, viewsets.ReadOnlyModelViewSet):
     """The template library.
 
-    Read-only over the API: templates are product content, authored by Nehrux
-    through the Django admin. Agents choose from them, they do not edit them —
-    which is what makes the permission map meaningful.
+    Read-only to everybody except the platform owner, who publishes into it and
+    can take things back out. Agents choose from templates, they do not edit
+    them — which is what makes the permission map meaningful.
     """
 
     permission_classes = [IsAuthenticated]
     pagination_class = TemplateLibraryPagination
+
+    def get_permissions(self):
+        """Removing from the library is a Nehrux Admin's alone.
+
+        The library is one shelf shared by every agency. A brokerage admin
+        deleting from it would be deleting a rival firm's templates too, so
+        the capability belongs to whoever owns the shelf.
+        """
+        if self.action in ("destroy", "publish"):
+            return [IsAuthenticated(), IsNehruxAdmin()]
+        return super().get_permissions()
+
+    def destroy(self, request: Request, *args, **kwargs) -> Response:
+        """Take a template out of every agent's gallery.
+
+        TWO OUTCOMES, AND THE DIFFERENCE IS NOT COSMETIC
+        --------------------------------------------------------------------
+        A template nobody has used is deleted outright. One that designs were
+        made from is *retired* instead — `is_active=False`, which removes it
+        from the gallery just as completely, because `get_queryset` filters on
+        it.
+
+        The reason is `Design.template`, which is `on_delete=PROTECT`. That
+        protection is deliberate and worth keeping: an agent's finished flyer
+        must not disappear because somebody tidied the library. Without this
+        branch a delete would simply raise, and the admin would be told the
+        template cannot be removed when what they asked for — gone from the
+        agents' panel — is perfectly achievable.
+
+        Either way the answer to "is it still in the agent dashboard" is no.
+        """
+        template = self.get_object()
+        designs = template.designs.count()
+
+        if designs:
+            template.is_active = False
+            template.save(update_fields=["is_active", "updated_at"])
+            logger.info(
+                "Template %s retired by user %s (%d design(s) keep it)",
+                template.pk, request.user.pk, designs,
+            )
+            return Response(
+                {
+                    "retired": True,
+                    "designs": designs,
+                    "detail": (
+                        f"Removed from the library. {designs} design"
+                        f"{'' if designs == 1 else 's'} already made from it "
+                        f"still open and export normally."
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        name = template.name
+        template.delete()
+        logger.info("Template %r deleted by user %s", name, request.user.pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def get_serializer_class(self):
         return (
@@ -177,6 +236,38 @@ class TemplateViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         return queryset
+
+    @action(detail=True, methods=["post"], url_path="publish")
+    def publish(self, request: Request, pk=None) -> Response:
+        """Move an imported template into the shared library.
+
+        This is the Upload button on the platform dashboard, and it is the only
+        way a template reaches every agent in every brokerage.
+
+        An import lands owned by whoever uploaded it, which makes it a private
+        draft: `Template.visible_to` shows an owned template to its owner and
+        nobody else. Clearing the owner is what publishes it — the same
+        queryset then returns it to everyone. So the review step is not a
+        workflow bolted on top, it is just the state an import already starts
+        in.
+
+        Nehrux Admins only. A brokerage admin publishing here would be putting
+        their own artwork into a rival brokerage's gallery.
+        """
+        template = self.get_object()
+        if template.owner_id is None:
+            return Response(
+                {"detail": "That template is already in the shared library."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        template.owner = None
+        template.is_active = True
+        template.save(update_fields=["owner", "is_active", "updated_at"])
+        logger.info(
+            "Template %s published to the library by user %s", template.pk, request.user.pk
+        )
+        return Response(TemplateDetailSerializer(template, context={"request": request}).data)
 
     @action(detail=False, methods=["get"], url_path="facets")
     def facets(self, request: Request) -> Response:
@@ -261,6 +352,23 @@ class TemplateImportViewSet(
     parser_classes = [MultiPartParser, FormParser]
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "template_import"
+
+    def get_throttles(self):
+        """The platform owner gets the higher ceiling.
+
+        The low limit exists because an import can mean a paid vision call, and
+        that reasoning holds for an agent importing their own artwork. It does
+        not hold for Nehrux filling the library: a text PDF is read structurally
+        and costs nothing, and stocking the gallery is a sitting-down job that
+        being cut off after ten uploads makes impossible.
+
+        Set per request rather than per class because `throttle_scope` is read
+        off the view instance, and the two scopes have to be able to coexist.
+        """
+        user = getattr(self.request, "user", None)
+        if getattr(user, "is_nehrux_admin", False):
+            self.throttle_scope = "template_import_admin"
+        return super().get_throttles()
 
     def get_queryset(self) -> QuerySet[TemplateImport]:
         # Strictly the caller's own. Unlike designs, an import is not
@@ -405,6 +513,17 @@ class DesignViewSet(viewsets.ModelViewSet):
             .prefetch_related("template__elements", "exports")
         )
 
+        # `?mine=1` narrows to the caller's own designs.
+        #
+        # `for_user` above is the *permission* boundary — a brokerage admin may
+        # legitimately read the whole firm's work. That is the wrong answer for
+        # the two screens that ask "what have I been making": the Designs panel,
+        # and the check for an existing design behind a template. Without this,
+        # an admin's panel fills with their agents' designs, and clicking a
+        # template would offer to resume somebody else's work in it.
+        if self.request.query_params.get("mine") in {"1", "true"}:
+            queryset = queryset.filter(agent__user=self.request.user)
+
         template_id = self.request.query_params.get("template")
         if template_id and template_id.isdigit():
             queryset = queryset.filter(template_id=int(template_id))
@@ -414,6 +533,25 @@ class DesignViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(listing_id=int(listing_id))
 
         return queryset
+
+    def create(self, request: Request, *args, **kwargs) -> Response:
+        """POST a design, or get back the one you already had.
+
+        `DesignSerializer.create` resumes an existing design rather than making
+        a near-duplicate of it. When it does, saying 201 Created would be a
+        lie — and a caller that trusts the status to mean "this is new" would
+        be wrong about it — so a resumed design answers 200 instead.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        code = (
+            status.HTTP_200_OK
+            if serializer.reused_existing
+            else status.HTTP_201_CREATED
+        )
+        return Response(serializer.data, status=code, headers=headers)
 
     @action(detail=True, methods=["get"], url_path="resolved")
     def resolved(self, request: Request, pk=None) -> Response:

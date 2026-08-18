@@ -22,7 +22,7 @@
  * purely for editor chrome that was never part of the rendered design.
  */
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 
 import type { BrandKit } from '../../api/profiles.ts'
 import { carriesImage, carriesText } from '../../api/templates.ts'
@@ -44,6 +44,12 @@ const FONT_STACKS: Record<string, string> = {
   display: `'Roboto Condensed', 'Liberation Sans Narrow', 'DejaVu Sans Condensed', ${SAFE_FONT_STACK}`,
   serif: "'Liberation Serif', 'DejaVu Serif', Georgia, serif",
   mono: "'Liberation Mono', 'DejaVu Sans Mono', monospace",
+  // Calligraphic headlines. The renderer installs Dancing Script; a browser
+  // previewing the canvas may not have it and will fall back to its own
+  // cursive, so the canvas can look slightly different here from the export.
+  // That is the one place the two deliberately diverge, and only because the
+  // alternative is shipping a webfont into a page that inlines everything.
+  script: "'Dancing Script', 'Kaushan Script', 'Lobster Two', cursive",
 }
 
 const JUSTIFY_BY_ALIGN: Record<string, string> = {
@@ -62,6 +68,34 @@ const JUSTIFY_BY_ALIGN: Record<string, string> = {
  * more willing to interpolate one than the renderer is. See
  * `html_builder._clip_path`, which this mirrors exactly.
  */
+/**
+ * A dotted ground as CSS. Mirrors `html_builder._dot_pattern`.
+ *
+ * A repeating grid of dots is a pattern, and flattening it to one hex — the
+ * dot's colour, or the average of the area — produces something that looks
+ * nothing like the artwork. The extractor records the dot and the grid; this
+ * rebuilds one tile holding one dot and repeats it.
+ */
+function dotPattern(
+  style: Record<string, unknown>,
+  scaleRef: number,
+  brandKit: BrandKit | null,
+): React.CSSProperties | undefined {
+  if (style.fill_type !== 'dot_pattern') return undefined
+  const radius = num(style.dot_radius_ratio) * scaleRef
+  const spacingX = num(style.dot_spacing_x_ratio) * scaleRef
+  const spacingY = num(style.dot_spacing_y_ratio) * scaleRef
+  if (radius <= 0 || spacingX <= 0 || spacingY <= 0) return undefined
+  const colour = resolveColor(style.dot_color ?? '#000000', brandKit)
+  return {
+    // `radius` twice so the stop lands exactly on the dot's edge and the
+    // gradient draws a hard circle rather than a soft blob.
+    backgroundImage: `radial-gradient(circle at 50% 50%, ${colour} 0 ${radius.toFixed(2)}px, transparent ${radius.toFixed(2)}px)`,
+    backgroundSize: `${spacingX.toFixed(2)}px ${spacingY.toFixed(2)}px`,
+    backgroundRepeat: 'repeat',
+  }
+}
+
 function clipPath(points: unknown): string | undefined {
   if (!Array.isArray(points) || points.length < 6 || points.length % 2) return undefined
   const pairs: string[] = []
@@ -85,6 +119,11 @@ export function resolveColor(value: unknown, brandKit: BrandKit | null): string 
   const fromBrand = brandKit ? (brandKit as unknown as Record<string, unknown>)[key] : undefined
   return typeof fromBrand === 'string' ? fromBrand : '#000000'
 }
+
+/** The shrink-to-fit constants. Mirror `html_builder.FIT_MIN_SCALE` and
+ *  `FIT_STEPS`; the two implementations must produce the same pixel. */
+const FIT_MIN_SCALE = 0.5
+const FIT_STEPS = 8
 
 function num(value: unknown, fallback = 0): number {
   return typeof value === 'number' ? value : fallback
@@ -116,6 +155,43 @@ export default function ElementLayer({
   onCancelEdit,
   onDragStart,
 }: Props) {
+  const boxRef = useRef<HTMLDivElement>(null)
+
+  // Shrink-to-fit. Mirrors html_builder.FIT_TEXT_JS exactly — same floor, same
+  // fixed step count, same overflow test — because an agent who lays a design
+  // out on a canvas that shrinks and exports through one that clips has been
+  // shown a lie. If you change one, change the other.
+  //
+  // Declared above the `visible` early-return: hooks may not sit behind a
+  // conditional. When the element is hidden there is no node and the effect
+  // does nothing.
+  //
+  // No dependency array on purpose. React only rewrites style properties it
+  // sees change, so a font size this effect lowered would survive into the
+  // next render and be shrunk again from the already-shrunk value. Resetting
+  // to the base size first makes the pass idempotent however often it runs.
+  const fitBasePx = carriesText(element.type)
+    ? num(element.style?.font_size_ratio, 0.04) * Math.min(canvas.width, canvas.height)
+    : 0
+  useLayoutEffect(() => {
+    const node = boxRef.current
+    if (!node || !(fitBasePx > 0) || editing) return
+    node.style.fontSize = `${fitBasePx}px`
+    const over = () =>
+      node.scrollWidth > node.clientWidth + 0.5 ||
+      node.scrollHeight > node.clientHeight + 0.5
+    if (!over()) return
+    let lo = fitBasePx * FIT_MIN_SCALE
+    let hi = fitBasePx
+    for (let step = 0; step < FIT_STEPS; step += 1) {
+      const mid = (lo + hi) / 2
+      node.style.fontSize = `${mid}px`
+      if (over()) hi = mid
+      else lo = mid
+    }
+    node.style.fontSize = `${lo}px`
+  })
+
   if (!element.visible) return null
 
   const { transform, style } = element
@@ -149,6 +225,13 @@ export default function ElementLayer({
   if (typeof style.background_gradient === 'string') {
     box.backgroundImage = style.background_gradient
   }
+  // A dotted ground, rebuilt as a tiling pattern rather than flattened to a
+  // flat fill. Mirrors html_builder._dot_pattern — same tile, same hard-edged
+  // stop — and is built from numbers here for the same reason clipPath is:
+  // `background-image` takes a url(), so a pass-through string would be a way
+  // to make the renderer fetch something.
+  const dots = dotPattern(style, scaleRef, brandKit)
+  if (dots) Object.assign(box, dots)
   // Angled and chevron photo edges, the same way the export draws them. Built
   // from numbers here rather than accepting a CSS string, mirroring
   // html_builder._clip_path — the canvas and the export must agree, and they
@@ -199,6 +282,7 @@ export default function ElementLayer({
 
   return (
     <div
+      ref={boxRef}
       style={box}
       // A locked element is invisible to the pointer, so a click passes
       // through to whatever is behind it — which is the point of locking the

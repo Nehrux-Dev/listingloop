@@ -1,9 +1,15 @@
 /**
  * The template gallery: a filter sidebar beside a grid you pick from.
  *
- * Browse-only. There is no canvas here and no template-detail screen in
- * between — clicking a card creates the Design copy and lands you in the
- * editor, which is where every editing surface lives.
+ * Templates and nothing else. This screen briefly carried a strip of the
+ * agent's own designs across the top, which made one screen answer two
+ * questions and put the catalogue below the fold on a short window. Your work
+ * in progress lives on its own panel now — see DesignsPage.
+ *
+ * Clicking a card does not create anything. It opens a confirm dialog with a
+ * proper look at the template, and only a yes there opens a design — see
+ * UseTemplateDialog, which is also where an already-started design is resumed
+ * rather than a second one made.
  *
  * WHAT THE THREE FILTER GROUPS ACTUALLY ARE
  * ---------------------------------------------------------------------------
@@ -15,21 +21,21 @@
  * the counts come from `/facets/` so they describe the whole library rather
  * than the page currently loaded.
  *
- * THE ONE THING THIS PAGE STILL HAS TO ASK
+ * NO PROPERTY IS ASKED FOR HERE ANY MORE
  * ---------------------------------------------------------------------------
- * A "Just Sold" template describes a specific property and the server refuses
- * to create one without a listing. That cannot be skipped, but it does not
- * have to be asked per click: the listing is picked once, in the header, and
- * every card below then opens in a single click. Seasonal and agent-led
- * templates need no property and ignore it.
+ * This page used to carry a property selector, defaulted to the most recent
+ * verified listing, and hand it to every design it created. The effect was
+ * that saving one listing silently made every template an agent opened be
+ * about that property — including the ones they were only looking at.
+ *
+ * A template is now opened as itself. The property is attached later, from
+ * inside the editor, by an agent who has decided which design it belongs to.
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
-import { fetchListings, type Listing } from '../api/listings.ts'
 import {
-  createDesign,
   fetchRenderDimensions,
   fetchTemplateFacets,
   fetchTemplateImport,
@@ -42,11 +48,19 @@ import {
   type TemplateSummary,
 } from '../api/templates.ts'
 import { Alert } from '../components/FormControls.tsx'
-import { IconFilter, IconGrid, IconLayers, IconSearch, IconUpload } from '../components/icons.tsx'
+import {
+  IconDesigns,
+  IconFilter,
+  IconGrid,
+  IconLayers,
+  IconSearch,
+  IconUpload,
+} from '../components/icons.tsx'
 import ImportTemplateDialog from '../components/ImportTemplateDialog.tsx'
 import TemplateThumb from '../components/TemplateThumb.tsx'
+import UseTemplateDialog from '../components/UseTemplateDialog.tsx'
 import { ApiError } from '../lib/apiClient.ts'
-import { designEditorPath } from '../lib/routes.ts'
+import { DESIGNS_HOME, designEditorPath } from '../lib/routes.ts'
 
 type Sort = 'name' | 'name_desc'
 
@@ -82,11 +96,8 @@ export default function TemplateLibraryPage() {
   const [view, setView] = useState<'grid' | 'list'>('grid')
   const [filtersOpen, setFiltersOpen] = useState(true)
 
-  // Only verified listings can back a design, so only those are offered.
-  const [listings, setListings] = useState<Listing[]>([])
-  const [listingId, setListingId] = useState<string>('')
-  /** The template being opened, so its card can say so. */
-  const [opening, setOpening] = useState<number | null>(null)
+  /** The template awaiting a yes/no in the confirm dialog. */
+  const [picked, setPicked] = useState<TemplateSummary | null>(null)
 
   /** Imports still worth watching: anything unfinished, plus the failures,
    *  which stay on screen until dismissed so a reason is never lost to a
@@ -98,13 +109,6 @@ export default function TemplateLibraryPage() {
   useEffect(() => {
     fetchTemplateFacets().then(setFacets).catch(() => setFacets(null))
     fetchRenderDimensions().then(setRenderDimensions).catch(() => setRenderDimensions([]))
-    fetchListings({ verification_status: 'verified' })
-      .then((page) => {
-        setListings(page.results)
-        // Default to the most recent, so the common case really is one click.
-        if (page.results.length > 0) setListingId(String(page.results[0].id))
-      })
-      .catch(() => setListings([]))
     // Pick up anything still running from a previous visit: an import survives
     // a page reload, and a user who navigated away mid-extraction should come
     // back to it in progress rather than to no trace of it.
@@ -229,30 +233,6 @@ export default function TemplateLibraryPage() {
     setRawQuery('')
   }
 
-  async function openTemplate(template: TemplateSummary) {
-    if (opening !== null) return
-    setOpening(template.id)
-    setError(null)
-    try {
-      const design = await createDesign({
-        name: `${template.name} — ${new Date().toLocaleDateString()}`,
-        template: template.id,
-        // An imported template no longer *requires* a property, but it may
-        // still bind listing fields — so it takes the selected one when there
-        // is one. Keying this off `requires_listing` alone would open an
-        // agent's own property flyer with the property deliberately left out.
-        listing:
-          (template.requires_listing || template.is_imported) && listingId
-            ? Number(listingId)
-            : null,
-      })
-      void navigate(designEditorPath(design.id))
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Could not start that design.')
-      setOpening(null)
-    }
-  }
-
   return (
     <div className="flex h-screen flex-col bg-app">
       <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-6 py-4">
@@ -274,26 +254,16 @@ export default function TemplateLibraryPage() {
           />
         </div>
 
-        {/* Asked once, not per card. Only property templates use it, and they
-            say so on the card when it is missing. */}
-        {listings.length > 0 && (
-          <label className="flex items-center gap-2 text-sm">
-            <span className="text-xs font-medium uppercase tracking-wide text-muted">
-              Property
-            </span>
-            <select
-              value={listingId}
-              onChange={(event) => setListingId(event.target.value)}
-              className="max-w-56 rounded-control border border-line bg-surface px-3 py-2.5 text-sm"
-            >
-              {listings.map((listing) => (
-                <option key={listing.id} value={listing.id}>
-                  {listing.full_address || `Listing #${listing.id}`}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+        {/* The way across to the other half. The rail already has it, but an
+            agent who arrived here to start something and then remembered the
+            one they had going should not have to hunt for it. */}
+        <Link
+          to={DESIGNS_HOME}
+          className="flex items-center gap-2 rounded-control border border-line px-3.5 py-2.5 text-sm font-medium transition hover:bg-hover"
+        >
+          <IconDesigns className="size-4 text-muted" />
+          My designs
+        </Link>
 
         <button
           type="button"
@@ -432,14 +402,6 @@ export default function TemplateLibraryPage() {
             </ul>
           )}
 
-          {listings.length === 0 && (
-            <p className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-              You have no verified listings yet, so the library's property templates
-              are unavailable. Verify one to use them — seasonal templates, and any
-              template you imported yourself, need no property.
-            </p>
-          )}
-
           {templates && shown.length === 0 && (
             <div className="rounded-lg border border-dashed border-line p-10 text-center text-sm text-muted">
               No templates match those filters.
@@ -455,15 +417,11 @@ export default function TemplateLibraryPage() {
               }
             >
               {shown.map((template) => {
-                const blocked = template.requires_listing && !listingId
                 const card = {
                   template,
-                  blocked,
-                  busy: opening === template.id,
-                  disabled: blocked || opening !== null,
                   aspect: aspectFor(template),
                   format: formatLabel(template),
-                  onOpen: () => void openTemplate(template),
+                  onOpen: () => setPicked(template),
                 }
                 return (
                   <li key={template.id}>
@@ -483,6 +441,16 @@ export default function TemplateLibraryPage() {
             setImports((current) => [job, ...current])
             setImportOpen(false)
           }}
+        />
+      )}
+
+      {picked && (
+        <UseTemplateDialog
+          template={picked}
+          format={formatLabel(picked)}
+          aspect={aspectFor(picked)}
+          onClose={() => setPicked(null)}
+          onOpen={(designId) => void navigate(designEditorPath(designId))}
         />
       )}
     </div>
@@ -541,60 +509,56 @@ function ImportRow({ job, onDismiss }: { job: TemplateImport; onDismiss: () => v
 
 type CardProps = {
   template: TemplateSummary
-  blocked: boolean
-  busy: boolean
-  disabled: boolean
   aspect: number
   format: string
   onOpen: () => void
 }
 
-function cardTitle({ template, blocked }: CardProps): string {
-  if (blocked) return 'This template describes a property. Verify a listing to use it.'
-  return `Start a design from ${template.name}`
+/** No card is ever disabled now. A property template opens as a property
+ *  template with its fields empty, and the agent attaches a listing from the
+ *  editor — so there is nothing left for the gallery to refuse. */
+function cardTitle(template: TemplateSummary): string {
+  return `Customize ${template.name}`
 }
 
-function GridCard(props: CardProps) {
-  const { template, blocked, busy, disabled, aspect, format, onOpen } = props
+function GridCard({ template, aspect, format, onOpen }: CardProps) {
   return (
     <button
       type="button"
-      disabled={disabled}
-      title={cardTitle(props)}
+      title={cardTitle(template)}
       onClick={onOpen}
-      className="group w-full overflow-hidden rounded-panel border border-line bg-surface text-left shadow-panel transition hover:-translate-y-0.5 hover:border-brand/50 hover:shadow-pop disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:translate-y-0 disabled:hover:border-line disabled:hover:shadow-panel"
+      className="group w-full overflow-hidden rounded-panel border border-line bg-surface text-left shadow-panel transition hover:-translate-y-0.5 hover:border-brand/50 hover:shadow-pop"
     >
       <TemplateThumb
         template={template}
         className="w-full p-3"
         style={{ aspectRatio: String(aspect) }}
       >
-        {busy && (
-          <span className="absolute inset-0 flex items-center justify-center bg-white/80 text-xs font-semibold text-ink">
-            Opening the editor…
+        {/* The affordance the dialog needs to be worth opening: the card says
+            what the click leads to before it is clicked. */}
+        <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition group-hover:opacity-100">
+          <span className="rounded-control bg-white px-3 py-1.5 text-xs font-semibold text-slate-900">
+            Customize
           </span>
-        )}
+        </span>
       </TemplateThumb>
       <div className="p-3">
         <p className="truncate text-sm font-medium text-ink">{template.name}</p>
         <p className="mt-0.5 text-xs text-muted">
           {format} · {template.category_display}
         </p>
-        {blocked && <p className="mt-1 text-xs text-amber-700">Needs a verified listing.</p>}
       </div>
     </button>
   )
 }
 
-function ListRow(props: CardProps) {
-  const { template, blocked, busy, disabled, format, onOpen } = props
+function ListRow({ template, format, onOpen }: CardProps) {
   return (
     <button
       type="button"
-      disabled={disabled}
-      title={cardTitle(props)}
+      title={cardTitle(template)}
       onClick={onOpen}
-      className="flex w-full items-center gap-3 overflow-hidden rounded-control border border-line bg-surface p-2 text-left transition hover:border-brand/50 disabled:cursor-not-allowed disabled:opacity-55 disabled:hover:border-line"
+      className="flex w-full items-center gap-3 overflow-hidden rounded-control border border-line bg-surface p-2 text-left transition hover:border-brand/50"
     >
       <TemplateThumb
         template={template}
@@ -607,10 +571,6 @@ function ListRow(props: CardProps) {
           {format} · {template.category_display} · {template.style_display}
         </span>
       </span>
-      {blocked && (
-        <span className="shrink-0 text-xs text-amber-700">Needs a verified listing</span>
-      )}
-      {busy && <span className="shrink-0 text-xs font-semibold text-brand">Opening…</span>}
     </button>
   )
 }

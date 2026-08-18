@@ -312,11 +312,24 @@ REST_FRAMEWORK = {
         "enquiry": env("ENQUIRY_THROTTLE_RATE", default="5/hour"),
         # Public page reads. Generous: this is a page anyone may look at.
         "public_page": env("PUBLIC_PAGE_THROTTLE_RATE", default="120/min"),
-        # A template import is the most expensive call in the product: one
+        # A template import can be the most expensive call in the product: one
         # high-resolution page image into a vision model, and a large JSON
         # response back. Kept low and per-user for the same reason as
-        # `ai_generate` — each one costs real money.
+        # `ai_generate` — each one of those costs real money.
         "template_import": env("TEMPLATE_IMPORT_THROTTLE_RATE", default="10/hour"),
+        # The platform owner seeding the library is the other half of that.
+        #
+        # Two things make the low ceiling the wrong answer for them. A PDF that
+        # carries real text is read structurally — no vision call, no cost, so
+        # the reason for the limit is simply absent. And filling the library is
+        # a sitting-down job: an admin uploads a batch in one session, and being
+        # cut off after ten is the product refusing its own supply side.
+        #
+        # Still a ceiling rather than an exemption. It is the runaway-loop
+        # backstop, not a cost control.
+        "template_import_admin": env(
+            "TEMPLATE_IMPORT_ADMIN_THROTTLE_RATE", default="200/hour"
+        ),
     },
 }
 

@@ -110,6 +110,100 @@ class DesignRoundTripTests(TemplateAPITestCase):
         self.assertTrue(by_original["price"]["locked"])
         self.assertEqual(by_original["price"]["name"], "The price")
 
+    def _open_template(self, **extra):
+        """Open the template the way every screen in the app opens one."""
+        payload = {"name": "Harbour View", "template": self.template.pk}
+        payload.update(extra)
+        return self.client.post(self.designs_url, payload, format="json")
+
+    def test_opening_the_same_template_twice_resumes_one_design(self):
+        """The complaint, as a test.
+
+        Opening a template used to POST a new design every time, so an agent
+        who came back to "Just Listed" on three days had three near-identical
+        rows in their designs panel and no way to tell which held their edits.
+        """
+        first = self._open_template()
+        second = self._open_template()
+
+        self.assertEqual(first.status_code, 201, first.data)
+        # 200, not 201: nothing was created the second time, and saying
+        # otherwise would make the status a lie.
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertEqual(first.data["id"], second.data["id"])
+        self.assertEqual(Design.objects.count(), 1)
+
+    def test_resuming_returns_the_edits_rather_than_a_clean_copy(self):
+        """Resuming has to mean *your* canvas, not a fresh one under the old id.
+
+        This is the half that makes the fix worth anything: an agent who edits,
+        saves, leaves and clicks the template again is asking to carry on.
+        """
+        created = self._open_template()
+        design = Design.objects.get()
+
+        elements = created.data["elements"]
+        for element in elements:
+            if element["original_element_id"] == "headline":
+                element["content"] = "Beachside living at its best"
+                element["manually_overridden"] = True
+        self.client.patch(
+            self.design_detail_url(design), {"elements": elements}, format="json"
+        )
+
+        reopened = self._open_template()
+
+        self.assertEqual(Design.objects.count(), 1)
+        by_original = {
+            e["original_element_id"]: e for e in reopened.data["elements"]
+        }
+        self.assertEqual(
+            by_original["headline"]["content"], "Beachside living at its best"
+        )
+
+    def test_fresh_starts_a_second_design_on_purpose(self):
+        """Two flyers from one template for two properties is a real thing.
+
+        So the rule is a default, not a cage — "Start a fresh copy" sets this.
+        """
+        first = self._open_template()
+        second = self._open_template(fresh=True)
+
+        self.assertEqual(second.status_code, 201, second.data)
+        self.assertNotEqual(first.data["id"], second.data["id"])
+        self.assertEqual(Design.objects.count(), 2)
+
+    def test_another_agent_gets_their_own_design_from_the_same_template(self):
+        """The rule is per agent. A shared library template is opened by
+        everybody, and resuming a colleague's design would be a data leak
+        rather than a convenience."""
+        mine = self._open_template()
+
+        colleague, _profile = self.make_agent_in(self.acme, "b@example.com")
+        self.authenticate_as(colleague)
+        theirs = self._open_template()
+
+        self.assertEqual(theirs.status_code, 201, theirs.data)
+        self.assertNotEqual(mine.data["id"], theirs.data["id"])
+        self.assertEqual(Design.objects.count(), 2)
+
+    def test_reopening_does_not_disturb_the_listing_already_attached(self):
+        """A resumed design keeps the property the agent chose for it.
+
+        The editor sends a listing when it switches template, and letting that
+        overwrite one already on the design would silently re-point a finished
+        flyer at a different house.
+        """
+        first = self._open_template(listing=self.listing.pk)
+        other = self.make_verified_listing(
+            self.profile, self.agent, address="9 Other Street"
+        )
+
+        second = self._open_template(listing=other.pk)
+
+        self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(second.data["listing"], self.listing.pk)
+
     def test_reopening_resolves_content_against_the_listing(self):
         design = self.make_design(self.template, self.profile, self.listing)
         headline = self.element_of(design, "headline")
@@ -327,15 +421,21 @@ class ImportedTemplateNeedsNoListingTests(TemplateAPITestCase):
         self.assertEqual(response.status_code, 201, response.data)
         self.assertIsNone(Design.objects.get().listing)
 
-    def test_the_library_equivalent_is_still_refused_without_one(self):
+    def test_the_library_equivalent_also_opens_without_one(self):
+        """`requires_listing` no longer gates creation for anything.
+
+        It still describes the template truthfully, and the library still uses
+        it — but what it governs now is whether the export can go out empty,
+        not whether the design may be started.
+        """
         response = self.client.post(
             self.designs_url,
             {"name": "Needs a property", "template": self.library.pk},
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("listing", response.data)
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(Design.objects.get().listing)
 
     def test_an_unverified_listing_is_still_refused_on_an_imported_template(self):
         """Not needing a listing is not the same as accepting an unreviewed one.
@@ -449,6 +549,44 @@ class DesignScopingTests(TemplateAPITestCase):
 
     def test_unauthenticated_access_is_rejected(self):
         self.assertEqual(self.client.get(self.designs_url).status_code, 401)
+
+    def test_mine_narrows_an_admin_to_designs_they_authored(self):
+        """`?mine=1` asks a narrower question than the permission scope.
+
+        A brokerage admin may legitimately read the whole firm's designs, which
+        is the right answer for an audit and the wrong one for a screen called
+        "my designs". Without this the admin's designs panel fills with their
+        agents' work, and the template gallery offers to resume it.
+        """
+        self.authenticate_as(self.broker_admin)
+
+        response = self.client.get(self.designs_url, {"mine": "1"})
+
+        self.assertEqual(response.data["count"], 0)
+
+    def test_mine_leaves_an_agents_own_list_alone(self):
+        self.authenticate_as(self.agent_a)
+
+        response = self.client.get(self.designs_url, {"mine": "1"})
+
+        self.assertEqual([row["name"] for row in response.data["results"]], ["A design"])
+
+    def test_mine_combines_with_the_template_filter(self):
+        """The exact query behind "have I already started one of these?".
+
+        The template gallery asks this before offering to create anything, so
+        that opening the same template twice resumes one design rather than
+        leaving a second one behind.
+        """
+        self.authenticate_as(self.agent_a)
+        other_template = self.make_template(slug="other-template")
+        self.make_design(other_template, self.profile_a, name="Different template")
+
+        response = self.client.get(
+            self.designs_url, {"mine": "1", "template": self.template.pk}
+        )
+
+        self.assertEqual([row["name"] for row in response.data["results"]], ["A design"])
 
 
 class TemplateLibraryTests(TemplateAPITestCase):
@@ -623,3 +761,136 @@ class UploadImageTests(TemplateAPITestCase):
 
         self.design.refresh_from_db()
         self.assertEqual(self.design.elements, before)
+
+
+class MergeDuplicateDesignsCommandTests(TemplateAPITestCase):
+    """Cleaning up the duplicates the old create rule already left behind.
+
+    The fix in `DesignSerializer.create` only stops new ones. An agent staring
+    at fourteen copies of the same flyer is not helped by that alone, which is
+    what this command is for.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.template = self.make_template()
+
+    def _merge(self, **options) -> str:
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command("merge_duplicate_designs", stdout=out, stderr=out, **options)
+        return out.getvalue()
+
+    def test_dry_run_reports_but_deletes_nothing(self):
+        for index in range(3):
+            self.make_design(self.template, self.profile, name=f"Copy {index}")
+
+        output = self._merge()
+
+        self.assertIn("Dry run", output)
+        self.assertIn("2 design(s) would be deleted", output)
+        self.assertEqual(Design.objects.count(), 3)
+
+    def test_apply_keeps_only_the_most_recently_edited(self):
+        oldest = self.make_design(self.template, self.profile, name="Oldest")
+        newest = self.make_design(self.template, self.profile, name="Newest")
+        # `updated_at` is auto_now, so the second one saved is genuinely newer;
+        # assert the ordering rather than trusting the write order.
+        self.assertGreater(newest.updated_at, oldest.updated_at)
+
+        self._merge(apply=True)
+
+        self.assertEqual([d.pk for d in Design.objects.all()], [newest.pk])
+
+    def test_another_agents_design_is_not_touched(self):
+        """One shared template is opened by everybody. Folding across agents
+        would delete somebody else's work."""
+        _colleague, other_profile = self.make_agent_in(self.acme, "b@example.com")
+        mine_old = self.make_design(self.template, self.profile, name="Mine 1")
+        self.make_design(self.template, self.profile, name="Mine 2")
+        theirs = self.make_design(self.template, other_profile, name="Theirs")
+
+        self._merge(apply=True)
+
+        surviving = set(Design.objects.values_list("pk", flat=True))
+        self.assertIn(theirs.pk, surviving)
+        self.assertNotIn(mine_old.pk, surviving)
+        self.assertEqual(len(surviving), 2)
+
+    def test_designs_from_different_templates_are_left_alone(self):
+        other_template = self.make_template(slug="other-template")
+        self.make_design(self.template, self.profile, name="A")
+        self.make_design(other_template, self.profile, name="B")
+
+        output = self._merge(apply=True)
+
+        self.assertIn("Nothing to merge", output)
+        self.assertEqual(Design.objects.count(), 2)
+
+    def test_an_exported_design_survives_a_newer_unexported_one(self):
+        """Somebody already has the PNG. Deleting it takes its exports with it,
+        so the export outranks the timestamp."""
+        exported = self.make_design(self.template, self.profile, name="Exported")
+        exported.exports.create(
+            dimension="instagram_post",
+            export_format="png",
+            width=1080,
+            height=1080,
+            bytes=1234,
+            render_ms=10,
+        )
+        newer = self.make_design(self.template, self.profile, name="Newer draft")
+        self.assertGreater(newer.updated_at, exported.updated_at)
+
+        self._merge(apply=True)
+
+        self.assertEqual([d.pk for d in Design.objects.all()], [exported.pk])
+
+    def test_two_exported_designs_are_reported_and_skipped(self):
+        """Two rendered designs are two real pieces of work. The command says
+        so instead of picking one."""
+        for name in ("First", "Second"):
+            design = self.make_design(self.template, self.profile, name=name)
+            design.exports.create(
+                dimension="instagram_post",
+                export_format="png",
+                width=1080,
+                height=1080,
+                bytes=1234,
+                render_ms=10,
+            )
+
+        output = self._merge(apply=True)
+
+        self.assertIn("skipped", output)
+        self.assertEqual(Design.objects.count(), 2)
+
+    def test_agent_filter_limits_the_blast_radius(self):
+        _colleague, other_profile = self.make_agent_in(self.acme, "b@example.com")
+        self.make_design(self.template, self.profile, name="Mine 1")
+        self.make_design(self.template, self.profile, name="Mine 2")
+        self.make_design(self.template, other_profile, name="Theirs 1")
+        self.make_design(self.template, other_profile, name="Theirs 2")
+
+        self._merge(apply=True, agent="b@example.com")
+
+        self.assertEqual(Design.objects.filter(agent=self.profile).count(), 2)
+        self.assertEqual(Design.objects.filter(agent=other_profile).count(), 1)
+
+    def test_exclude_spares_a_deliberate_variation(self):
+        """A variation made on purpose reads exactly like an accidental copy
+        from the command's point of view, so it has to be named explicitly."""
+        oldest = self.make_design(self.template, self.profile, name="Oldest")
+        variation = self.make_design(self.template, self.profile, name="A (variation)")
+        newest = self.make_design(self.template, self.profile, name="Newest")
+
+        self._merge(apply=True, exclude=[variation.pk])
+
+        surviving = set(Design.objects.values_list("pk", flat=True))
+        self.assertEqual(surviving, {variation.pk, newest.pk})
+        self.assertNotIn(oldest.pk, surviving)

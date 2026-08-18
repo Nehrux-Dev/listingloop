@@ -69,6 +69,11 @@ FONT_STACKS: dict[str, str] = {
     ),
     "serif": "'Liberation Serif', 'DejaVu Serif', Georgia, serif",
     "mono": "'Liberation Mono', 'DejaVu Sans Mono', monospace",
+    # Calligraphic headlines. Dancing Script is the closest formal script in
+    # Debian; the copperplate faces this kind of artwork actually uses are all
+    # proprietary, so this is an approximation and a deliberate one — a script
+    # that is nearly right reads as the same design, where a serif does not.
+    "script": "'Dancing Script', 'Kaushan Script', 'Lobster Two', cursive",
 }
 
 
@@ -229,6 +234,39 @@ def type_scale_reference(dimension: Dimension) -> float:
     return float(min(dimension.width, dimension.height))
 
 
+def _dot_pattern(style: dict, scale_ref: float, context: dict) -> list[str]:
+    """A dotted ground, rebuilt as a tiling pattern rather than a flat fill.
+
+    A repeating grid of dots is a *pattern*, and flattening it to the average
+    colour of the area — or to the colour of one dot — produces something that
+    looks nothing like the artwork. So the extractor records the dot's colour,
+    its radius and the grid spacing, and this rebuilds it: one tile containing
+    one dot, repeated.
+
+    Built out of numbers, never out of a string the extractor supplied. This is
+    the same rule ``clip_polygon`` follows and for the same reason:
+    ``background-image`` takes a ``url(...)``, so a pass-through string here
+    would be a way to make the renderer fetch something. Numbers cannot express
+    a URL.
+    """
+    if style.get("fill_type") != "dot_pattern":
+        return []
+    radius = float(style.get("dot_radius_ratio") or 0) * scale_ref
+    spacing_x = float(style.get("dot_spacing_x_ratio") or 0) * scale_ref
+    spacing_y = float(style.get("dot_spacing_y_ratio") or 0) * scale_ref
+    if radius <= 0 or spacing_x <= 0 or spacing_y <= 0:
+        return []
+    colour = _resolve_color(style.get("dot_color", "#000000"), context)
+    # `radius` twice: the colour stop ends exactly where the dot's edge is, so
+    # the gradient draws a hard-edged circle rather than a soft blob.
+    return [
+        f"background-image:radial-gradient(circle at 50% 50%, "
+        f"{colour} 0 {radius:.2f}px, transparent {radius:.2f}px)",
+        f"background-size:{spacing_x:.2f}px {spacing_y:.2f}px",
+        "background-repeat:repeat",
+    ]
+
+
 def _clip_path(points: Any) -> str:
     """``clip-path`` for an element whose visible edge is not its box.
 
@@ -316,6 +354,9 @@ def element_html(element: dict, context: dict, dimension: Dimension, images: dic
         css.append(f"opacity:{float(style['opacity'])}")
     if style.get("background_gradient"):
         css.append(f"background-image:{style['background_gradient']}")
+    dots = _dot_pattern(style, scale_ref, context)
+    if dots:
+        css.extend(dots)
     clip = _clip_path(style.get("clip_polygon"))
     if clip:
         css.append(clip)
@@ -395,11 +436,46 @@ def element_html(element: dict, context: dict, dimension: Dimension, images: dic
     if style.get("padding_ratio"):
         css.append(f"padding:{float(style['padding_ratio']) * scale_ref:.2f}px")
     # Text that outgrows its box would otherwise sit on top of the element
-    # below it, which is worse than a clipped descender.
+    # below it, which is worse than a clipped descender. This stays as the
+    # backstop; `data-fit` is what normally prevents it being reached.
     css.append("overflow:hidden")
 
     body = html.escape(text).replace("\n", "<br />")
-    return f'<div style="{";".join(css)}">{body}</div>'
+    # Marks this box for the renderer's shrink-to-fit pass — see FIT_ATTRIBUTE
+    # above for why the pass is not in this document. Placed after the style
+    # attribute so the parity tests' `<div style="...">` match still holds.
+    return f'<div style="{";".join(css)}" {FIT_ATTRIBUTE}="1">{body}</div>'
+
+
+#: The shrink-to-fit contract, documented here because this is where the boxes
+#: and font sizes are decided — but deliberately NOT executed here.
+#:
+#: WHY THE PASS EXISTS
+#: ---------------------------------------------------------------------------
+#: A template's font size is a ratio of the page, measured off artwork set in
+#: some other typeface. The families installed in the renderer are not that
+#: typeface, so a headline measured at 96px on the original can render wider
+#: here and outgrow the box it was measured into. The answer used to be
+#: `overflow:hidden` alone, which cut "$700,000" down to "$700,0" — a silent,
+#: entirely plausible wrong number on a page about to go to a client.
+#:
+#: WHY IT IS NOT A <script> IN THIS DOCUMENT
+#: ---------------------------------------------------------------------------
+#: The renderer runs every page with `javaScriptEnabled: false`, on the
+#: grounds that a template is static HTML and nothing in one needs scripting.
+#: That is worth keeping: this markup carries user-influenced content. So the
+#: pass lives in the renderer's own `page.evaluate` (see renderer/src/server.js),
+#: which still runs, and all this file does is mark which boxes it applies to.
+#:
+#: Three places therefore have to agree — this marker, the renderer's loop, and
+#: the editor canvas's copy of it in ElementLayer.tsx.
+FIT_ATTRIBUTE = "data-fit"
+
+#: Mirrored by FIT_MIN_SCALE / FIT_STEPS in renderer/src/server.js and
+#: ElementLayer.tsx. Asserted by the parity tests so a change in one place
+#: without the others fails loudly rather than splitting canvas from export.
+FIT_MIN_SCALE = 0.5
+FIT_STEPS = 8
 
 
 def build_html(design, context: dict, dimension: Dimension, images: dict) -> str:

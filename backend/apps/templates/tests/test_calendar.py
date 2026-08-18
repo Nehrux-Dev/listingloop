@@ -172,8 +172,14 @@ class DesignWithoutListingTests(TemplateAPITestCase):
         design = Design.objects.get()
         self.assertIsNone(design.listing)
 
-    def test_a_listing_template_still_requires_one(self):
-        """A "Just Sold" card with no property has nothing to say."""
+    def test_a_listing_template_opens_without_one(self):
+        """The property is chosen in the editor now, not before it.
+
+        Creating this used to be refused outright, which forced the choice of
+        property into the gallery — before the agent had seen the design. The
+        refusal moved to export; see the test below for the half that still
+        bites.
+        """
         listing_template = self.make_template()
 
         response = self.client.post(
@@ -182,9 +188,28 @@ class DesignWithoutListingTests(TemplateAPITestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("listing", response.data)
-        self.assertIn("specific property", str(response.data["listing"]))
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIsNone(Design.objects.get().listing)
+
+    def test_exporting_a_property_design_with_no_property_is_refused(self):
+        """Where the requirement actually lives now.
+
+        The design may exist with its price and address empty. It may not be
+        rendered that way — the refusal names the empty fields and points at
+        the screen that fills them.
+        """
+        listing_template = self.make_template()
+        design = self.make_design(listing_template, self.profile, listing=None)
+
+        response = self.client.post(
+            self.design_action_url(design, "export"),
+            {"dimensions": ["instagram_post"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409, response.data)
+        missing = str(response.data)
+        self.assertIn("listing", missing.lower())
 
     def test_the_design_resolves_without_a_listing(self):
         design = self.make_design(self.seasonal, self.profile, listing=None)
@@ -278,6 +303,50 @@ class DesignWithoutListingTests(TemplateAPITestCase):
 
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(Design.objects.get().calendar_event, event)
+
+    def test_each_occasion_gets_its_own_design_from_one_template(self):
+        """Opening a template resumes your design from it — but the occasion
+        is part of which design that is.
+
+        One seasonal template serves Diwali every year. Collapsing them by
+        template alone would make this year's post open last year's canvas and
+        overwrite it, which is the opposite of the duplicate the rule exists to
+        prevent.
+        """
+        this_year = CalendarEvent.objects.create(
+            name="Diwali",
+            slug="diwali",
+            category=TemplateCategory.DIWALI,
+            date=timezone.localdate() + timedelta(days=30),
+        )
+        next_year = CalendarEvent.objects.create(
+            name="Diwali",
+            slug="diwali",
+            category=TemplateCategory.DIWALI,
+            date=timezone.localdate() + timedelta(days=395),
+        )
+
+        def open_for(event):
+            return self.client.post(
+                self.designs_url,
+                {
+                    "name": event.name,
+                    "template": self.seasonal.pk,
+                    "calendar_event": event.pk,
+                },
+                format="json",
+            )
+
+        first = open_for(this_year)
+        second = open_for(next_year)
+        again = open_for(this_year)
+
+        self.assertEqual(second.status_code, 201, second.data)
+        self.assertNotEqual(first.data["id"], second.data["id"])
+        # The same occasion twice is still one design.
+        self.assertEqual(again.status_code, 200, again.data)
+        self.assertEqual(again.data["id"], first.data["id"])
+        self.assertEqual(Design.objects.count(), 2)
 
 
 class CalendarEventTests(TemplateAPITestCase):

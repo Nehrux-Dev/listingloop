@@ -689,15 +689,11 @@ class Design(TimeStampedModel):
             raise ValidationError(
                 {"listing": _("Only verified listings can be used in a design.")}
             )
-        if self.template_id and self.template.requires_listing and not self.listing_id:
-            raise ValidationError(
-                {
-                    "listing": _(
-                        "This template describes a specific property, so it needs "
-                        "a listing."
-                    )
-                }
-            )
+        # A design on a property template with no property attached is allowed
+        # to exist: it is a layout the agent has not decided the subject of
+        # yet. What is not allowed is *exporting* one — see
+        # readiness.assess_design, which blocks on any bound element that
+        # resolves empty and names it.
 
 
 class ExportFormat(models.TextChoices):

@@ -99,3 +99,6 @@ backend/ai_sample_run.md
 
 # Claude Code — machine-local permission grants, not shared project config.
 .claude/settings.local.json
+
+# Local proposal / planning docs — not part of the app
+Listing-Studio-Proposal.md

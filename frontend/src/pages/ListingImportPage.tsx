@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 
 import {
   importListing,
@@ -8,6 +8,7 @@ import {
 } from '../api/listings.ts'
 import { Alert, Card, TextField } from '../components/FormControls.tsx'
 import { ApiError } from '../lib/apiClient.ts'
+import { keepForDesign } from '../lib/routes.ts'
 
 /**
  * One-off import: the agent pastes a URL, the server fetches that page once.
@@ -26,6 +27,8 @@ import { ApiError } from '../lib/apiClient.ts'
  */
 export default function ListingImportPage() {
   const navigate = useNavigate()
+  // Carried through, so an import that started from a design ends back at it.
+  const [params] = useSearchParams()
   const [url, setUrl] = useState('')
   const [result, setResult] = useState<ListingImportResult | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -97,7 +100,7 @@ export default function ListingImportPage() {
           {error} You can{' '}
           <button
             type="button"
-            onClick={() => void navigate('/listings/new')}
+            onClick={() => void navigate(keepForDesign('/listings/new', params))}
             className="underline underline-offset-2"
           >
             enter it manually
@@ -237,7 +240,9 @@ export default function ListingImportPage() {
 
           <button
             type="button"
-            onClick={() => void navigate(`/listings/${result.listing.id}`)}
+            onClick={() =>
+              void navigate(keepForDesign(`/listings/${result.listing.id}`, params))
+            }
             className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
           >
             Review and complete the draft

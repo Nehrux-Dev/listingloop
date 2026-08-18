@@ -441,3 +441,72 @@ class TemplateIsNeverModifiedByExportTests(DocumentEditMixin, TemplateAPITestCas
         self.assertEqual(
             set(), {e["id"] for e in first.elements} & {e["id"] for e in second.elements}
         )
+
+
+class ShrinkToFitParityTests(DocumentEditMixin, TemplateAPITestCase):
+    """The export ships a shrink-to-fit pass; the canvas runs the same one.
+
+    A template's font size is a ratio measured off artwork set in some other
+    typeface, so text can render wider here than it did there and outgrow the
+    box it was measured into. `overflow:hidden` used to cut "$700,000" to
+    "$700,0" — a plausible-looking wrong number on a page bound for a client.
+
+    These pin the contract between the two implementations. The arithmetic
+    itself runs in a browser and cannot be exercised here, so what is checked
+    is that the export carries the pass, that every text box opts in, and that
+    the constants the canvas mirrors have not drifted.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.acme = self.make_brokerage("Acme Realty")
+        self.agent, self.profile = self.make_agent_in(self.acme, "a@example.com")
+        self.template = self.make_template()
+        self.listing = self.make_verified_listing(self.profile, self.agent)
+        self.design = self.make_design(self.template, self.profile, self.listing)
+
+    def test_the_document_carries_no_script(self):
+        """The pass runs in the renderer, never as page script.
+
+        Pages are rendered with `javaScriptEnabled: false` because this markup
+        carries user-influenced content. Injecting a <script> to do the fitting
+        would have meant turning that off — so the fit lives in the renderer's
+        own `page.evaluate` and the document stays inert.
+        """
+        html = self.render(self.design)
+
+        self.assertNotIn("<script", html.lower())
+        self.assertNotIn("__fitText", html)
+
+    def test_every_text_box_opts_into_it(self):
+        html = self.render(self.design)
+
+        # Headline, price and badge. The disclaimer resolves empty on a
+        # brokerage that has not set one, and an empty text box is dropped
+        # rather than emitted, so it is not among them.
+        self.assertEqual(html.count('data-fit="1"'), 3)
+        self.assertEqual(html.count("data-fit"), 3)
+
+    def test_a_box_that_carries_no_text_is_not_marked(self):
+        """Images and colour blocks have nothing to shrink, and running the
+        pass over them would only cost time."""
+        self.edit(self.design, "hero_photo", content="")
+        html = self.render(self.design)
+
+        for match in re.finditer(r'<div style="([^"]*)"([^>]*)>', html):
+            if "background-image" in match.group(1) or "object-fit" in match.group(1):
+                self.assertNotIn("data-fit", match.group(2))
+
+    def test_overflow_hidden_is_still_the_backstop(self):
+        """The pass has a floor. Text that will not fit even at half size is
+        still clipped rather than allowed to run over its neighbours."""
+        self.assertIn("overflow:hidden", self.render(self.design))
+
+    def test_the_constants_the_other_two_mirror(self):
+        """renderer/src/server.js and ElementLayer.tsx both hardcode these.
+        Changing one without the others splits the canvas from the export,
+        which is the exact failure this module exists to catch."""
+        from apps.templates.html_builder import FIT_MIN_SCALE, FIT_STEPS
+
+        self.assertEqual(FIT_MIN_SCALE, 0.5)
+        self.assertEqual(FIT_STEPS, 8)

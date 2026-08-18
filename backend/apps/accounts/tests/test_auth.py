@@ -335,3 +335,55 @@ class CurrentUserTests(AuthAPITestCase):
         response = self.client.get(self.me_url)
 
         self.assertEqual(response.status_code, 401)
+
+
+class LoginByUsernameTests(AuthAPITestCase):
+    """Signing in with a bare name rather than an address.
+
+    Accounts are still keyed by e-mail — USERNAME_FIELD has not moved. What
+    changed is that the login form accepts the local part on its own, because
+    the staff accounts this platform is administered from are handed out as a
+    name and a password.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.admin = self.make_nehrux_admin("nehrux@nehrux.com")
+
+    def test_the_bare_name_signs_in(self):
+        response = self.login("nehrux")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["user"]["email"], "nehrux@nehrux.com")
+
+    def test_the_name_is_case_insensitive(self):
+        self.assertEqual(self.login("Nehrux").status_code, 200)
+
+    def test_the_full_address_still_works(self):
+        self.assertEqual(self.login("nehrux@nehrux.com").status_code, 200)
+
+    def test_the_password_is_still_required(self):
+        response = self.login("nehrux", password="not-the-password")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("access", response.data)
+
+    def test_an_unknown_name_is_refused(self):
+        self.assertEqual(self.login("nobody").status_code, 400)
+
+    def test_an_ambiguous_name_resolves_to_nobody(self):
+        """Two accounts whose addresses start the same way cannot be told
+        apart from the name alone. Picking one would let somebody sign in as
+        an account they did not name, so neither is chosen."""
+        self.make_agent("nehrux@example.com")
+
+        response = self.login("nehrux")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("access", response.data)
+
+    def test_a_name_is_never_treated_as_an_address(self):
+        """The field stopped being an EmailField. It must not have become a
+        way to authenticate as something that only looks like an account."""
+        self.assertEqual(self.login("nehrux@").status_code, 400)
+        self.assertEqual(self.login("@nehrux.com").status_code, 400)
