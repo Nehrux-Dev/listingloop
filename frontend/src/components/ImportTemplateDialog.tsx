@@ -32,8 +32,13 @@ import { IconUpload } from './icons.tsx'
 
 /** Mirrors IMPORT_EXTENSIONS in apps/templates/serializers.py. The server
  *  re-checks all of this — and sniffs the bytes, which a browser cannot — so
- *  this exists to keep the file picker useful, not to enforce anything. */
-const ACCEPT = '.pdf,.png,.jpg,.jpeg,.webp'
+ *  this exists to keep the file picker useful, not to enforce anything.
+ *
+ *  PDF only for now, same reason as TemplateUploadPage: image extraction
+ *  needs the vision model (OPENAI_API_KEY), which this server does not have
+ *  configured. Restore '.pdf,.png,.jpg,.jpeg,.webp' (and the hint below)
+ *  when the key is set. */
+const ACCEPT = '.pdf'
 
 /** Mirrors MAX_TEMPLATE_IMPORT_MB. Checked here only so an oversized file is
  *  refused before it spends a minute uploading. */
@@ -171,7 +176,7 @@ export default function ImportTemplateDialog({
               <span className="text-sm font-medium text-ink">
                 Drop a design here, or click to choose
               </span>
-              <span className="text-xs text-muted">PDF, PNG, JPG or WebP · up to {MAX_MB}MB</span>
+              <span className="text-xs text-muted">PDF · up to {MAX_MB}MB</span>
             </>
           )}
         </label>

@@ -456,6 +456,137 @@ class MicrodataTests(SimpleTestCase):
         self.assertEqual(result.fields["address"], "12 Harbour View Terrace")
 
 
+NEXT_DATA_PAGE = """
+<html><head>
+<script id="__NEXT_DATA__" type="application/json">
+{"props": {"pageProps": {"property": {
+  "displayAddress": "12 Harbour View Terrace, Manly",
+  "listPrice": 1850000,
+  "bedrooms": 4,
+  "bathrooms": 2.5,
+  "propertyType": "SemiDetachedHouse",
+  "images": [{"url": "https://cdn.example.test/a.jpg"}, "/img/b.jpg"]
+}}}}
+</script>
+</head><body><div id="root"></div></body></html>
+"""
+
+WINDOW_STATE_PAGE = """
+<html><head><script>
+window.__INITIAL_STATE__ = {"listing": {
+  "address": {"street": "12 Harbour View Terrace", "city": "Manly",
+              "state": "NSW", "zip": "2095"},
+  "prices": {"primaryPrice": "$1,850,000"},
+  "beds": 4,
+  "baths": 2
+}};
+</script></head><body><div id="root"></div></body></html>
+"""
+
+CARD_LIST_PAGE = """
+<html><head>
+<script id="__NEXT_DATA__" type="application/json">
+{"props": {"searchResults": [
+  {"displayAddress": "1 First St", "listPrice": 500000, "bedrooms": 2, "bathrooms": 1},
+  {"displayAddress": "2 Second St", "listPrice": 600000, "bedrooms": 3, "bathrooms": 2},
+  {"displayAddress": "3 Third St", "listPrice": 700000, "bedrooms": 4, "bathrooms": 2}
+]}}
+</script>
+</head><body><div id="root"></div></body></html>
+"""
+
+DISAGREEING_STATE_PAGE = """
+<html><head>
+<script id="__NEXT_DATA__" type="application/json">
+{"entities": {
+  "Listing:1": {"displayAddress": "12 Harbour View Terrace", "listPrice": 1850000,
+                "bedrooms": 4, "bathrooms": 2},
+  "Listing:2": {"displayAddress": "99 Somewhere Else Road", "listPrice": 725000,
+                "bedrooms": 3, "bathrooms": 2}
+}}
+</script>
+</head><body><div id="root"></div></body></html>
+"""
+
+
+class EmbeddedStateTests(SimpleTestCase):
+    """The JSON a JavaScript-built page ships its own data in.
+
+    These pages used to import blank from the plain fetch (their visible HTML
+    is an empty shell) and needed the browser re-fetch, which the state tier
+    now often makes unnecessary.
+    """
+
+    def test_next_data_island_is_read(self):
+        result = extract_listing_data(NEXT_DATA_PAGE, SOURCE_URL)
+
+        self.assertEqual(result.fields["address"], "12 Harbour View Terrace, Manly")
+        self.assertEqual(result.fields["price"], Decimal("1850000"))
+        self.assertEqual(result.fields["bedrooms"], 4)
+        self.assertEqual(result.fields["bathrooms"], Decimal("2.5"))
+        self.assertEqual(result.fields["property_type"], "house")
+        self.assertTrue(result.structured)
+
+    def test_state_photos_are_collected_and_made_absolute(self):
+        result = extract_listing_data(NEXT_DATA_PAGE, SOURCE_URL)
+
+        self.assertIn("https://cdn.example.test/a.jpg", result.photo_urls)
+        self.assertIn("https://example.test/img/b.jpg", result.photo_urls)
+
+    def test_inline_window_assignment_is_read(self):
+        result = extract_listing_data(WINDOW_STATE_PAGE, SOURCE_URL)
+
+        self.assertEqual(result.fields["address"], "12 Harbour View Terrace")
+        self.assertEqual(result.fields["city"], "Manly")
+        self.assertEqual(result.fields["state"], "NSW")
+        self.assertEqual(result.fields["postcode"], "2095")
+        self.assertEqual(result.fields["price"], Decimal("1850000"))
+        self.assertEqual(result.fields["bedrooms"], 4)
+
+    def test_a_card_list_is_not_mistaken_for_the_listing(self):
+        """Search results are somebody else's properties, every one of them."""
+        result = extract_listing_data(CARD_LIST_PAGE, SOURCE_URL)
+
+        self.assertEqual(result.fields, {})
+        self.assertFalse(result.structured)
+
+    def test_disagreeing_state_objects_settle_only_what_they_agree_on(self):
+        """An entity cache holds the neighbours too; unanimity or nothing."""
+        result = extract_listing_data(DISAGREEING_STATE_PAGE, SOURCE_URL)
+
+        self.assertNotIn("address", result.fields)
+        self.assertNotIn("price", result.fields)
+        self.assertNotIn("bedrooms", result.fields)
+        self.assertEqual(result.fields["bathrooms"], Decimal("2"))
+        self.assertTrue(any("conflicting values" in w for w in result.warnings))
+
+    def test_json_ld_wins_over_embedded_state(self):
+        state = NEXT_DATA_PAGE.replace('"listPrice": 1850000', '"listPrice": 999')
+        both = JSON_LD_PAGE + state
+
+        result = extract_listing_data(both, SOURCE_URL)
+
+        self.assertEqual(result.fields["price"], Decimal("1850000"))
+
+    def test_javascript_that_is_not_json_is_skipped_not_evaluated(self):
+        html = (
+            "<html><head><script>window.PAGE_MODEL = {foo: bar, nope};"
+            "</script></head><body>hi</body></html>"
+        )
+
+        result = extract_listing_data(html, SOURCE_URL)
+
+        self.assertEqual(result.fields, {})
+        self.assertFalse(result.structured)
+
+    def test_an_area_with_no_unit_is_not_assumed_to_be_square_feet(self):
+        html = NEXT_DATA_PAGE.replace('"listPrice": 1850000', '"listPrice": 1850000, "livingArea": 200')
+
+        result = extract_listing_data(html, SOURCE_URL)
+
+        self.assertNotIn("square_footage", result.fields)
+
+
 class BotWallTests(SimpleTestCase):
     """A challenge page is not an empty listing, and must not read as one."""
 

@@ -35,8 +35,15 @@ import { ApiError } from '../../lib/apiClient.ts'
 
 /** Mirrors IMPORT_EXTENSIONS / MAX_TEMPLATE_IMPORT_MB in the serializer. The
  *  server re-checks both and sniffs the bytes, which a browser cannot — this
- *  keeps the picker useful, it does not enforce anything. */
-const ACCEPT = '.pdf,.png,.jpg,.jpeg,.webp'
+ *  keeps the picker useful, it does not enforce anything.
+ *
+ *  PDF only for now, although the backend can also read PNG/JPG/WEBP: image
+ *  extraction goes through the vision model, which needs OPENAI_API_KEY
+ *  configured — and on a server without it, offering images here just walks
+ *  the admin into "content generation is not configured". Restore
+ *  '.pdf,.png,.jpg,.jpeg,.webp' (and the hint text below) when the key is
+ *  set. A text PDF needs no key at all — it is read structurally. */
+const ACCEPT = '.pdf'
 const MAX_MB = 25
 
 /** A PDF carrying real text is read structurally and finishes in about a
@@ -172,8 +179,7 @@ export default function TemplateUploadPage() {
             {file ? file.name : 'Drop a PDF here, or choose a file'}
           </p>
           <p className="mt-0.5 text-xs text-muted">
-            PDF, PNG, JPG or WEBP · up to {MAX_MB}MB · the first page becomes the
-            template
+            PDF · up to {MAX_MB}MB · the first page becomes the template
           </p>
           <input
             ref={inputRef}

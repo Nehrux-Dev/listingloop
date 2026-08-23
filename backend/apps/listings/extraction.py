@@ -8,14 +8,22 @@ Everything this module produces gets shown to an agent who is about to put
 their name on it. A blank field is a small inconvenience; a *wrong* field that
 looks confidently filled in is how a listing goes out with the wrong price.
 
-So the extraction is deliberately conservative, in three tiers, most reliable
+So the extraction is deliberately conservative, in four tiers, most reliable
 first:
 
-  1. **JSON-LD** (schema.org) — the site explicitly telling us what the
-     numbers mean. Trusted.
-  2. **Open Graph / meta tags** — also explicit, but coarser. Used for images
+  1. **JSON-LD / microdata** (schema.org) — the site explicitly telling us
+     what the numbers mean. Trusted.
+  2. **Embedded state** — the JSON a JavaScript-built site ships its own page
+     data in (``__NEXT_DATA__``, ``window.__INITIAL_STATE__``, Rightmove's
+     ``PAGE_MODEL``, Apollo caches). This is the very object the page renders
+     from, so it is as explicit as JSON-LD — but its key names are the site's
+     own, so only unambiguous keys are read, and a value is accepted only when
+     every listing-shaped object on the page agrees about it. A page whose
+     state describes many properties (search results, "similar homes") is
+     left alone entirely.
+  3. **Open Graph / meta tags** — also explicit, but coarser. Used for images
      and description.
-  3. **Labelled text patterns** — only for bedrooms, bathrooms and floor area,
+  4. **Labelled text patterns** — only for bedrooms, bathrooms and floor area,
      and only where a number sits directly against an unambiguous label
      ("3 bedrooms"). If the page yields *conflicting* values for a field, the
      field is left blank and a warning is recorded. Guessing which of two
@@ -23,8 +31,10 @@ first:
 
 Price is never taken from loose text. A listing page is full of numbers that
 look like prices — comparable sales, price history, mortgage estimates — and
-picking one would be a coin flip. If structured data does not state the price,
-it stays blank.
+picking one would be a coin flip. A price is accepted only where it is
+*labelled as the price* in machine-readable form: schema.org data, embedded
+state under an explicit price key, or a price meta tag. Anywhere else, it
+stays blank.
 
 Every field that is populated is named in ``extracted_fields``, and everything
 that could not be found produces a warning. The agent therefore sees exactly
@@ -105,9 +115,12 @@ class ExtractionResult:
     fields: dict = field(default_factory=dict)
     photo_urls: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    #: Whether the page actually declared a listing (JSON-LD or microdata), as
-    #: opposed to yielding only meta tags and text guesses. The import path uses
-    #: this to decide whether re-fetching with a browser is worth the cost.
+    #: Whether the page actually declared a listing machine-readably (JSON-LD,
+    #: microdata, or usable embedded state), as opposed to yielding only meta
+    #: tags and text guesses. The import path uses this to decide whether
+    #: re-fetching with a browser is worth the cost — and embedded state often
+    #: answers it from the plain fetch, since a JS-built page ships its data
+    #: island in the HTML even when the visible markup is an empty shell.
     structured: bool = False
 
     @property
@@ -394,6 +407,432 @@ def _apply_microdata(result: ExtractionResult, soup: BeautifulSoup, base_url: st
 
 
 # ---------------------------------------------------------------------------
+# Embedded state (__NEXT_DATA__ and friends)
+# ---------------------------------------------------------------------------
+#
+# A JavaScript-built listing page ships its data as JSON in the HTML — a
+# Next.js data island, a `window.__INITIAL_STATE__` assignment, Rightmove's
+# PAGE_MODEL — and renders the visible page *from* it. That JSON is therefore
+# at least as authoritative as the rendered text, and it is present in the
+# plain fetch, which means reading it here can save the whole browser
+# re-fetch that exists for pages whose visible HTML is an empty shell.
+#
+# What makes it riskier than schema.org is that the key names are the site's
+# own. Two rules keep the never-invent promise:
+#
+#   * Only unambiguous keys are read (`bedrooms`, `listPrice`,
+#     `displayAddress`, ...). A key that merely might mean the right thing
+#     (`area`, `size`) is ignored.
+#   * The state routinely describes *other* properties too — search cards,
+#     "similar homes", an entity cache with the neighbours in it. So a value
+#     is used only when every listing-shaped object found agrees on it; an
+#     array of several listing-shaped objects is treated as a card list and
+#     skipped outright; and a page whose state is mostly other properties is
+#     left alone with a warning.
+
+#: Globals that sites assign their page state to. Matched as `NAME = {...}`
+#: inside inline scripts; the JSON object is cut out by brace-matching and
+#: parsed strictly — anything that is not valid JSON is skipped, never eval'd.
+_STATE_ASSIGNMENT_RE = re.compile(
+    r"(?:window\.|self\.|globalThis\.)?"
+    r"(?:__NEXT_DATA__|__INITIAL_STATE__|__PRELOADED_STATE__|__APOLLO_STATE__|PAGE_MODEL)"
+    r"\s*=\s*"
+)
+
+#: A single state blob past this size is an app bundle, not page data.
+_MAX_STATE_BYTES = 2 * 1024 * 1024
+
+#: Ceiling on JSON nodes walked per page. Bounds CPU on pathological blobs;
+#: real page states are far smaller.
+_MAX_STATE_NODES = 80_000
+
+#: More listing-shaped objects than this means a search page. Nothing on such
+#: a page can be attributed to "the" listing, so the tier withdraws.
+_MAX_STATE_CANDIDATES = 8
+
+#: A dict qualifies as listing-shaped when at least this many of the signal
+#: groups below are present. High enough that a random config object cannot
+#: qualify; low enough that a lean listing card still does.
+_MIN_STATE_SIGNALS = 3
+
+# Key synonyms, matched after lowercasing and stripping `_`/`-` so camelCase
+# and snake_case spell the same thing. Every entry is a key whose meaning is
+# not really in doubt; that is the admission test for this table.
+_STATE_BEDROOM_KEYS = ("bedrooms", "beds", "numbedrooms", "bedroomcount", "numberofbedrooms")
+_STATE_BATHROOM_KEYS = (
+    "bathrooms",
+    "baths",
+    "numbathrooms",
+    "bathroomcount",
+    "numberofbathroomstotal",
+    "bathroomstotal",
+)
+_STATE_PRICE_KEYS = ("price", "listprice", "askingprice", "listingprice", "prices")
+_STATE_PRICE_INNER_KEYS = ("amount", "value", "price", "listprice", "primaryprice", "displayprice")
+_STATE_ADDRESS_KEYS = ("address", "displayaddress", "fulladdress")
+_STATE_STREET_KEYS = ("streetaddress", "street", "street1", "line1", "addressline1", "address1")
+_STATE_CITY_KEYS = ("addresslocality", "city", "locality", "town", "suburb")
+_STATE_REGION_KEYS = ("addressregion", "state", "region", "province", "county", "statecode")
+_STATE_POSTCODE_KEYS = ("postalcode", "postcode", "zip", "zipcode")
+_STATE_COUNTRY_KEYS = ("addresscountry", "country", "countrycode")
+#: Keys that state the unit in their own name need no companion unit key.
+_STATE_SQFT_KEYS = ("sqft", "squarefeet", "squarefootage", "floorareasqft")
+#: `livingArea` alone could be either unit; it is read only when a unit key
+#: sits beside it to say which.
+_STATE_AREA_KEYS = ("livingarea", "livingareavalue")
+_STATE_AREA_UNIT_KEYS = ("livingareaunits", "areaunits", "areaunit", "sizeunit", "unitofarea")
+_STATE_TYPE_KEYS = ("propertytype", "hometype", "propertysubtype")
+_STATE_PHOTO_KEYS = ("images", "photos", "media", "propertyimages", "photourls")
+_STATE_PHOTO_INNER_KEYS = ("url", "src", "href", "srcurl", "imageurl", "mainimagesrc")
+
+#: Site vocabularies mapped onto schema.org type names, which then go through
+#: the same PROPERTY_TYPE_HINTS as everything else. Only spellings whose
+#: meaning is obvious; anything absent stays unmapped on purpose.
+_STATE_TYPE_ALIASES = {
+    "singlefamily": "house",
+    "singlefamilyhome": "house",
+    "singlefamilyresidence": "house",
+    "detached": "house",
+    "detachedhouse": "house",
+    "semidetached": "house",
+    "semidetachedhouse": "house",
+    "house": "house",
+    "flat": "apartment",
+    "apartment": "apartment",
+    "condo": "condo",
+    "condominium": "condo",
+    "townhouse": "townhouse",
+    "townhome": "townhouse",
+    "duplex": "duplex",
+    "land": "land",
+    "lot": "land",
+    "commercial": "commercial",
+}
+
+
+def _normalised_keys(node: dict) -> dict:
+    """`{listPrice: 1} / {list_price: 1}` -> `{"listprice": 1}`, first wins."""
+    out: dict = {}
+    for key, value in node.items():
+        normalised = str(key).lower().replace("_", "").replace("-", "")
+        out.setdefault(normalised, value)
+    return out
+
+
+def _balanced_json_object(text: str, start: int) -> str | None:
+    """The `{...}` starting at ``start``, honouring strings and escapes."""
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, min(len(text), start + _MAX_STATE_BYTES)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _iter_embedded_json(soup: BeautifulSoup):
+    """Yield every parsed JSON state blob on the page."""
+    for tag in soup.find_all("script"):
+        script_type = (tag.get("type") or "").lower()
+        if script_type == "application/ld+json":
+            continue  # tier 1's territory
+        raw = tag.string or tag.get_text() or ""
+        if not raw or len(raw) > _MAX_STATE_BYTES:
+            continue
+
+        # Data islands: <script type="application/json"> is inert data by
+        # definition — __NEXT_DATA__ is the famous one, but any island might
+        # be the page's state, and parsing them all costs one json.loads each.
+        if script_type == "application/json":
+            try:
+                yield json.loads(raw)
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        # Inline assignments to the known globals.
+        for match in _STATE_ASSIGNMENT_RE.finditer(raw):
+            snippet = _balanced_json_object(raw, match.end())
+            if snippet is None:
+                continue
+            try:
+                yield json.loads(snippet)
+            except (ValueError, TypeError):
+                # Real JavaScript rather than serialised JSON. Not ours to
+                # interpret — evaluating it would be running the site's code.
+                continue
+
+
+def _state_signals(node: dict) -> set[str]:
+    """Which listing signals ``node`` carries, by unambiguous key alone."""
+    lowered = _normalised_keys(node)
+
+    def present(keys: tuple[str, ...]) -> bool:
+        return any(lowered.get(key) not in (None, "", [], {}) for key in keys)
+
+    signals = set()
+    if present(_STATE_BEDROOM_KEYS):
+        signals.add("bedrooms")
+    if present(_STATE_BATHROOM_KEYS):
+        signals.add("bathrooms")
+    if present(_STATE_PRICE_KEYS):
+        signals.add("price")
+    if present(_STATE_ADDRESS_KEYS):
+        signals.add("address")
+    if present(_STATE_SQFT_KEYS) or present(_STATE_AREA_KEYS):
+        signals.add("square_footage")
+    if any(isinstance(lowered.get(key), str) and lowered[key].strip() for key in _STATE_TYPE_KEYS):
+        signals.add("property_type")
+    return signals
+
+
+def _is_state_candidate(node) -> bool:
+    return isinstance(node, dict) and len(_state_signals(node)) >= _MIN_STATE_SIGNALS
+
+
+def _iter_state_candidates(root):
+    """Yield listing-shaped dicts inside ``root``, skipping card lists.
+
+    Iterative rather than recursive (state blobs nest deep), with a node
+    budget. Two shapes are deliberately not yielded:
+
+      * Items of an array that contains two or more listing-shaped objects.
+        That is a search-result or "similar homes" strip, and every entry in
+        it is somebody else's property.
+      * Anything nested *inside* a yielded candidate — its interesting
+        sub-objects (address, photos) are read through the candidate itself.
+    """
+    budget = _MAX_STATE_NODES
+    stack = [root]
+    while stack and budget > 0:
+        budget -= 1
+        node = stack.pop()
+        if isinstance(node, dict):
+            if _is_state_candidate(node):
+                yield node
+            else:
+                stack.extend(node.values())
+        elif isinstance(node, list):
+            candidates_here = sum(1 for item in node if _is_state_candidate(item))
+            if candidates_here >= 2:
+                stack.extend(item for item in node if not _is_state_candidate(item))
+            else:
+                stack.extend(node)
+
+
+def _state_price(value) -> Decimal | None:
+    if isinstance(value, dict):
+        lowered = _normalised_keys(value)
+        for key in _STATE_PRICE_INNER_KEYS:
+            if key in lowered:
+                price = _to_decimal(lowered[key])
+                if price:
+                    return price
+        return None
+    return _to_decimal(value)
+
+
+def _state_address(value):
+    """An address value -> the shape ``_extract_address`` reads."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+
+    lowered = _normalised_keys(value)
+
+    def first(keys: tuple[str, ...]):
+        for key in keys:
+            if lowered.get(key) not in (None, ""):
+                return lowered[key]
+        return None
+
+    schema_shaped = {
+        "streetAddress": first(_STATE_STREET_KEYS),
+        "addressLocality": first(_STATE_CITY_KEYS),
+        "addressRegion": first(_STATE_REGION_KEYS),
+        "postalCode": first(_STATE_POSTCODE_KEYS),
+        "addressCountry": first(_STATE_COUNTRY_KEYS),
+    }
+    if any(schema_shaped.values()):
+        return {key: value for key, value in schema_shaped.items() if value is not None}
+
+    # No component keys, but a display string inside the object (Rightmove's
+    # address.displayAddress). Kept whole, like any unstructured address.
+    display = first(("displayaddress", "fulladdress"))
+    return display if isinstance(display, str) else None
+
+
+def _state_photos(value) -> list[str]:
+    urls: list[str] = []
+    items = value if isinstance(value, list) else [value]
+    for item in items[: MAX_PHOTOS * 2]:
+        if isinstance(item, str) and item.strip():
+            urls.append(item.strip())
+        elif isinstance(item, dict):
+            lowered = _normalised_keys(item)
+            for key in _STATE_PHOTO_INNER_KEYS:
+                candidate = lowered.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    urls.append(candidate.strip())
+                    break
+    return urls
+
+
+def _schema_node_from_state(node: dict) -> dict:
+    """Translate one state candidate into a schema.org-shaped node.
+
+    Translation rather than a second extractor: everything downstream —
+    clamping, list-unwrapping, the m² conversion and its warning — already
+    exists in ``_apply_listing_node``, and this keeps the state tier from
+    growing field rules that drift away from the JSON-LD ones.
+    """
+    lowered = _normalised_keys(node)
+    schema: dict = {}
+
+    def first(keys: tuple[str, ...]):
+        for key in keys:
+            if lowered.get(key) not in (None, ""):
+                return lowered[key]
+        return None
+
+    bedrooms = first(_STATE_BEDROOM_KEYS)
+    if bedrooms is not None:
+        schema["numberOfBedrooms"] = bedrooms
+    bathrooms = first(_STATE_BATHROOM_KEYS)
+    if bathrooms is not None:
+        schema["numberOfBathroomsTotal"] = bathrooms
+
+    price_raw = first(_STATE_PRICE_KEYS)
+    if price_raw is not None:
+        price = _state_price(price_raw)
+        if price:
+            schema["offers"] = {"price": price}
+
+    address = _state_address(first(_STATE_ADDRESS_KEYS))
+    if address is not None:
+        schema["address"] = address
+
+    sqft = first(_STATE_SQFT_KEYS)
+    if sqft is not None:
+        schema["floorSize"] = sqft
+    else:
+        area = first(_STATE_AREA_KEYS)
+        unit = first(_STATE_AREA_UNIT_KEYS)
+        if area is not None and isinstance(unit, str) and unit.strip():
+            schema["floorSize"] = {"value": area, "unitText": unit}
+
+    type_raw = first(_STATE_TYPE_KEYS)
+    if isinstance(type_raw, str):
+        alias = _STATE_TYPE_ALIASES.get(re.sub(r"[^a-z]", "", type_raw.lower()))
+        if alias:
+            schema["@type"] = [alias]
+
+    description = lowered.get("description")
+    # Short strings under a `description` key are routinely UI labels or SEO
+    # stubs; a real listing description has some length to it.
+    if isinstance(description, str) and len(description.strip()) >= 40:
+        schema["description"] = description.strip()
+
+    photos = _state_photos(first(_STATE_PHOTO_KEYS))
+    if photos:
+        schema["image"] = photos
+
+    return schema
+
+
+def _comparable(value) -> str:
+    """A value as a string that makes duplicates equal across candidates."""
+    if isinstance(value, Decimal):
+        return str(value.normalize())
+    return " ".join(str(value).lower().split())
+
+
+def _apply_embedded_state(result: ExtractionResult, soup: BeautifulSoup, base_url: str) -> bool:
+    """Read the page's embedded state. True when it yielded anything usable."""
+    candidates: list[dict] = []
+    for blob in _iter_embedded_json(soup):
+        for node in _iter_state_candidates(blob):
+            candidates.append(node)
+            if len(candidates) > _MAX_STATE_CANDIDATES:
+                result.warnings.append(
+                    "The page's embedded data describes many properties, so "
+                    "none of it was used."
+                )
+                return False
+    if not candidates:
+        return False
+
+    # Each candidate is applied into its own scratch result, and a field only
+    # reaches the real one where every candidate that states it agrees. The
+    # entity-cache case — the page's own listing sitting beside its neighbours
+    # in one dict — is exactly what this catches.
+    scratches: list[ExtractionResult] = []
+    for node in candidates:
+        scratch = ExtractionResult()
+        _apply_listing_node(scratch, _schema_node_from_state(node), base_url)
+        if scratch.fields or scratch.photo_urls:
+            result.warnings.extend(scratch.warnings)
+            scratches.append(scratch)
+    if not scratches:
+        return False
+
+    field_names = sorted(set().union(*(scratch.fields for scratch in scratches)))
+    disputed: list[str] = []
+    settled = 0
+    for name in field_names:
+        values = {
+            _comparable(scratch.fields[name])
+            for scratch in scratches
+            if name in scratch.fields
+        }
+        if len(values) == 1:
+            for scratch in scratches:
+                if name in scratch.fields:
+                    result.set(name, scratch.fields[name])
+                    settled += 1
+                    break
+        else:
+            disputed.append(name)
+
+    if disputed:
+        listed = ", ".join(field.replace("_", " ") for field in disputed)
+        result.warnings.append(
+            f"The page's embedded data gives conflicting values for {listed}, "
+            "so they were left blank rather than guessed."
+        )
+
+    # Photos are only attributable to *the* listing when the candidates are
+    # not disputing whose page this is.
+    photos_added = 0
+    if "address" not in disputed:
+        for scratch in scratches:
+            for url in scratch.photo_urls:
+                absolute = urljoin(base_url, url)
+                if absolute not in result.photo_urls:
+                    result.photo_urls.append(absolute)
+                    photos_added += 1
+
+    return settled > 0 or photos_added > 0
+
+
+# ---------------------------------------------------------------------------
 # Open Graph / meta
 # ---------------------------------------------------------------------------
 
@@ -502,9 +941,12 @@ def extract_listing_data(html: str, base_url: str) -> ExtractionResult:
 
     # JSON-LD first so it wins where both are present: `set()` keeps the first
     # value for a field, and a script block is less likely to have been
-    # mangled by a CMS than inline attributes.
+    # mangled by a CMS than inline attributes. Embedded state runs after the
+    # schema.org tiers — it is the same data with the site's own key names, so
+    # where both exist the spelled-out vocabulary is the better witness.
     had_structured_data = _apply_jsonld(result, soup, base_url)
     had_structured_data |= _apply_microdata(result, soup, base_url)
+    had_structured_data |= _apply_embedded_state(result, soup, base_url)
     result.structured = had_structured_data
     _apply_meta(result, soup, base_url)
     # Run last: structured data always wins, and `set()` ignores repeats.
