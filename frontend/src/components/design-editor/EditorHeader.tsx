@@ -140,7 +140,7 @@ export default function EditorHeader({
   }, [])
 
   return (
-    <header className="flex h-16 shrink-0 items-center gap-3 border-b border-line bg-surface px-4">
+    <header className="flex h-16 shrink-0 items-center gap-2 border-b border-line bg-surface px-3 sm:gap-3 sm:px-4">
       {/* -- where you are --------------------------------------------- */}
       <Link
         to={DESIGNS_HOME}
@@ -184,7 +184,10 @@ export default function EditorHeader({
           </HeaderIconButton>
         </div>
 
-        <div className="flex items-center gap-0.5 rounded-control border border-line p-0.5">
+        {/* Hidden on phones: pinch-to-zoom territory, and the header has no
+            room. Fit runs automatically on load, so the canvas is still sized
+            sensibly without these. */}
+        <div className="hidden items-center gap-0.5 rounded-control border border-line p-0.5 md:flex">
           <HeaderIconButton
             onClick={() => onZoomChange(Math.max(MIN_ZOOM, zoom - 10))}
             disabled={zoom <= MIN_ZOOM}
@@ -232,7 +235,7 @@ export default function EditorHeader({
               ? `Currently showing ${listingAddress}. Pick a different property.`
               : 'Bring a property into this design'
           }
-          className={`flex items-center gap-1.5 rounded-control border px-3 py-2 text-[13px] font-medium transition disabled:opacity-50 ${
+          className={`hidden items-center gap-1.5 rounded-control border px-3 py-2 text-[13px] font-medium transition disabled:opacity-50 sm:flex ${
             listingAddress
               ? 'border-line hover:bg-hover'
               : 'border-brand/40 bg-brand-soft text-brand hover:bg-brand-soft/70'
@@ -248,7 +251,7 @@ export default function EditorHeader({
           type="button"
           onClick={onPreview}
           disabled={busy}
-          className="flex items-center gap-1.5 rounded-control border border-line px-3 py-2 text-[13px] font-medium transition hover:bg-hover disabled:opacity-50"
+          className="hidden items-center gap-1.5 rounded-control border border-line px-3 py-2 text-[13px] font-medium transition hover:bg-hover disabled:opacity-50 sm:flex"
         >
           <IconEye className="size-4 text-muted" />
           Preview
@@ -286,6 +289,15 @@ export default function EditorHeader({
 
           {menuOpen && (
             <div className="absolute right-0 top-full z-30 mt-1.5 w-56 overflow-hidden rounded-panel border border-line bg-surface py-1 shadow-pop">
+              {/* Where the header hid a button for lack of room, the menu
+                  carries it — every action stays reachable on a phone. */}
+              <div className="sm:hidden">
+                <MenuItem onClick={() => { setMenuOpen(false); onImportListing() }}>
+                  {listingAddress ? 'Change listing…' : 'Import listing…'}
+                </MenuItem>
+                <MenuItem onClick={() => { setMenuOpen(false); onPreview() }}>Preview</MenuItem>
+                <div className="my-1 h-px bg-line" />
+              </div>
               <MenuItem onClick={() => { setMenuOpen(false); onRename() }}>Rename…</MenuItem>
               <MenuItem onClick={() => { setMenuOpen(false); onDuplicate() }}>Duplicate</MenuItem>
               <div className="my-1 h-px bg-line" />

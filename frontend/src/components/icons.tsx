@@ -44,6 +44,18 @@ export const IconDashboard = (p: IconProps) => (
   </Svg>
 )
 
+export const IconMenu = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M4 6.5h16M4 12h16M4 17.5h16" />
+  </Svg>
+)
+
+export const IconClose = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m6 6 12 12M18 6 6 18" />
+  </Svg>
+)
+
 export const IconListings = (p: IconProps) => (
   <Svg {...p}>
     <path d="M3 21h18" />
@@ -201,6 +213,22 @@ export const IconCopy = (p: IconProps) => (
   <Svg {...p}>
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M15 5.5A1.5 1.5 0 0 0 13.5 4H5.5A1.5 1.5 0 0 0 4 5.5v8A1.5 1.5 0 0 0 5.5 15" />
+  </Svg>
+)
+
+export const IconClipboard = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="5.5" y="4.5" width="13" height="17" rx="2" />
+    <rect x="9" y="2.5" width="6" height="4" rx="1" />
+    <path d="M9 12h6M9 15.5h4" />
+  </Svg>
+)
+
+export const IconPaintRoller = (p: IconProps) => (
+  <Svg {...p}>
+    <rect x="3.5" y="4" width="13" height="5" rx="1.5" />
+    <path d="M16.5 6.5h2.5A1.5 1.5 0 0 1 20.5 8v2.5a1.5 1.5 0 0 1-1.5 1.5h-6a1 1 0 0 0-1 1v1.5" />
+    <rect x="10.5" y="14.5" width="3" height="6.5" rx="1" />
   </Svg>
 )
 

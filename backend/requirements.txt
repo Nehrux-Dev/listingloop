@@ -26,6 +26,12 @@ openai>=1.60,<2.0
 # install` on Windows behaving the same way.
 PyMuPDF>=1.24,<2.0
 
+# Import fidelity scoring (extraction_validation): pixel-diffs the rebuilt
+# layout against the source. Without it the render-and-compare path — and the
+# offset auto-correction that acts on it — silently reports "could not
+# validate" on every import.
+numpy>=2.0,<3.0
+
 # Background processing
 celery>=5.5,<6.0
 redis>=5.2,<7.0

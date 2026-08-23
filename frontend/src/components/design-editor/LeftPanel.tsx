@@ -54,6 +54,13 @@ import {
 import TemplateThumb from '../TemplateThumb.tsx'
 import LayersPanel from './LayersPanel.tsx'
 import { elementKind } from './elementKind.ts'
+import {
+  SHAPE_DRAG_MIME,
+  SHAPE_PRIMITIVES,
+  shapePrimitive,
+  type ShapePrimitive,
+  type ShapePrimitiveKey,
+} from './shapeLibrary.ts'
 
 export type LeftPanelTab =
   | 'templates'
@@ -99,27 +106,67 @@ const CATEGORIES: { key: Category; label: string }[] = [
  */
 type Tile = {
   kind: ElementType
+  /** Set for a shape/frame card: the local recipe placed directly (and
+   *  draggable onto the canvas). Without it the tile goes through the
+   *  server's per-type blueprint — which cannot tell a star from a square. */
+  shape?: ShapePrimitiveKey
   label: string
   keywords: string
   category: Exclude<Category, 'all'>
   swatch: React.ReactNode
 }
 
+/**
+ * A card's preview, drawn from the primitive's own recipe — the same
+ * clip polygon and radius the placed element will render with, so the card
+ * can never advertise a shape the canvas then draws differently.
+ */
+function ShapeSwatch({ primitive }: { primitive: ShapePrimitive }) {
+  const aspect = primitive.width / primitive.height
+  const width = aspect >= 1 ? 40 : Math.max(12, Math.round(40 * aspect))
+  const height = aspect >= 1 ? Math.max(3, Math.round(40 / aspect)) : 40
+
+  const style: React.CSSProperties = { width, height }
+  const polygon = primitive.style.clip_polygon as number[] | undefined
+  if (Array.isArray(polygon)) {
+    const pairs: string[] = []
+    for (let index = 0; index < polygon.length; index += 2) {
+      pairs.push(`${polygon[index]}% ${polygon[index + 1]}%`)
+    }
+    style.clipPath = `polygon(${pairs.join(',')})`
+  }
+  const radius = Number(primitive.style.border_radius_ratio ?? 0)
+  if (radius > 0) style.borderRadius = radius >= 0.5 ? 999 : 5
+
+  if (primitive.category === 'frames') {
+    return (
+      <span className="flex items-center justify-center bg-beige" style={style}>
+        <IconImage className="size-4 text-brand/50" />
+      </span>
+    )
+  }
+  return (
+    <span
+      className={`block ${primitive.category === 'lines' ? 'bg-brand/70' : 'bg-beige'}`}
+      style={style}
+    />
+  )
+}
+
 const TILES: Tile[] = [
-  {
-    kind: 'shape',
-    label: 'Rectangle',
-    keywords: 'rectangle square block box shape',
-    category: 'shapes',
-    swatch: <span className="block h-8 w-11 rounded-[3px] bg-beige" />,
-  },
-  {
-    kind: 'shape',
-    label: 'Circle',
-    keywords: 'circle round ellipse dot shape',
-    category: 'shapes',
-    swatch: <span className="block size-9 rounded-full bg-beige" />,
-  },
+  // Every primitive becomes a card; the swatch is derived from the recipe.
+  ...SHAPE_PRIMITIVES.map(
+    (primitive): Tile => ({
+      kind: primitive.type,
+      shape: primitive.key,
+      label: primitive.label,
+      keywords: primitive.keywords,
+      category: primitive.category,
+      swatch: <ShapeSwatch primitive={primitive} />,
+    }),
+  ),
+  // The badge is a shape with a label inside it — a server-blueprint element
+  // (`type: button`), not a style-only primitive, so it keeps its own card.
   {
     kind: 'button',
     label: 'Badge',
@@ -131,37 +178,26 @@ const TILES: Tile[] = [
       </span>
     ),
   },
-  {
-    kind: 'image',
-    label: 'Image frame',
-    keywords: 'image frame photo picture placeholder rectangle',
-    category: 'frames',
-    swatch: (
-      <span className="flex h-8 w-11 items-center justify-center rounded-[3px] border-2 border-dashed border-brand/40 bg-beige/50">
-        <IconImage className="size-4 text-brand/60" />
-      </span>
-    ),
-  },
-  {
-    kind: 'shape',
-    label: 'Divider',
-    keywords: 'divider line rule separator horizontal',
-    category: 'lines',
-    swatch: <span className="block h-0.5 w-11 rounded-full bg-brand/70" />,
-  },
 ]
+
+/** What identifies a tile in the recently-used store — the shape key where
+ *  there is one, else the element type. Two shape tiles share `kind`, so the
+ *  kind alone cannot name them. */
+function tileId(tile: Tile): string {
+  return tile.shape ?? tile.kind
+}
 
 const RECENT_KEY = 'design-editor:recent-elements'
 const RECENT_LIMIT = 4
 
-function readRecent(): ElementType[] {
+function readRecent(): string[] {
   try {
     const raw = window.localStorage.getItem(RECENT_KEY)
     if (!raw) return []
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    const known = new Set(TILES.map((tile) => tile.kind))
-    return parsed.filter((k): k is ElementType => known.has(k as ElementType))
+    const known = new Set(TILES.map(tileId))
+    return parsed.filter((k): k is string => typeof k === 'string' && known.has(k))
   } catch {
     // A corrupt or unavailable store is not worth breaking the panel over.
     return []
@@ -185,6 +221,10 @@ type Props = {
   onDuplicateElement: (id: string) => void
 
   onAddElement: (kind: ElementType) => void
+  /** Place a shape primitive from the local library — at the canvas centre
+   *  from a click; the drag-onto-canvas path goes through Canvas's own drop
+   *  handler instead, because only it can name the drop position. */
+  onAddShape: (shape: ShapePrimitive) => void
   adding: boolean
 
   /** Start a new design from another template. See TemplatesTab for why this
@@ -207,7 +247,10 @@ type Props = {
 
 export default function LeftPanel(props: Props) {
   return (
-    <div className="flex h-full min-h-0 shrink-0">
+    // relative: on small screens the expanded panel floats over the canvas
+    // (anchored to this wrapper) instead of squeezing it off the viewport —
+    // a 300px column beside a 390px phone leaves nothing to design on.
+    <div className="relative flex h-full min-h-0 shrink-0">
       <nav className="flex w-[74px] shrink-0 flex-col gap-1 overflow-y-auto border-r border-line bg-subtle p-2">
         {TABS.map((entry) => {
           const active = props.tab === entry.key
@@ -235,10 +278,15 @@ export default function LeftPanel(props: Props) {
       </nav>
 
       <div
-        className={`flex min-h-0 min-w-0 flex-col border-r border-line bg-surface ${
+        className={`flex min-h-0 min-w-0 flex-col border-r border-line bg-surface max-md:absolute max-md:inset-y-0 max-md:left-full max-md:z-30 max-md:shadow-pop ${
           // Templates is a grid to pick from, not a list to read, so it gets
-          // the width two columns of thumbnails actually need.
-          props.tab === 'templates' ? 'w-[344px] shrink-0' : props.tab ? 'w-[300px] shrink-0' : 'hidden'
+          // the width two columns of thumbnails actually need. The max-md cap
+          // keeps either width inside a phone viewport minus the tab rail.
+          props.tab === 'templates'
+            ? 'w-[344px] shrink-0 max-md:w-[min(344px,calc(100vw-74px))]'
+            : props.tab
+              ? 'w-[300px] shrink-0 max-md:w-[min(300px,calc(100vw-74px))]'
+              : 'hidden'
         }`}
       >
         {props.tab === 'templates' && <TemplatesTab {...props} />}
@@ -314,18 +362,31 @@ function FixedLayoutNotice({ template }: { template: TemplateDetail }) {
 
 // -- Elements ----------------------------------------------------------------
 
-function ElementsTab({ template, onAddElement, adding, listingPhotos, uploads, onTabChange }: Props) {
+function ElementsTab({
+  template,
+  onAddElement,
+  onAddShape,
+  adding,
+  listingPhotos,
+  uploads,
+  onTabChange,
+}: Props) {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState<Category>('all')
-  const [recent, setRecent] = useState<ElementType[]>(() => readRecent())
+  const [recent, setRecent] = useState<string[]>(() => readRecent())
 
   /** Remembers what you reach for. Local to the browser — this is a
    *  convenience, not data worth a table. */
   const add = useCallback(
-    (kind: ElementType) => {
-      onAddElement(kind)
+    (tile: Tile) => {
+      // A shape card carries its own recipe and is placed locally; everything
+      // else still goes through the server's per-type blueprint.
+      const primitive = tile.shape ? shapePrimitive(tile.shape) : null
+      if (primitive) onAddShape(primitive)
+      else onAddElement(tile.kind)
       setRecent((current) => {
-        const next = [kind, ...current.filter((k) => k !== kind)].slice(0, RECENT_LIMIT)
+        const id = tileId(tile)
+        const next = [id, ...current.filter((k) => k !== id)].slice(0, RECENT_LIMIT)
         try {
           window.localStorage.setItem(RECENT_KEY, JSON.stringify(next))
         } catch {
@@ -334,7 +395,7 @@ function ElementsTab({ template, onAddElement, adding, listingPhotos, uploads, o
         return next
       })
     },
-    [onAddElement],
+    [onAddElement, onAddShape],
   )
 
   const visible = useMemo(() => {
@@ -353,7 +414,7 @@ function ElementsTab({ template, onAddElement, adding, listingPhotos, uploads, o
   const frames = byCategory('frames')
   const lines = byCategory('lines')
   const recentTiles = recent
-    .map((kind) => TILES.find((tile) => tile.kind === kind))
+    .map((id) => TILES.find((tile) => tileId(tile) === id))
     .filter((tile): tile is Tile => Boolean(tile))
 
   const collections = [
@@ -526,18 +587,32 @@ function TileGrid({
   disabled,
 }: {
   tiles: Tile[]
-  onAdd: (kind: ElementType) => void
+  onAdd: (tile: Tile) => void
   disabled: boolean
 }) {
   return (
     <div className="grid grid-cols-2 gap-1.5">
       {tiles.map((tile) => (
         <button
-          key={`${tile.category}-${tile.kind}`}
+          key={`${tile.category}-${tileId(tile)}`}
           type="button"
           disabled={disabled}
-          onClick={() => onAdd(tile.kind)}
-          title={`Add ${tile.label.toLowerCase()}`}
+          onClick={() => onAdd(tile)}
+          // Shape cards can also be dragged straight onto the canvas, landing
+          // where they are dropped. The payload is just the primitive's key —
+          // the drop side looks the recipe up itself, so the two ends can
+          // never disagree about what a "circle" is.
+          draggable={Boolean(tile.shape) && !disabled}
+          onDragStart={(event) => {
+            if (!tile.shape) return
+            event.dataTransfer.setData(SHAPE_DRAG_MIME, tile.shape)
+            event.dataTransfer.effectAllowed = 'copy'
+          }}
+          title={
+            tile.shape
+              ? `Add ${tile.label.toLowerCase()} — click, or drag it onto the canvas`
+              : `Add ${tile.label.toLowerCase()}`
+          }
           className="group flex flex-col items-center justify-center gap-2 rounded-control border border-line bg-surface py-4 transition hover:border-brand/40 hover:bg-hover disabled:opacity-50"
         >
           <span className="flex h-9 items-center justify-center">{tile.swatch}</span>

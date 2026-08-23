@@ -41,6 +41,7 @@ and it is the one place this module guesses.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -85,9 +86,18 @@ _MAX_CORNER_FRACTION = 0.5
 #: in their own right and should not be swallowed into a pattern. PDF points.
 _MAX_DOT_PT = 14.0
 
-#: How many evenly-spaced dots it takes before a scatter is a pattern. Five is
-#: comfortably past a row of bullet points and short of a real grid.
-_MIN_PATTERN_DOTS = 5
+#: How many evenly-spaced dots it takes before a scatter is a pattern. Set
+#: above the shapes a *list* produces: six bullet points in two columns of
+#: three are evenly spaced too, and rebuilding them as a tiling texture
+#: scattered dots through the list's own text. A real decorative grid has
+#: dozens.
+_MIN_PATTERN_DOTS = 9
+
+#: A pattern's pitch is a small multiple of its dot. Bullets in two columns
+#: "align" at the column gap — thirty dot-widths apart — and that is a page
+#: layout, not a texture. Anything past this multiple of the dot diameter is
+#: refused.
+_MAX_PATTERN_PITCH_FACTOR = 8.0
 
 #: Mirrors importing._MIN_MASK_POINTS / _MAX_MASK_POINTS, which cap the outline
 #: a blob may carry. Traced here so the thinning keeps the shape rather than
@@ -108,8 +118,8 @@ _ADDRESS_RE = re.compile(
     re.I,
 )
 
-#: PyMuPDF span flag bits. Only the three that change how type is set.
-_FLAG_ITALIC, _FLAG_SERIF, _FLAG_BOLD = 1 << 1, 1 << 2, 1 << 4
+#: PyMuPDF span flag bits. Only the four that change how type is set.
+_FLAG_ITALIC, _FLAG_SERIF, _FLAG_MONO, _FLAG_BOLD = 1 << 1, 1 << 2, 1 << 3, 1 << 4
 
 
 @dataclass
@@ -327,6 +337,9 @@ def find_dot_pattern(candidates: list) -> dict | None:
 
     widths = [item["rect"].width for item in candidates]
     radius = sum(widths) / len(widths) / 2
+    max_pitch = radius * 2 * _MAX_PATTERN_PITCH_FACTOR
+    if spacing_x > max_pitch or spacing_y > max_pitch:
+        return None
     return {
         "dot_color": candidates[0]["colour"],
         "dot_radius_pt": radius,
@@ -355,15 +368,289 @@ def _binding_for(text: str) -> str:
     return ""
 
 
-def _family_for(flags: int) -> str:
+#: Subset fonts arrive as "ABCDEF+Montserrat-Bold"; the tag says nothing about
+#: the face, so it is stripped before the name is read.
+_SUBSET_TAG_RE = re.compile(r"^[A-Z]{6}\+")
+
+#: Name fragments that identify a role more specifically than the PDF's own
+#: serif/mono flags can. Matched case-insensitively against the family name.
+#: Deliberately short lists of unambiguous fragments: a fragment that could
+#: appear in an unrelated family name would misfile body text, which reads
+#: worse than leaving a display face in the body bucket.
+_SCRIPT_NAME_HINTS = ("script", "brush", "callig", "handwrit", "cursive", "signature")
+_DISPLAY_NAME_HINTS = ("condensed", "narrow", "compress", "bebas", "oswald", "anton", "impact")
+_MONO_NAME_HINTS = ("mono", "courier", "consol")
+_SERIF_NAME_HINTS = ("serif", "times", "georgia", "garamond", "playfair", "didot", "bodoni", "baskerville", "caslon")
+_SANS_NAME_HINTS = ("sans", "grotesk", "grotesque", "gothic")
+
+#: Measured average advance (em per character, spaces included) below which a
+#: face is too narrow to be ordinary text. Normal sans and serif faces sit
+#: near 0.50; condensed display faces around 0.45; scripts 0.30-0.42. Set
+#: between the populations rather than at either one.
+_NARROW_FACE_EM = 0.44
+
+#: Fewer sampled characters than this and the average is one word's shape, not
+#: the face's. The name/flag fallback handles these.
+_MIN_FACE_SAMPLE = 8
+
+
+def _family_for(
+    font_name: str,
+    flags: int,
+    avg_em: float | None = None,
+    lower_ratio: float | None = None,
+) -> str:
     """What the PDF says about the face, in the vocabulary a template speaks.
 
-    A content stream cannot tell us "this is calligraphy" — Type3 subset fonts,
-    which is what design tools emit, carry no usable family name at all. So a
-    serif flag becomes `serif` and everything else becomes `body`, and a script
-    headline is one thing the admin re-picks in the editor.
+    Three sources of truth, in order of how much they can be trusted:
+
+    1. The family name. "GreatVibes-Regular" is a script, "BebasNeue" is a
+       condensed display face, anything with "Sans" in it is a body face.
+       Exact when it matches; most real PDFs carry one.
+    2. The measured shape of the face. Embedded fonts routinely lie about
+       everything else — this flyer's exporter wrote descriptor flags of
+       plain "symbolic" and zeroed the OS/2 classification on all three of
+       its fonts — but the page itself cannot lie about how wide its text
+       runs are. A face averaging under ~0.44em per glyph is not ordinary
+       text: lowercase-heavy narrow runs are calligraphy (scripts are the
+       narrowest family there is), caps-heavy ones are a condensed display
+       face. Misfiling calligraphy as serif is the single most visible way
+       an import stops resembling its flyer, so the narrow branch leans
+       toward `script` on the mixed-case side.
+    3. PyMuPDF's serif/mono flags — synthesised, wrong often enough that
+       they are only the tie-break when nothing was measured.
     """
+    name = _SUBSET_TAG_RE.sub("", font_name or "").lower()
+    if flags & _FLAG_MONO or any(hint in name for hint in _MONO_NAME_HINTS):
+        return "mono"
+    if any(hint in name for hint in _SCRIPT_NAME_HINTS):
+        return "script"
+    if any(hint in name for hint in _DISPLAY_NAME_HINTS):
+        return "display"
+    if any(hint in name for hint in _SANS_NAME_HINTS):
+        return "body"
+    # "sans" was handled above precisely because "serif" is a substring of
+    # sans-serif style names — a sans face must never land in serif.
+    if any(hint in name for hint in _SERIF_NAME_HINTS):
+        return "serif"
+    if avg_em is not None and avg_em < _NARROW_FACE_EM:
+        return "script" if (lower_ratio or 0.0) >= 0.5 else "display"
     return "serif" if flags & _FLAG_SERIF else "body"
+
+
+def _font_metrics(page) -> dict[str, tuple[float, float]]:
+    """Per font name: (average advance in em, lowercase share of its letters).
+
+    Measured from the page's own spans — the one description of a face no
+    exporter can strip or falsify — and consumed by ``_family_for``'s narrow-
+    face branch. Spaces count toward the average (they are part of how wide
+    text runs); case share is over letters only.
+    """
+    totals: dict[str, list[float]] = {}
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                size = float(span.get("size", 0))
+                text = span.get("text", "")
+                if size <= 0 or not text:
+                    continue
+                left, _, right, _ = span.get("bbox", (0, 0, 0, 0))
+                if right <= left:
+                    continue
+                entry = totals.setdefault(span.get("font", ""), [0.0, 0, 0, 0])
+                entry[0] += (right - left) / size
+                entry[1] += len(text)
+                entry[2] += sum(1 for c in text if c.isalpha())
+                entry[3] += sum(1 for c in text if c.islower())
+    metrics: dict[str, tuple[float, float]] = {}
+    for name, (em, chars, letters, lowers) in totals.items():
+        if chars < _MIN_FACE_SAMPLE:
+            continue
+        metrics[name] = (em / chars, lowers / letters if letters else 0.0)
+    return metrics
+
+
+#: Below this the writing direction is horizontal with placement slop, not a
+#: rotated line — carrying the noise as a rotation would tilt every element by
+#: a fraction of a degree. In degrees.
+_MIN_TEXT_ROTATION = 0.5
+
+#: The envelope equations below degenerate near 45°, where |cos²θ - sin²θ|
+#: goes to zero and the axis-aligned bbox carries one equation for two
+#: unknowns. Under this determinant the line's height is taken from its own
+#: font size instead.
+_ROTATION_SOLVE_FLOOR = 0.2
+
+#: How far two edges (or centres) may sit apart and still be read as the same
+#: alignment decision, in PDF points. Design tools snap, so genuinely aligned
+#: type agrees to well under a point; anything past this is layout.
+_ALIGN_TOLERANCE_PT = 1.5
+
+
+def _line_box(line: dict, size_pt: float) -> tuple[tuple[float, float, float, float], float]:
+    """The line's own (unrotated) box and its rotation in degrees.
+
+    ``line["bbox"]`` is the axis-aligned *envelope* of the glyphs. For
+    horizontal text that is the text box; for rotated text it is a lie — a
+    vertical caption comes back as a wide, short rectangle and renders as
+    horizontal type smeared across it. The writing direction (``dir``, a unit
+    vector) says the angle, and CSS rotation happens about the box centre —
+    which is also the envelope's centre — so only the box's size needs
+    recovering: envelope = w·|cos| + h·|sin| per axis, solved for w and h.
+    """
+    x0, y0, x1, y1 = line["bbox"]
+    direction = line.get("dir") or (1.0, 0.0)
+    angle = math.degrees(math.atan2(float(direction[1]), float(direction[0])))
+    if abs(angle) < _MIN_TEXT_ROTATION:
+        return (x0, y0, x1, y1), 0.0
+
+    env_w, env_h = x1 - x0, y1 - y0
+    cos, sin = abs(math.cos(math.radians(angle))), abs(math.sin(math.radians(angle)))
+    det = cos * cos - sin * sin
+    if abs(det) >= _ROTATION_SOLVE_FLOOR:
+        width = (env_w * cos - env_h * sin) / det
+        height = (env_h * cos - env_w * sin) / det
+    else:
+        # Near 45° the envelope cannot separate width from height, but a line
+        # of type knows its own height: about 1.25em.
+        height = size_pt * 1.25
+        width = (env_w - height * sin) / max(cos, 1e-6)
+    if width <= 0 or height <= 0:
+        # A degenerate solve means the envelope was not a rotated line after
+        # all; the pre-existing behaviour (envelope, no rotation) is the safe
+        # answer.
+        return (x0, y0, x1, y1), 0.0
+
+    centre_x, centre_y = (x0 + x1) / 2, (y0 + y1) / 2
+    return (
+        centre_x - width / 2,
+        centre_y - height / 2,
+        centre_x + width / 2,
+        centre_y + height / 2,
+    ), round(angle, 2)
+
+
+def _block_alignment(line_boxes: list[tuple[float, float, float, float]], page_width: float) -> str:
+    """Which text-align the block was set with, read from its own lines.
+
+    Alignment is invisible in a per-line read — each line's box is cut tight
+    to its glyphs — but it decides which way downstream passes may grow a box
+    the substitute face does not fit ("left" grows rightward and shoves a
+    centred headline off-axis). So it is inferred where the geometry states
+    it: ragged lines sharing a centre were centred, sharing a right edge were
+    right-aligned. A single line can only be read against the page — dead on
+    the page's centreline means centred — and everything else stays "left",
+    because a wrong alignment moves type and no alignment merely grows a box
+    to the right.
+    """
+    if not line_boxes:
+        return "left"
+    if len(line_boxes) == 1:
+        x0, _, x1, _ = line_boxes[0]
+        if abs((x0 + x1) / 2 - page_width / 2) <= _ALIGN_TOLERANCE_PT:
+            return "center"
+        return "left"
+
+    def spread(values: list[float]) -> float:
+        return max(values) - min(values)
+
+    lefts = [box[0] for box in line_boxes]
+    centers = [(box[0] + box[2]) / 2 for box in line_boxes]
+    rights = [box[2] for box in line_boxes]
+    # Left first: when every anchor agrees (equal-width lines) the commonest
+    # alignment wins, which is also the one that changes nothing downstream.
+    if spread(lefts) <= _ALIGN_TOLERANCE_PT:
+        return "left"
+    if spread(centers) <= _ALIGN_TOLERANCE_PT:
+        return "center"
+    if spread(rights) <= _ALIGN_TOLERANCE_PT:
+        return "right"
+    return "left"
+
+
+#: A clip only counts as an image's own frame while it keeps at least this
+#: much of the placement. Below it the overlap is coincidence — a small badge
+#: clip that happens to sit on the photo — and trimming to it would crop the
+#: picture to a corner. The cost of the floor: an image zoomed so far that its
+#: frame shows under half of it keeps its full placement box, which is the
+#: pre-existing behaviour rather than a new failure.
+_MIN_CLIP_COVER = 0.5
+
+
+def _image_clips(page) -> list[dict]:
+    """The page's clip entries, from the extended drawing walk.
+
+    Plain ``get_drawings`` hides clips, and clips are exactly what separates
+    where a photo *is* from where anyone can see it: design tools place the
+    picture generously and let a rounded frame crop it. Reading only the
+    placement box baked whatever sat next to the frame — the first glyphs of a
+    neighbouring text column, on real artwork — into the photo asset.
+    """
+    try:
+        return [
+            drawing
+            for drawing in page.get_drawings(extended=True)
+            if drawing.get("type") == "clip" and drawing.get("scissor") is not None
+        ]
+    except Exception:  # pragma: no cover - extended walk is best-effort
+        logger.warning("Could not read clip paths", exc_info=True)
+        return []
+
+
+def _visible_image_box(bbox, clips: list[dict]) -> tuple[tuple[float, float, float, float], float]:
+    """Where a placed image can actually be seen, and its frame's corner radius.
+
+    The tightest clip that still keeps most of the placement (see
+    ``_MIN_CLIP_COVER``) is taken to be the image's own frame; the visible box
+    is the intersection with its scissor. Nothing associates a clip with an
+    image in what PyMuPDF exposes, so the pairing is spatial — which is also
+    why the cover floor exists. A page that clips nothing returns the
+    placement box unchanged: the page-sized scissor intersects to exactly the
+    bbox and carries no radius.
+    """
+    left, top, right, bottom = bbox
+    area = max(0.0, right - left) * max(0.0, bottom - top)
+    if area <= 0:
+        return bbox, 0.0
+
+    best: tuple[float, tuple[float, float, float, float]] | None = None
+    matched: list[tuple[float, dict]] = []
+    for clip in clips:
+        scissor = clip["scissor"]
+        cut_left, cut_top = max(left, scissor.x0), max(top, scissor.y0)
+        cut_right, cut_bottom = min(right, scissor.x1), min(bottom, scissor.y1)
+        width, height = cut_right - cut_left, cut_bottom - cut_top
+        if width <= 0 or height <= 0:
+            continue
+        cut_area = width * height
+        if cut_area / area < _MIN_CLIP_COVER:
+            continue
+        matched.append((cut_area, clip))
+        if best is None or cut_area < best[0]:
+            best = (cut_area, (cut_left, cut_top, cut_right, cut_bottom))
+
+    if best is None:
+        return bbox, 0.0
+    smallest, visible = best
+
+    # The frame's own path says whether its corners are soft; carrying the
+    # radius is what keeps a rounded photo rounded after a re-render. A design
+    # tool nests several clips over the same frame — an axis-aligned scissor
+    # rectangle and, inside it, the rounded path that actually shapes the
+    # corners — so every clip at (near enough) the winning size is asked, and
+    # any of them knowing a radius answers for the frame.
+    radius = 0.0
+    for cut_area, clip in matched:
+        if cut_area > smallest * 1.005:
+            continue
+        shape, clip_radius = classify_shape(
+            {"items": clip.get("items") or [], "rect": clip["scissor"]}
+        )
+        if shape in ("rounded_rect", "ellipse") and clip_radius > 0:
+            radius = max(radius, clip_radius)
+    return visible, radius
 
 
 def is_text_pdf(data: bytes) -> bool:
@@ -431,7 +718,21 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
             if shape is None:
                 continue
             width, height = shape.width, shape.height
-            colour = _hex_from_floats(drawing.get("fill"))
+
+            # Opacity is part of what a fill *is*. Design tools leave fully
+            # transparent shapes in the stream — masks, guides, backdrops of
+            # deleted content — and every one of them is drawn in black.
+            # Reading the colour without the opacity turned each into an
+            # opaque black slab across the artwork, which is how a beige
+            # footer came back with a black band over it.
+            fill_opacity = drawing.get("fill_opacity")
+            fill_opacity = 1.0 if fill_opacity is None else float(fill_opacity)
+            stroke_opacity = drawing.get("stroke_opacity")
+            stroke_opacity = 1.0 if stroke_opacity is None else float(stroke_opacity)
+            if fill_opacity <= 0 and (stroke_opacity <= 0 or not drawing.get("color")):
+                # Nothing about this path is visible on the page.
+                continue
+            colour = _hex_from_floats(drawing.get("fill")) if fill_opacity > 0 else ""
 
             # Small, filled, same-sized shapes are set aside before the size
             # filter below can discard them: individually they are beneath
@@ -519,7 +820,9 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
         stroke_index = 0
         for index, (area, order, drawing) in enumerate(fills):
             shape = drawing["rect"]
-            colour = _hex_from_floats(drawing.get("fill"))
+            fill_opacity = drawing.get("fill_opacity")
+            fill_opacity = 1.0 if fill_opacity is None else float(fill_opacity)
+            colour = _hex_from_floats(drawing.get("fill")) if fill_opacity > 0 else ""
             covers_page = area >= page_area * _PAGE_COVERAGE
             if covers_page and order != ground_order:
                 # A sheet underneath the visible ground. See above.
@@ -615,6 +918,10 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
                 "fill_type": "solid_color",
                 "shape_type": shape_type,
             }
+            if fill_opacity < 1:
+                # A translucent wash over a photo is part of the design; drawn
+                # opaque it would blot out what it is supposed to tint.
+                style["opacity"] = round(fill_opacity, 2)
             if radius_pt > 0:
                 style["border_radius_px"] = radius_pt * scale_y
             if shape_type == "blob":
@@ -645,12 +952,22 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
         # -- placed images ---------------------------------------------------
         # In document order: an overlay wash sits directly on the photograph it
         # fades, and reordering them by size would put it underneath.
-        photos = list(page.get_image_info())
+        # ``xrefs=True`` names each placement's embedded stream, so baking can
+        # go back to the original pixels instead of re-cropping the raster.
+        try:
+            photos = list(page.get_image_info(xrefs=True))
+        except Exception:  # pragma: no cover - xref resolution is best-effort
+            logger.warning("Could not resolve image xrefs", exc_info=True)
+            photos = list(page.get_image_info())
+        clips = _image_clips(page)
+        visible_boxes = [_visible_image_box(info["bbox"], clips) for info in photos]
+        # Ranked by *visible* size: the hero is the biggest picture on the
+        # page, not the biggest placement rectangle behind a small frame.
         ranked = sorted(
             range(len(photos)),
             key=lambda i: -(
-                (photos[i]["bbox"][2] - photos[i]["bbox"][0])
-                * (photos[i]["bbox"][3] - photos[i]["bbox"][1])
+                (visible_boxes[i][0][2] - visible_boxes[i][0][0])
+                * (visible_boxes[i][0][3] - visible_boxes[i][0][1])
             ),
         )
         # The largest picture is the hero; the rest take photo_2.. in reading
@@ -660,22 +977,45 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
             slot_of[image_index] = f"photo_{slot}"
 
         for index, info in enumerate(photos):
-            elements.append(
-                _element(
-                    f"image_{index}",
-                    "image",
-                    "photo",
-                    box_of(info["bbox"]),
-                    _Z_IMAGE + index,
-                    binding=slot_of.get(index, ""),
-                )
+            box, radius_pt = visible_boxes[index]
+            style = {"border_radius_px": radius_pt * scale_y} if radius_pt > 0 else {}
+            element = _element(
+                f"image_{index}",
+                "image",
+                "photo",
+                box_of(box),
+                _Z_IMAGE + index,
+                binding=slot_of.get(index, ""),
+                style=style,
             )
+            # The stream behind this placement, and the *full* placement box in
+            # raster pixels (the visible box above may be a clip of it). Baking
+            # uses the pair to cut the same region out of the original image,
+            # which the raster's size cap never touched. The vision path has no
+            # equivalent, so downstream treats both as optional.
+            xref = int(info.get("xref") or 0)
+            if xref > 0:
+                placement = box_of(info["bbox"])
+                if placement.w > 0 and placement.h > 0:
+                    element["source_xref"] = xref
+                    element["source_placement"] = [
+                        round(placement.x, 2),
+                        round(placement.y, 2),
+                        round(placement.w, 2),
+                        round(placement.h, 2),
+                    ]
+            elements.append(element)
 
         # -- text ------------------------------------------------------------
+        face_metrics = _font_metrics(page)
         text_index = 0
         for block in page.get_text("dict").get("blocks", []):
             if block.get("type") != 0:
                 continue
+            # Two passes over the block: alignment is a property of the block's
+            # lines *together* (see _block_alignment), so every line has to be
+            # measured before any can be emitted.
+            block_lines: list[dict] = []
             for line in block.get("lines", []):
                 spans = line.get("spans") or []
                 # Design tools split one visual line into a span per glyph run,
@@ -688,28 +1028,56 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
                 size_pt = float(lead.get("size", 0))
                 if size_pt < _MIN_FONT_PT:
                     continue
+                box_pt, rotation = _line_box(line, size_pt)
+                block_lines.append(
+                    {
+                        "text": text,
+                        "lead": lead,
+                        "size_pt": size_pt,
+                        "box_pt": box_pt,
+                        "rotation": rotation,
+                    }
+                )
+            if not block_lines:
+                continue
 
+            align = _block_alignment(
+                [entry["box_pt"] for entry in block_lines if entry["rotation"] == 0],
+                rect.width,
+            )
+            for entry in block_lines:
+                lead, text = entry["lead"], entry["text"]
                 flags = int(lead.get("flags", 0))
+                face = face_metrics.get(str(lead.get("font", "")))
                 style = {
                     "color": _hex_from_int(lead.get("color")) or "#000000",
-                    "font_size_px": size_pt * scale_y,
+                    "font_size_px": entry["size_pt"] * scale_y,
                     "font_weight": "700" if flags & _FLAG_BOLD else "400",
-                    "font_family": _family_for(flags),
-                    "text_align": "left",
+                    "font_family": _family_for(
+                        str(lead.get("font", "")),
+                        flags,
+                        avg_em=face[0] if face else None,
+                        lower_ratio=face[1] if face else None,
+                    ),
+                    # A rotated line reads its alignment along its own axis,
+                    # which the page-relative inference above cannot see.
+                    "text_align": align if entry["rotation"] == 0 else "left",
                     "line_height": 1.2,
                 }
-                elements.append(
-                    _element(
-                        f"text_{text_index}",
-                        "text",
-                        "text",
-                        box_of(line["bbox"]),
-                        _Z_TEXT + text_index,
-                        text=text.strip(),
-                        binding=_binding_for(text),
-                        style=style,
-                    )
+                if flags & _FLAG_ITALIC:
+                    style["font_style"] = "italic"
+                element = _element(
+                    f"text_{text_index}",
+                    "text",
+                    "text",
+                    box_of(entry["box_pt"]),
+                    _Z_TEXT + text_index,
+                    text=text.strip(),
+                    binding=_binding_for(text),
+                    style=style,
                 )
+                element["transform"]["rotation"] = entry["rotation"]
+                elements.append(element)
                 text_index += 1
 
     if not elements:
@@ -724,6 +1092,12 @@ def extract_pdf_layout(data: bytes, page_width: int, page_height: int) -> dict:
             # against another is wrong in a way no validation catches.
             "width": page_width,
             "height": page_height,
+            # These boxes are the document's own numbers, not a model's
+            # estimate. Normalisation reads this to unlock the compensations
+            # that are only safe against exact measurements — fitting the
+            # substitute face to the measured box, for one. A vision payload
+            # never carries it.
+            "geometry_is_exact": True,
         },
         "elements": elements,
     }

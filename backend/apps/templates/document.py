@@ -295,7 +295,16 @@ FONT_WEIGHTS = {"300", "400", "500", "600", "700", "800", "900"}
 #: sets its headline in flowing calligraphy — "Dream House" across a hero shot
 #: — and rendering that in a serif is the single most obvious way an imported
 #: template stops looking like the flyer it came from.
-FONT_FAMILIES = {"body", "display", "serif", "mono", "script"}
+#:
+#: The second row is the authoring palette: roles an agent picks from when
+#: building type from scratch, not roles the import classifier assigns (that
+#: stays the five above — see ``pdf_extraction._family_for``). Each resolves
+#: to an open-licensed family installed in the renderer image and vendored
+#: for the canvas, keeping the still-a-role-never-a-family-name rule.
+FONT_FAMILIES = {
+    "body", "display", "serif", "mono", "script",
+    "elegant", "modern", "rounded", "slab", "retro", "soft",
+}
 TEXT_ALIGNMENTS = {"left", "center", "right"}
 VERTICAL_ALIGNMENTS = {"flex-start", "center", "flex-end"}
 FONT_STYLES = {"normal", "italic"}

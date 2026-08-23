@@ -39,7 +39,8 @@ from apps.templates.document import (
     new_element,
     new_element_id,
 )
-from apps.templates.dimensions import DEFAULT_DIMENSION, SOCIAL_DIMENSIONS
+from apps.templates.dimensions import DEFAULT_DIMENSION, SOCIAL_DIMENSIONS, get_dimension
+from apps.templates.layout_adaptation import adapt_elements
 from apps.templates.models import (
     LISTING_CATEGORIES,
     SEASONAL_CATEGORIES,
@@ -63,6 +64,7 @@ from apps.templates.rendering import (
 )
 from apps.templates.serializers import (
     CalendarEventSerializer,
+    DesignAdaptSerializer,
     DesignDuplicateSerializer,
     DesignExportRequestSerializer,
     DesignExportSerializer,
@@ -601,6 +603,61 @@ class DesignViewSet(viewsets.ModelViewSet):
                 {**element, "id": new_element_id()}
                 for element in design.ensure_document()
             ],
+        )
+        return Response(
+            self.get_serializer(copy).data, status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=True, methods=["post"], url_path="adapt")
+    def adapt(self, request: Request, pk=None) -> Response:
+        """Copy a design with its layout re-composed for another format.
+
+        A copy, not an in-place change, for the same reason Canva's resize
+        makes one: a design's single document renders at every dimension, so
+        re-laying it out for LinkedIn in place would wreck the Instagram
+        version the agent already has. The copy is an ordinary design —
+        hand-editable, exportable — whose ``preferred_dimension`` tells the
+        editor which format to open it at.
+
+        The layout maths is ``layout_adaptation.adapt_elements``; it runs once
+        here, and only the stored numbers travel further, so the editor, the
+        renderer and the export cannot disagree about what "adapted" means.
+        """
+        design = self.get_object()
+        serializer = DesignAdaptSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        target = get_dimension(serializer.validated_data["dimension"])
+        # The format this document is actually composed for. An adapted copy
+        # carries its own; treating it as still flyer-shaped would re-adapt
+        # geometry that already moved and scramble it.
+        source = get_dimension(
+            design.preferred_dimension or design.template.default_dimension
+        )
+        if target.key == source.key:
+            return Response(
+                {
+                    "detail": (
+                        "This design is already composed for "
+                        f"{source.label} — there is nothing to adapt."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        adapted = adapt_elements(design.ensure_document(), source, target)
+        # Suffixed like a duplicate is, and truncated the same way any name
+        # field is — a long design name must not turn a 201 into a 500.
+        name = (
+            serializer.validated_data.get("name")
+            or f"{design.name} — {target.label}"
+        )[:160]
+        copy = Design.objects.create(
+            name=name,
+            template=design.template,
+            agent=design.agent,
+            listing=design.listing,
+            preferred_dimension=target.key,
+            elements=[{**element, "id": new_element_id()} for element in adapted],
         )
         return Response(
             self.get_serializer(copy).data, status=status.HTTP_201_CREATED

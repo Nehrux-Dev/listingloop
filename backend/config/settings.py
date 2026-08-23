@@ -520,6 +520,13 @@ TEMPLATE_IMPORT_VALIDATE_MIN_SCORE = env.float(
     "TEMPLATE_IMPORT_VALIDATE_MIN_SCORE", default=0.9
 )
 
+#: When validation flags an element as *shifted* (its pixels match the source a
+#: few pixels over), apply that shift, re-score, and keep it only if the page
+#: as a whole got closer to the original. One extra render per import at most;
+#: a correction that does not improve the score is reverted. Only meaningful
+#: when TEMPLATE_IMPORT_VALIDATE is on, since it acts on validation's findings.
+TEMPLATE_IMPORT_AUTOCORRECT = env.bool("TEMPLATE_IMPORT_AUTOCORRECT", default=True)
+
 #: Write per-stage debug images (01_original, 02_extracted_boxes,
 #: 03_aligned_boxes, and 04/05/06 when validation also runs) plus a JSON report
 #: under MEDIA_ROOT/import-debug/<job>/. For diagnosing a bad reconstruction;

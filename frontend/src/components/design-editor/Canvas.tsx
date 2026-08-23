@@ -18,7 +18,7 @@
  * converts it to true pixels for layout and never writes anything back.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useReducer, useRef, useState } from 'react'
 
 import type { BrandKit } from '../../api/profiles.ts'
 import type { ResolvedDesign } from '../../api/templates.ts'
@@ -37,6 +37,7 @@ import {
   type PixelBox,
   type ResizeHandle,
 } from './geometry.ts'
+import { SHAPE_DRAG_MIME, shapePrimitive, type ShapePrimitive } from './shapeLibrary.ts'
 
 const ZOOM_STEPS = [25, 50, 75, 100, 125, 150, 200]
 const MIN_ZOOM = ZOOM_STEPS[0]
@@ -119,6 +120,22 @@ type Props = {
    *  than built here so the canvas stays agnostic about what an element
    *  can do; the canvas only decides where the toolbar sits. */
   selectionToolbar?: React.ReactNode
+  /** A shape card from the Elements panel was dropped on the canvas. The
+   *  geometry is already in the document's normalized fractions, centred on
+   *  the drop point — the canvas owns that conversion because only it knows
+   *  the stage's screen position and the current zoom scale. The page owns
+   *  what happens next (creating the element), same as every other edit. */
+  onShapeDrop?: (shape: ShapePrimitive, geometry: Box) => void
+  /** Right-click on an element. Viewport coordinates, because the menu the
+   *  page opens is position:fixed chrome, never part of the scaled stage. */
+  onElementContextMenu?: (id: string, position: { x: number; y: number }) => void
+  /** Right-click on empty canvas/mat space. Carries the point in canvas-frame
+   *  pixels too — the canvas owns that conversion (stage rect + zoom), and the
+   *  page uses it to paste an element under the pointer. */
+  onCanvasContextMenu?: (
+    position: { x: number; y: number },
+    point: { x: number; y: number },
+  ) => void
 }
 
 export default function Canvas({
@@ -137,6 +154,9 @@ export default function Canvas({
   onZoomChange,
   fitNonce,
   selectionToolbar,
+  onShapeDrop,
+  onElementContextMenu,
+  onCanvasContextMenu,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
@@ -223,6 +243,33 @@ export default function Canvas({
     return () => window.cancelAnimationFrame(id)
   }, [design.width, design.height, fitNonce])
 
+  // Re-render the elements when the canvas webfonts finish loading.
+  //
+  // The shrink-to-fit effect in ElementLayer measures text the moment an
+  // element mounts — which on a cold cache is before canvas-fonts.css has
+  // delivered the real faces, so it measures fallback glyphs and settles on a
+  // size the true font then overflows: "Real" clipped to "Rea", "BOOK NOW"
+  // wrapped inside its button. Nothing re-renders when a font arrives, so the
+  // stale sizes survived until some unrelated interaction. The fit effect
+  // deliberately has no dependency array, so a plain state bump here is the
+  // whole fix: every ElementLayer re-renders and re-measures with the real
+  // glyph widths. `loadingdone` as well as `ready`, because a font that
+  // starts loading late (a face first used by a newly added element) resolves
+  // `ready` anew only in some engines — the event is the reliable signal.
+  const [, refitOnFontLoad] = useReducer((count: number) => count + 1, 0)
+  useEffect(() => {
+    let cancelled = false
+    void document.fonts.ready.then(() => {
+      if (!cancelled) refitOnFontLoad()
+    })
+    const handleLoaded = () => refitOnFontLoad()
+    document.fonts.addEventListener('loadingdone', handleLoaded)
+    return () => {
+      cancelled = true
+      document.fonts.removeEventListener('loadingdone', handleLoaded)
+    }
+  }, [])
+
   const scale = zoom / 100
   const stageWidth = design.width * scale
   const stageHeight = design.height * scale
@@ -242,6 +289,36 @@ export default function Canvas({
     const rect = stageRef.current?.getBoundingClientRect()
     if (!rect) return { x: 0, y: 0 }
     return { x: (clientX - rect.left) / scaleValueRef.current, y: (clientY - rect.top) / scaleValueRef.current }
+  }
+
+  /**
+   * A shape card dropped from the Elements panel.
+   *
+   * The drop point is converted exactly the way a drag gesture is: screen
+   * pixels through the stage's bounding rect and the current zoom scale into
+   * canvas-frame pixels, then `pixelBoxToGeometry` into the normalized
+   * fractions that are the document's source of truth. The shape's default
+   * size is authored against the canvas's shorter side so a circle is a
+   * circle on a non-square canvas, and the box is centred on the pointer —
+   * where the user is looking — then clamped by the same limits every drag
+   * obeys, so a drop can never author geometry a save would reject.
+   */
+  function handleShapeDrop(event: React.DragEvent) {
+    if (!onShapeDrop) return
+    const shape = shapePrimitive(event.dataTransfer.getData(SHAPE_DRAG_MIME))
+    if (!shape) return
+    event.preventDefault()
+    const point = clientToCanvasFrame(event.clientX, event.clientY)
+    const scaleRef = Math.min(design.width, design.height)
+    const width = shape.width * scaleRef
+    const height = shape.height * scaleRef
+    const box: PixelBox = {
+      left: point.x - width / 2,
+      top: point.y - height / 2,
+      width,
+      height,
+    }
+    onShapeDrop(shape, clampToCanvasLimits(pixelBoxToGeometry(box, 0, design)))
   }
 
   function handleDragStart(key: string, event: React.PointerEvent) {
@@ -416,11 +493,31 @@ export default function Canvas({
 
       <div
         ref={containerRef}
+        data-canvas-mat=""
         className={`min-h-0 flex-1 overflow-auto p-5 ${
           tool === 'hand' ? 'cursor-grab active:cursor-grabbing' : ''
         }`}
         onPointerDown={(event) => {
           if (tool === 'hand' && event.button === 0) beginPan(event)
+        }}
+        // Only a shape card is accepted — anything else the OS can drag in
+        // (files, text selections) keeps its default behaviour.
+        onDragOver={(event) => {
+          if (!onShapeDrop || !event.dataTransfer.types.includes(SHAPE_DRAG_MIME)) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+        }}
+        onDrop={handleShapeDrop}
+        // Right-click on empty space (mat or unoccupied canvas — elements
+        // stop propagation and open their own menu). The browser menu is
+        // suppressed either way: half-native, half-custom reads as broken.
+        onContextMenu={(event) => {
+          if (!onCanvasContextMenu) return
+          event.preventDefault()
+          onCanvasContextMenu(
+            { x: event.clientX, y: event.clientY },
+            clientToCanvasFrame(event.clientX, event.clientY),
+          )
         }}
         // Clicking the surrounding mat deselects, the way clicking empty
         // canvas space in any design tool does — unless the click is just the
@@ -457,6 +554,7 @@ export default function Canvas({
               >
                 <div
                   ref={stageRef}
+                  data-canvas-stage=""
                   style={{
                     width: design.width,
                     height: design.height,
@@ -483,6 +581,12 @@ export default function Canvas({
                       onCommitEdit={onCommitEdit}
                       onCancelEdit={onCancelEdit}
                       onDragStart={handleDragStart}
+                      onContextMenu={
+                        onElementContextMenu
+                          ? (id, event) =>
+                              onElementContextMenu(id, { x: event.clientX, y: event.clientY })
+                          : undefined
+                      }
                     />
                   ))}
                 </div>

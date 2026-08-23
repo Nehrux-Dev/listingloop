@@ -74,6 +74,17 @@ FONT_STACKS: dict[str, str] = {
     # proprietary, so this is an approximation and a deliberate one — a script
     # that is nearly right reads as the same design, where a serif does not.
     "script": "'Dancing Script', 'Kaushan Script', 'Lobster Two', cursive",
+    # The authoring palette — roles an agent chooses in the editor's font
+    # picker, all resolved to families the renderer image installs from
+    # Debian's own archive (renderer/Dockerfile). Fallbacks are the closest
+    # metric neighbours already in the stacks above, so a missing family
+    # degrades to a same-shaped face rather than to fontconfig's guess.
+    "elegant": "'EB Garamond', 'Liberation Serif', Georgia, serif",
+    "modern": "'Lato', " + SAFE_FONT_STACK,
+    "rounded": "'Quicksand', 'Trebuchet MS', " + SAFE_FONT_STACK,
+    "slab": "'Roboto Slab', 'Liberation Serif', Georgia, serif",
+    "retro": "'Lobster Two', 'Dancing Script', cursive",
+    "soft": "'Comfortaa', 'Quicksand', " + SAFE_FONT_STACK,
 }
 
 

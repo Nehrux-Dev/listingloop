@@ -24,21 +24,29 @@
 import type { ListingPhoto } from '../../api/listings.ts'
 import type { Geometry, ResolvedElement } from '../../api/templates.ts'
 import { ELEMENT_TYPE_LABELS } from '../../api/templates.ts'
+import type { BrandKit } from '../../api/profiles.ts'
 import {
   ColorControl,
-  FONT_FIXED_REASON,
   ImageReplaceControl,
   PercentField,
   PositionGrid,
   PropertyRow,
-  SAFE_FONT_LABEL,
   SliderControl,
   ToggleButton,
+  type SwatchSection,
 } from './controls.tsx'
 import { canReset, elementKind, isAgentOwned } from './elementKind.ts'
+import { FONT_OPTIONS, FONT_STACKS } from './fonts.ts'
+import { PRESET_PALETTES } from './colorPresets.ts'
 
 type Props = {
   element: ResolvedElement | null
+  /** Colours already used in this design — the "Document colors" swatch row.
+   *  Derived by the page from the resolved elements; optional so older call
+   *  sites keep working. */
+  documentColors?: string[]
+  /** Lets `@token` swatches show the colour they render as. */
+  brandKit?: BrandKit | null
   /** Set one field of the selected element. `field` is a path the page
    *  understands: a bare style key, or `content`/`name`/`locked`/`visible`,
    *  or `transform.x` and friends. */
@@ -184,17 +192,35 @@ function BindingRow({
   )
 }
 
-function TextProperties({
-  element,
-  onChange,
-  onCommit,
-}: Props & { element: ResolvedElement }) {
+/** The swatch rows every colour control in this panel offers: brand tokens
+ *  first, then the design's own colours, then the preset palettes folded
+ *  behind a disclosure. */
+function swatchSections(props: Props): SwatchSection[] {
+  const sections: SwatchSection[] = [
+    { label: 'Brand', colors: ['@primary_color', '@secondary_color', '@accent_color'] },
+  ]
+  if (props.documentColors && props.documentColors.length > 0) {
+    sections.push({ label: 'In this design', colors: props.documentColors })
+  }
+  return [
+    ...sections,
+    ...PRESET_PALETTES.map((palette) => ({
+      label: palette.name,
+      colors: palette.colors,
+      collapsed: true,
+    })),
+  ]
+}
+
+function TextProperties(props: Props & { element: ResolvedElement }) {
+  const { element, onChange, onCommit } = props
   const constraints = element.constraints ?? {}
   const value = (field: string, fallback: unknown) => element.style[field] ?? fallback
 
   const text = String(element.content ?? '')
   const weight = String(value('font_weight', '400'))
   const align = String(value('text_align', 'left'))
+  const fontRole = String(value('font_family', 'body'))
 
   return (
     <div className="space-y-3">
@@ -215,9 +241,23 @@ function TextProperties({
       )}
 
       <PropertyRow label="Font">
-        <p className="text-xs italic text-slate-400" title={FONT_FIXED_REASON}>
-          {SAFE_FONT_LABEL} — the only family the renderer has
-        </p>
+        <select
+          value={fontRole}
+          onChange={(event) => {
+            onChange('font_family', event.target.value)
+            onCommit()
+          }}
+          // The select wears the chosen role's stack, so it is its own
+          // preview; per-option fonts are not stylable in a native select.
+          style={{ fontFamily: FONT_STACKS[fontRole] }}
+          className="w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm outline-none focus:border-slate-900"
+        >
+          {FONT_OPTIONS.map((option) => (
+            <option key={option.role} value={option.role}>
+              {option.label} — {option.family}
+            </option>
+          ))}
+        </select>
       </PropertyRow>
 
       {(
@@ -255,7 +295,9 @@ function TextProperties({
         <PropertyRow label="Colour">
           <ColorControl
             value={String(value('color', '#000000'))}
-              onChange={(next) => onChange('color', next)}
+            onChange={(next) => onChange('color', next)}
+            sections={swatchSections(props)}
+            brandKit={props.brandKit}
           />
         </PropertyRow>
       )}
@@ -412,11 +454,8 @@ function ImageProperties({
   )
 }
 
-function ShapeProperties({
-  element,
-  onChange,
-  onCommit,
-}: Props & { element: ResolvedElement }) {
+function ShapeProperties(props: Props & { element: ResolvedElement }) {
+  const { element, onChange, onCommit } = props
   const value = (field: string, fallback: unknown) => element.style[field] ?? fallback
 
   return (
@@ -425,7 +464,9 @@ function ShapeProperties({
         <PropertyRow label="Fill">
           <ColorControl
             value={String(value('background_color', '#000000'))}
-              onChange={(next) => onChange('background_color', next)}
+            onChange={(next) => onChange('background_color', next)}
+            sections={swatchSections(props)}
+            brandKit={props.brandKit}
           />
         </PropertyRow>
       )}
@@ -452,7 +493,9 @@ function ShapeProperties({
         <PropertyRow label="Border colour">
           <ColorControl
             value={String(value('border_color', '#000000'))}
-              onChange={(next) => onChange('border_color', next)}
+            onChange={(next) => onChange('border_color', next)}
+            sections={swatchSections(props)}
+            brandKit={props.brandKit}
           />
         </PropertyRow>
       )}

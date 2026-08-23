@@ -23,9 +23,18 @@ WORKDIR /app
 # The copperplate faces those flyers actually use are proprietary; this is the
 # closest formal script Debian ships, and near-right reads as the same design
 # where a serif does not.
+# The second row of packages is the authoring palette: six more open-licensed
+# families so an agent building a design from scratch has real typographic
+# range (an elegant garamond, a geometric sans, a rounded face, a slab, a
+# retro script, a soft display). All from Debian's own archive — this
+# container stays networkless at run time and every family here is named in
+# html_builder.FONT_STACKS and vendored for the editor canvas, so the three
+# surfaces keep drawing the same glyphs.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fonts-dejavu-core fonts-liberation2 fonts-roboto fonts-dancingscript \
+        fonts-ebgaramond fonts-lato fonts-quicksand fonts-roboto-slab \
+        fonts-lobstertwo fonts-comfortaa \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 

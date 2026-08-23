@@ -181,6 +181,9 @@ export type ExtraElement = {
   style: Record<string, unknown>
   content: string
   hidden: boolean
+  /** Optional because entries saved before the layers panel could lock an
+   *  added element carry no key — absent means unlocked, as it always was. */
+  locked?: boolean
   z_index: number
 }
 
@@ -300,6 +303,11 @@ export type Design = {
   listing: number | null
   listing_address: string | null
   calendar_event?: number | null
+  /** The format this design's layout was composed or adapted for — set by
+   *  the adapt endpoint. Empty means the template's own native format. The
+   *  editor opens the design at this dimension when present, because an
+   *  adapted layout only reads right at its target. */
+  preferred_dimension?: string
   /** The design's own canvas — a deep copy of the template's elements, taken
    *  when the design was created and independently mutable ever since. */
   elements: DesignElement[]
@@ -625,7 +633,7 @@ export async function saveDesignState(
     original_element_id: element.source_key ?? null,
     type: element.element_type,
     name: element.label,
-    locked: false,
+    locked: element.locked ?? false,
     visible: !element.hidden,
     transform: { ...element.geometry, z_index: element.z_index },
     content: element.content,
@@ -649,6 +657,22 @@ export function duplicateDesign(id: number, name?: string): Promise<Design> {
   return apiRequest<Design>(`/api/designs/${id}/duplicate/`, {
     method: 'POST',
     body: name ? { name } : {},
+  }).then(withDesignCompat)
+}
+
+/**
+ * Copy a design with its layout re-composed for another format.
+ *
+ * A copy, never an in-place change: one document renders at every dimension,
+ * so re-laying it out for LinkedIn in place would wreck the Instagram
+ * version. The server does the layout maths once (layout_adaptation.py) and
+ * the result is an ordinary, fully editable design whose
+ * `preferred_dimension` says where to open it.
+ */
+export function adaptDesign(id: number, dimension: string): Promise<Design> {
+  return apiRequest<Design>(`/api/designs/${id}/adapt/`, {
+    method: 'POST',
+    body: { dimension },
   }).then(withDesignCompat)
 }
 
@@ -746,6 +770,8 @@ function toExtraElement(element: DesignElement): ExtraElement {
     style: element.style,
     content: element.content,
     hidden: !element.visible,
+    // Without this an added element's lock silently vanished on reload.
+    locked: element.locked,
     z_index: element.transform.z_index,
   }
 }
@@ -788,6 +814,8 @@ function applyOverride(element: DesignElement, override: Record<string, unknown>
     if (field === 'geometry') next.transform = value as Transform
     else if (field === 'z_index') next.transform.z_index = Number(value)
     else if (field === 'hidden') next.visible = !value
+    else if (field === 'name') next.name = String(value)
+    else if (field === 'locked') next.locked = Boolean(value)
     else if (field === 'text' || field === 'image_key') {
       next.content = String(value)
       // Both count as typing over the binding. `image_key` has to, now that a

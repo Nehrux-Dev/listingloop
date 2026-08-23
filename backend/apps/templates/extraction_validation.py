@@ -11,9 +11,12 @@ so the person who chose the file can look before publishing it.
 WHAT IT DELIBERATELY DOES NOT DO
 ------------------------------------------------------------------------------
 It does not touch geometry. The scoring is diagnostic only — the honest reading
-of "does the reconstruction look like the source", not a lever that rewrites the
-template. Auto-correcting from a pixel diff can just as easily move a correct
-element as fix a wrong one, so the decision was to report, not to rewrite.
+of "does the reconstruction look like the source". The one consumer that *acts*
+on a result is ``importing._autocorrect_offsets``, and even that is gated on
+this module scoring the corrected layout strictly better than the original:
+auto-correcting from a pixel diff can just as easily move a correct element as
+fix a wrong one, so a correction only survives when the whole page agrees it
+helped. The scoring itself stays a pure measurement either way.
 
 COST
 ------------------------------------------------------------------------------
@@ -72,6 +75,17 @@ _ELEMENT_ISSUE_THRESHOLD = 0.18
 #: explaining a mismatch. Small: this labels "this box looks shifted", it does
 #: not hunt for a new position.
 _OFFSET_SEARCH_PX = 6
+
+#: Below this a region already matches; there is no error worth explaining and
+#: no reason to spend an offset search on it. Also what keeps the search off
+#: the many pixel-identical regions (baked crops) a normal page has.
+_MIN_OFFSET_MAD = 0.03
+
+#: A shift only counts as *the* explanation when it at least halves the
+#: region's error. A cleanly shifted element drops to near zero under its true
+#: offset; substituted type over a photo improves only marginally under any
+#: shift, and moving it would be a guess dressed as a measurement.
+_OFFSET_GAIN = 0.5
 
 
 def _document_element(element) -> dict:
@@ -237,16 +251,24 @@ def score_images(original_png: bytes, rendered_png: bytes, elements=None) -> Val
         if base.size == 0 or shot.size == 0:
             continue
         region_mad = _mad(base, shot)
-        if region_mad < _ELEMENT_ISSUE_THRESHOLD:
+        if region_mad < _MIN_OFFSET_MAD:
             continue
-        delta = _best_offset(original, rendered, box)
+        # The offset search runs on every imperfect region, not only the badly
+        # mismatched ones: a cleanly shifted element has a *small* absolute
+        # error (a sliver of wrong pixels along two edges) that never reaches
+        # the mismatch threshold, and shifts are exactly the finding the
+        # import's auto-correction can act on.
+        delta, shifted_mad = _best_offset(original, rendered, box)
+        explained = delta != (0, 0) and shifted_mad <= region_mad * _OFFSET_GAIN
+        if not explained and region_mad < _ELEMENT_ISSUE_THRESHOLD:
+            continue
         issues.append(
             {
                 "element_id": getattr(element, "key", ""),
-                "type": "offset" if delta != (0, 0) else "region_mismatch",
+                "type": "offset" if explained else "region_mismatch",
                 "region_score": round(1.0 - region_mad, 4),
-                "delta_x": delta[0],
-                "delta_y": delta[1],
+                "delta_x": delta[0] if explained else 0,
+                "delta_y": delta[1] if explained else 0,
             }
         )
     issues.sort(key=lambda item: item["region_score"])
@@ -270,16 +292,16 @@ def _pixel_box(element, width: int, height: int):
     return left, top, right, bottom
 
 
-def _best_offset(original, rendered, box) -> tuple[int, int]:
+def _best_offset(original, rendered, box) -> tuple[tuple[int, int], float]:
     """The small (dx, dy) that best lines this element's region up, if any.
 
     Slides the *rendered* region against the original within a few pixels and
-    keeps the shift that minimises the difference. Purely descriptive: it turns
-    "this box is wrong" into "this box looks about three pixels left", which is
-    what makes the debug report actionable. Nothing acts on the number here.
+    keeps the shift that minimises the difference. Returns the shift and the
+    difference under it, so the caller can judge whether the shift actually
+    *explains* the mismatch or merely nibbles at it. Nothing acts on the
+    number here — ``importing._autocorrect_offsets`` is the consumer that
+    does, and only under its own score gate.
     """
-    import numpy as np
-
     left, top, right, bottom = box
     base = original[top:bottom, left:right]
     best = (0, 0)
@@ -296,7 +318,7 @@ def _best_offset(original, rendered, box) -> tuple[int, int]:
             candidate = _mad(base, rendered[t:b, l:r])
             if candidate < best_score - 1e-4:
                 best_score, best = candidate, (dx, dy)
-    return best
+    return best, best_score
 
 
 def validate_extraction(elements, page, background: str = "#FFFFFF") -> ValidationResult:

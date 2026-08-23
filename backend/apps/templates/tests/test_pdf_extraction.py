@@ -7,6 +7,8 @@ it instead of against an opaque blob.
 
 from __future__ import annotations
 
+import io
+
 from unittest import mock
 
 from django.conf import settings
@@ -31,7 +33,13 @@ from apps.templates.models import (
     TemplateImport,
 )
 from apps.templates.render_context import build_context
-from apps.templates.pdf_extraction import extract_pdf_layout, is_text_pdf
+from apps.templates.pdf_extraction import (
+    _FLAG_MONO,
+    _FLAG_SERIF,
+    _family_for,
+    extract_pdf_layout,
+    is_text_pdf,
+)
 from apps.templates.tests.base import TemplateAPITestCase
 
 templates_url = reverse("templates:template-list")
@@ -202,6 +210,309 @@ class StructuralExtractionTests(TemplateAPITestCase):
 
         self.assertEqual(ground.element_type, ElementType.COLOR_BLOCK)
         self.assertIsNone(ground.crop_box)
+
+
+class FontClassificationTests(TemplateAPITestCase):
+    """The family name files a face into the right substitute stack; the
+    serif/mono flags remain the fallback for nameless Type3 subsets."""
+
+    def test_the_family_name_beats_the_two_bucket_flags(self):
+        self.assertEqual(_family_for("ABCDEF+AlexBrush-Regular", 0), "script")
+        self.assertEqual(_family_for("BebasNeue-Regular", 0), "display")
+        self.assertEqual(_family_for("RobotoCondensed-Bold", 0), "display")
+        self.assertEqual(_family_for("CourierNew", 0), "mono")
+        self.assertEqual(_family_for("PlayfairDisplay-Bold", 0), "serif")
+        self.assertEqual(_family_for("Garamond-Regular", 0), "serif")
+
+    def test_a_sans_face_never_lands_in_serif(self):
+        # "serif" is a substring of sans-serif style names; the guard keeps a
+        # sans face out of the serif bucket even when its name contains it.
+        self.assertEqual(_family_for("OpenSans-Regular", 0), "body")
+        self.assertEqual(_family_for("SomeSansSerif", 0), "body")
+
+    def test_the_flags_remain_the_fallback_for_nameless_subsets(self):
+        self.assertEqual(_family_for("", _FLAG_SERIF), "serif")
+        self.assertEqual(_family_for("", _FLAG_MONO), "mono")
+        self.assertEqual(_family_for("", 0), "body")
+
+
+def make_italic_pdf() -> bytes:
+    """A page whose one line is set in Times-Italic."""
+    pymupdf = _pymupdf()
+    document = pymupdf.open()
+    page = document.new_page(width=400, height=600)
+    page.draw_rect(pymupdf.Rect(0, 0, 400, 600), color=None, fill=(1, 1, 1))
+    page.insert_text(
+        (40, 120), "Elegant Living", fontsize=24, fontname="tiit", color=(0, 0, 0)
+    )
+    data = document.tobytes()
+    document.close()
+    return data
+
+
+class TypographyCarryThroughTests(TemplateAPITestCase):
+    """What the PDF knows about its type survives into the payload."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        data = make_italic_pdf()
+        page = rasterise(data, "flyer.pdf")
+        self.payload = extract_pdf_layout(data, page.width, page.height)
+        self.line = next(
+            element
+            for element in self.payload["elements"]
+            if element["text"] == "Elegant Living"
+        )
+
+    def test_an_italic_serif_face_keeps_both_properties(self):
+        self.assertEqual(self.line["style"]["font_family"], "serif")
+        self.assertEqual(self.line["style"].get("font_style"), "italic")
+
+    def test_the_payload_declares_its_geometry_exact(self):
+        """What unlocks the measured-width compensations in normalisation —
+        only the structural reader may claim it."""
+        self.assertTrue(self.payload["page"]["geometry_is_exact"])
+
+
+class RotatedTextTests(TemplateAPITestCase):
+    """A rotated line carries its angle instead of arriving as its envelope.
+
+    The bbox of a vertical caption is a tall, thin rectangle; read as a
+    horizontal box it renders as type smeared sideways across it. The writing
+    direction says the angle, and the true box is recovered from the envelope.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        pymupdf = _pymupdf()
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.draw_rect(pymupdf.Rect(0, 0, 400, 600), color=None, fill=(1, 1, 1))
+        page.insert_text((60, 400), "SIDEWAYS CAPTION", fontsize=14, rotate=90)
+        page.insert_text((40, 100), "Plain heading", fontsize=20)
+        data = document.tobytes()
+        document.close()
+        raster = rasterise(data, "rotated.pdf")
+        self.payload = extract_pdf_layout(data, raster.width, raster.height)
+        self.by_text = {
+            e["text"]: e for e in self.payload["elements"] if e["text"]
+        }
+
+    def test_the_rotated_line_knows_its_angle(self):
+        caption = self.by_text["SIDEWAYS CAPTION"]
+        self.assertAlmostEqual(abs(caption["transform"]["rotation"]), 90.0, delta=1.0)
+
+    def test_the_rotated_box_is_the_line_not_its_envelope(self):
+        """The unrotated box runs along the text: longer in width than height,
+        even though the envelope on the page is taller than wide."""
+        caption = self.by_text["SIDEWAYS CAPTION"]
+        self.assertGreater(
+            caption["transform"]["width"], caption["transform"]["height"]
+        )
+
+    def test_horizontal_text_stays_unrotated(self):
+        self.assertEqual(self.by_text["Plain heading"]["transform"]["rotation"], 0)
+
+
+class TextAlignmentInferenceTests(TemplateAPITestCase):
+    """Alignment read from where the lines actually sit, never hardcoded.
+
+    It decides which way a too-tight box may grow: growing a centred headline
+    rightward shoves it off-axis.
+    """
+
+    def _payload_for(self, build) -> dict:
+        pymupdf = _pymupdf()
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.draw_rect(pymupdf.Rect(0, 0, 400, 600), color=None, fill=(1, 1, 1))
+        build(page, pymupdf)
+        data = document.tobytes()
+        document.close()
+        raster = rasterise(data, "align.pdf")
+        return extract_pdf_layout(data, raster.width, raster.height)
+
+    def test_a_line_dead_on_the_page_centreline_is_centred(self):
+        pymupdf = _pymupdf()
+        text = "OPEN HOUSE"
+        width = pymupdf.get_text_length(text, fontname="helv", fontsize=24)
+        payload = self._payload_for(
+            lambda page, _: page.insert_text(((400 - width) / 2, 100), text, fontsize=24)
+        )
+        line = next(e for e in payload["elements"] if e["text"] == text)
+
+        self.assertEqual(line["style"]["text_align"], "center")
+
+    def test_an_ordinary_left_line_stays_left(self):
+        payload = self._payload_for(
+            lambda page, _: page.insert_text((40, 100), "Off to one side", fontsize=18)
+        )
+        line = next(e for e in payload["elements"] if e["text"] == "Off to one side")
+
+        self.assertEqual(line["style"]["text_align"], "left")
+
+    def test_ragged_lines_sharing_a_centre_are_centred(self):
+        def build(page, pymupdf):
+            for text, size, y in (("A MUCH LONGER LINE", 16, 100), ("SHORT", 16, 120)):
+                width = pymupdf.get_text_length(text, fontname="helv", fontsize=size)
+                page.insert_text(((400 - width) / 2, y), text, fontsize=size)
+
+        payload = self._payload_for(build)
+        aligns = {
+            e["style"]["text_align"]
+            for e in payload["elements"]
+            if e["text"] in ("A MUCH LONGER LINE", "SHORT")
+        }
+
+        self.assertEqual(aligns, {"center"})
+
+
+class EmbeddedImagePointerTests(TemplateAPITestCase):
+    """A placed image remembers which stream it came from, so baking can go
+    back to the original pixels instead of the size-capped raster."""
+
+    def test_the_payload_carries_the_xref_and_placement(self):
+        from PIL import Image
+
+        pymupdf = _pymupdf()
+        buffer = io.BytesIO()
+        Image.new("RGB", (64, 64), "#3355EE").save(buffer, format="PNG")
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.draw_rect(pymupdf.Rect(0, 0, 400, 600), color=None, fill=(1, 1, 1))
+        page.insert_image(pymupdf.Rect(100, 150, 300, 350), stream=buffer.getvalue())
+        page.insert_text((40, 500), "With a photo", fontsize=12)
+        data = document.tobytes()
+        document.close()
+
+        raster = rasterise(data, "photo.pdf")
+        payload = extract_pdf_layout(data, raster.width, raster.height)
+        image = next(e for e in payload["elements"] if e["type"] == "image")
+
+        self.assertGreater(image["source_xref"], 0)
+        self.assertEqual(len(image["source_placement"]), 4)
+        self.assertGreater(image["source_placement"][2], 0)
+        self.assertGreater(image["source_placement"][3], 0)
+
+
+def make_invisible_mask_pdf() -> bytes:
+    """A page with a visible beige band and an invisible black rect over it.
+
+    Design tools leave fully transparent shapes in the stream (masks, backdrops
+    of deleted content); read without opacity each becomes an opaque black slab.
+    """
+    pymupdf = _pymupdf()
+    document = pymupdf.open()
+    page = document.new_page(width=400, height=400)
+    page.draw_rect(pymupdf.Rect(0, 0, 400, 400), color=None, fill=(1, 1, 1))
+    page.draw_rect(pymupdf.Rect(0, 300, 400, 400), color=None, fill=(0.7, 0.65, 0.6))
+    page.draw_rect(pymupdf.Rect(0, 300, 400, 400), color=None, fill=(0, 0, 0), fill_opacity=0)
+    page.draw_rect(
+        pymupdf.Rect(50, 50, 150, 100), color=None, fill=(0.3, 0.2, 0.1), fill_opacity=0.4
+    )
+    page.insert_text((40, 380), "On the band", fontsize=12, color=(0, 0, 0))
+    data = document.tobytes()
+    document.close()
+    return data
+
+
+class OpacityTests(TemplateAPITestCase):
+    """Transparent shapes must not come back as opaque black slabs."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        data = make_invisible_mask_pdf()
+        page = rasterise(data, "flyer.pdf")
+        self.payload = extract_pdf_layout(data, page.width, page.height)
+
+    def test_a_fully_transparent_fill_is_dropped(self):
+        blacks = [
+            e
+            for e in self.payload["elements"]
+            if e["style"].get("background_color") == "#000000"
+        ]
+        self.assertEqual(blacks, [])
+
+    def test_a_translucent_wash_keeps_its_opacity(self):
+        washes = [
+            e for e in self.payload["elements"] if e["style"].get("opacity", 1) < 1
+        ]
+        self.assertEqual(len(washes), 1)
+        self.assertAlmostEqual(washes[0]["style"]["opacity"], 0.4, places=2)
+
+
+class BulletsAreNotAPatternTests(TemplateAPITestCase):
+    """Six list bullets in two columns must stay six dots, not become a
+    tiling texture scattered through the list's own text."""
+
+    def test_two_columns_of_bullets_stay_individual_marks(self):
+        pymupdf = _pymupdf()
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=400)
+        page.draw_rect(pymupdf.Rect(0, 0, 400, 400), color=None, fill=(1, 1, 1))
+        for col_x in (60, 220):
+            for row in range(3):
+                centre = pymupdf.Point(col_x, 100 + row * 20)
+                page.draw_circle(centre, 2.2, color=None, fill=(0.34, 0.25, 0.2))
+        page.insert_text((40, 380), "Features", fontsize=12, color=(0, 0, 0))
+        data = document.tobytes()
+        document.close()
+
+        raster = rasterise(data, "flyer.pdf")
+        payload = extract_pdf_layout(data, raster.width, raster.height)
+        marks = [e for e in payload["elements"] if e["role"] == "mark"]
+        patterns = [e for e in payload["elements"] if e["role"] == "dot_pattern"]
+        self.assertEqual(len(marks), 6)
+        self.assertEqual(patterns, [])
+
+
+class VisibleImageBoxTests(TemplateAPITestCase):
+    """A placed image is trimmed to the clip that frames it, so the baked crop
+    holds the photo and not whatever sat next to the frame."""
+
+    def _clip(self, rect, items=None):
+        return {"scissor": rect, "items": items or [], "type": "clip"}
+
+    def test_the_placement_is_trimmed_to_its_frame(self):
+        from apps.templates.pdf_extraction import _visible_image_box
+
+        pymupdf = _pymupdf()
+        page_clip = self._clip(pymupdf.Rect(0, 0, 595, 842))
+        frame = self._clip(pymupdf.Rect(59.5, 106, 221.7, 268))
+        visible, radius = _visible_image_box((19, 106, 262, 268), [page_clip, frame])
+        self.assertAlmostEqual(visible[0], 59.5)
+        self.assertAlmostEqual(visible[2], 221.7)
+        self.assertEqual(radius, 0.0)
+
+    def test_a_tiny_unrelated_clip_does_not_crop_the_photo(self):
+        from apps.templates.pdf_extraction import _visible_image_box
+
+        pymupdf = _pymupdf()
+        badge = self._clip(pymupdf.Rect(20, 110, 60, 150))
+        visible, _ = _visible_image_box((19, 106, 262, 268), [badge])
+        self.assertEqual(visible, (19, 106, 262, 268))
+
+    def test_a_rounded_frame_hands_its_radius_to_the_photo(self):
+        from apps.templates.pdf_extraction import _visible_image_box
+
+        pymupdf = _pymupdf()
+        rect = pymupdf.Rect(50, 50, 250, 250)
+        # The rounded path alongside an axis-aligned scissor of the same size,
+        # as design tools nest them: corner arcs of ~12pt.
+        curve = [
+            (
+                "c",
+                pymupdf.Point(50, 62),
+                pymupdf.Point(50, 50),
+                pymupdf.Point(50, 50),
+                pymupdf.Point(62, 50),
+            )
+        ]
+        plain = self._clip(rect)
+        rounded = self._clip(rect, items=[("re", rect)] + curve)
+        visible, radius = _visible_image_box((30, 30, 270, 270), [plain, rounded])
+        self.assertEqual(visible, (50, 50, 250, 250))
+        self.assertGreater(radius, 0)
 
 
 class ExtractorRoutingTests(TemplateAPITestCase):
@@ -756,15 +1067,26 @@ class PatternReachesTheRendererTests(TemplateAPITestCase):
         self.assertIn("#3355EE", html)
         self.assertIn("background-size", html)
 
-    def test_an_incomplete_pattern_is_reported_not_flattened(self):
-        """Told it is a pattern but given nothing to redraw one with. A solid
-        rectangle would be the flattening this whole path exists to avoid."""
+    def test_an_incomplete_pattern_is_rescued_from_the_raster(self):
+        """Told it is a pattern but given nothing to redraw one with. The
+        region's own pixels are the tie-breaker: on this flyer the box sits on
+        the flat cream ground, so the *measured* colour — not a guess — is
+        what it becomes. A region the raster shows as genuinely patterned
+        keeps its `unsupported_pattern` marker instead (see the rescue tests
+        in test_importing)."""
         page = rasterise(make_pdf(), "flyer.pdf")
         payload = layout_with_broken_pattern()
 
         [element] = normalise_elements(payload, page)
 
-        self.assertEqual(element.style_properties["fill_type"], "unsupported_pattern")
+        self.assertEqual(element.style_properties["fill_type"], "solid_color")
+        # The cream ground of make_pdf, as the raster shows it — allow the
+        # rasteriser a rounding unit per channel.
+        measured = element.style_properties["background_color"]
+        for channel, expected in zip((1, 3, 5), (0xED, 0xE3, 0xD9)):
+            self.assertAlmostEqual(
+                int(measured[channel : channel + 2], 16), expected, delta=2
+            )
 
 
 def layout_with_broken_pattern() -> dict:
