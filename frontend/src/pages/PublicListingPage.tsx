@@ -203,7 +203,7 @@ function Shell({
   return (
     <div className="min-h-screen bg-white text-slate-900">
       <header className="border-b border-slate-200">
-        <div className="mx-auto flex max-w-5xl items-center gap-3 px-6 py-4">
+        <div className="mx-auto flex max-w-5xl items-center gap-3 px-4 py-4 sm:px-6">
           {brokerage?.logo_url ? (
             <img src={brokerage.logo_url} alt={brokerage.name} className="h-8 object-contain" />
           ) : (
@@ -216,7 +216,7 @@ function Shell({
           )}
         </div>
       </header>
-      <main className="mx-auto max-w-5xl px-6 py-10">{children}</main>
+      <main className="mx-auto max-w-5xl px-4 py-8 sm:px-6 sm:py-10">{children}</main>
     </div>
   )
 }

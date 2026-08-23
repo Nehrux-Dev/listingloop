@@ -26,7 +26,9 @@ import { useAuth } from '../auth/AuthContext.tsx'
 import {
   IconChevronDown,
   IconChevronLeft,
+  IconClose,
   IconLogout,
+  IconMenu,
   IconMoon,
 } from './icons.tsx'
 
@@ -84,6 +86,14 @@ export default function DashboardShell({
   const [menuOpen, setMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
+  /**
+   * Below `md` the rail becomes a drawer behind a hamburger. It is the same
+   * element in both worlds — fixed and slid off-canvas on phones, sticky on
+   * desktop — rather than two copies of the markup, because the account menu
+   * inside it carries state and refs that must not exist twice.
+   */
+  const [railOpen, setRailOpen] = useState(false)
+
   useEffect(() => {
     if (!menuOpen) return
     const close = (event: MouseEvent) => {
@@ -93,9 +103,12 @@ export default function DashboardShell({
     return () => window.removeEventListener('mousedown', close)
   }, [menuOpen])
 
-  // Collapsing the account menu on navigation stops it hanging open over the
-  // page the user just asked for.
-  useEffect(() => setMenuOpen(false), [pathname])
+  // Collapsing the account menu and the drawer on navigation stops them
+  // hanging open over the page the user just asked for.
+  useEffect(() => {
+    setMenuOpen(false)
+    setRailOpen(false)
+  }, [pathname])
 
   async function handleLogout() {
     await logout()
@@ -103,9 +116,23 @@ export default function DashboardShell({
   }
 
   return (
-    <div className="flex min-h-screen bg-app text-ink">
+    // Wide pages manage their own scroll, so the shell pins to the viewport
+    // (`h-dvh`, which tracks the real visible height on mobile browsers where
+    // the URL bar comes and goes); reading pages scroll as a document.
+    <div className={`flex ${wide ? 'h-dvh' : 'min-h-screen'} bg-app text-ink`}>
+      {/* Tapping the page behind the drawer is the universal "close". */}
+      {railOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          aria-hidden="true"
+          onClick={() => setRailOpen(false)}
+        />
+      )}
+
       <aside
-        className={`sticky top-0 flex h-screen ${RAIL_WIDTH} shrink-0 flex-col border-r border-line bg-surface`}
+        className={`fixed inset-y-0 left-0 z-40 flex h-full ${RAIL_WIDTH} shrink-0 flex-col border-r border-line bg-surface transition-transform duration-200 md:sticky md:top-0 md:z-auto md:h-screen md:translate-x-0 md:transition-none ${
+          railOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
       >
         <div className="flex items-center gap-2.5 px-4 py-5">
           <span className="flex size-9 shrink-0 items-center justify-center rounded-control bg-brand-soft text-brand">
@@ -116,6 +143,14 @@ export default function DashboardShell({
             <br />
             {brand.subtitle}
           </span>
+          <button
+            type="button"
+            onClick={() => setRailOpen(false)}
+            aria-label="Close menu"
+            className="ml-auto flex size-8 items-center justify-center rounded-control text-muted transition hover:bg-hover hover:text-ink md:hidden"
+          >
+            <IconClose className="size-4" />
+          </button>
         </div>
 
         <nav className="flex-1 space-y-0.5 overflow-y-auto px-2.5 pb-2">
@@ -191,10 +226,31 @@ export default function DashboardShell({
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col">
+        {/* The phone's way into the drawer. Sticky so navigation is always a
+            thumb-reach away however far the page has scrolled. */}
+        <header className="sticky top-0 z-20 flex shrink-0 items-center gap-3 border-b border-line bg-surface px-4 py-3 md:hidden">
+          <button
+            type="button"
+            onClick={() => setRailOpen(true)}
+            aria-label="Open menu"
+            className="flex size-9 items-center justify-center rounded-control border border-line text-muted transition hover:bg-hover hover:text-ink"
+          >
+            <IconMenu className="size-5" />
+          </button>
+          <span className="flex size-8 items-center justify-center rounded-control bg-brand-soft text-brand">
+            <brand.Icon className="size-4" />
+          </span>
+          <span className="text-[12px] font-semibold uppercase tracking-wide">
+            {brand.title} {brand.subtitle}
+          </span>
+        </header>
+
         {wide ? (
-          <Outlet />
+          <div className="min-h-0 flex-1">
+            <Outlet />
+          </div>
         ) : (
-          <main className="mx-auto w-full max-w-4xl px-8 py-10">
+          <main className="mx-auto w-full max-w-4xl px-4 py-6 sm:px-6 md:px-8 md:py-10">
             <Outlet />
           </main>
         )}
