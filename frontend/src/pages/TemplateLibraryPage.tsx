@@ -94,7 +94,13 @@ export default function TemplateLibraryPage() {
   const [query, setQuery] = useState('')
   const [sort, setSort] = useState<Sort>('name')
   const [view, setView] = useState<'grid' | 'list'>('grid')
-  const [filtersOpen, setFiltersOpen] = useState(true)
+  // Open by default only where the panel has a column to live in. On a phone
+  // it floats over the grid, so starting open would hide the templates the
+  // page exists to show. Initial-width check, not a live listener: a resize
+  // mid-visit should not yank a panel the user opened or closed themselves.
+  const [filtersOpen, setFiltersOpen] = useState(
+    () => window.matchMedia('(min-width: 768px)').matches,
+  )
 
   /** The template awaiting a yes/no in the confirm dialog. */
   const [picked, setPicked] = useState<TemplateSummary | null>(null)
@@ -234,8 +240,10 @@ export default function TemplateLibraryPage() {
   }
 
   return (
-    <div className="flex h-screen flex-col bg-app">
-      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-6 py-4">
+    // h-full, not h-screen: the shell owns the viewport now, and on phones a
+    // sticky top bar sits above this page inside the same column.
+    <div className="flex h-full flex-col bg-app">
+      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-4 sm:px-6">
         <div className="mr-auto min-w-0">
           <h1 className="text-xl font-semibold tracking-tight">Templates</h1>
           <p className="mt-0.5 text-sm text-muted">
@@ -294,9 +302,11 @@ export default function TemplateLibraryPage() {
         </button>
       </header>
 
-      <div className="flex min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1">
         {filtersOpen && (
-          <aside className="w-[264px] shrink-0 overflow-y-auto border-r border-line bg-surface p-4">
+          // On phones the panel floats over the grid instead of pushing it:
+          // a 264px column beside a 390px viewport leaves no grid to filter.
+          <aside className="w-[264px] shrink-0 overflow-y-auto border-r border-line bg-surface p-4 max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-20 max-md:shadow-pop">
             <FilterGroup title="Format">
               <FilterRow
                 label="All templates"
@@ -350,7 +360,7 @@ export default function TemplateLibraryPage() {
           </aside>
         )}
 
-        <main className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
+        <main className="min-w-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
           {error && (
             <div className="mb-4">
               <Alert kind="error">{error}</Alert>

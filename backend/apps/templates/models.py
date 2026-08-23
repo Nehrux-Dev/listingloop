@@ -582,6 +582,16 @@ class Design(TimeStampedModel):
         blank=True,
     )
 
+    #: The format this design's layout was composed (or adapted) for — the one
+    #: the editor should open. Empty means "the template's own native format",
+    #: which is every design except the copies the adapt endpoint creates: an
+    #: adapted layout only reads right at its target dimension, and opening it
+    #: at the template's native aspect would show the stretch the adaptation
+    #: exists to remove.
+    preferred_dimension = models.CharField(
+        _("preferred format"), max_length=40, blank=True, default=""
+    )
+
     #: THE DESIGN'S OWN CANVAS. A full, deep copy of the template's elements,
     #: taken the moment the design is created, and independently mutable from
     #: then on. Nothing an agent does here ever reaches the Template.

@@ -498,6 +498,41 @@ TEMPLATE_IMPORT_RASTER_MAX_EDGE = env.int(
     "TEMPLATE_IMPORT_RASTER_MAX_EDGE", default=2000
 )
 
+#: Deterministic geometry clean-up on extracted layouts: size-aware edge
+#: snapping, spacing regularisation, alignment-relationship metadata and crop
+#: preservation. Default on because it only ever pulls near-alignments onto a
+#: shared value (sub-tolerance nudges); off is the exact pre-existing behaviour,
+#: kept as a one-flag rollback. Existing templates are never rewritten.
+TEMPLATE_IMPORT_SMART_GEOMETRY = env.bool(
+    "TEMPLATE_IMPORT_SMART_GEOMETRY", default=True
+)
+
+#: Render the extracted layout back to a raster and score it against the source
+#: (see apps.templates.extraction_validation). Diagnostic only — it never
+#: rewrites geometry — but it makes the import worker depend on the renderer
+#: service, so it is off by default and skipped for text PDFs, and a renderer
+#: outage is logged and ignored rather than failing the import.
+TEMPLATE_IMPORT_VALIDATE = env.bool("TEMPLATE_IMPORT_VALIDATE", default=False)
+
+#: A fidelity score below this is surfaced as an import warning so the person
+#: who uploaded the file can look at the result before publishing it.
+TEMPLATE_IMPORT_VALIDATE_MIN_SCORE = env.float(
+    "TEMPLATE_IMPORT_VALIDATE_MIN_SCORE", default=0.9
+)
+
+#: When validation flags an element as *shifted* (its pixels match the source a
+#: few pixels over), apply that shift, re-score, and keep it only if the page
+#: as a whole got closer to the original. One extra render per import at most;
+#: a correction that does not improve the score is reverted. Only meaningful
+#: when TEMPLATE_IMPORT_VALIDATE is on, since it acts on validation's findings.
+TEMPLATE_IMPORT_AUTOCORRECT = env.bool("TEMPLATE_IMPORT_AUTOCORRECT", default=True)
+
+#: Write per-stage debug images (01_original, 02_extracted_boxes,
+#: 03_aligned_boxes, and 04/05/06 when validation also runs) plus a JSON report
+#: under MEDIA_ROOT/import-debug/<job>/. For diagnosing a bad reconstruction;
+#: never on in production.
+TEMPLATE_IMPORT_DEBUG = env.bool("TEMPLATE_IMPORT_DEBUG", default=False)
+
 
 # ---------------------------------------------------------------------------
 # Rendering service

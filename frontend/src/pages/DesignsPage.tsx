@@ -64,8 +64,10 @@ export default function DesignsPage() {
   }, [designs, query])
 
   return (
-    <div className="flex h-screen flex-col bg-app">
-      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-6 py-4">
+    // h-full, not h-screen: the shell owns the viewport now, and on phones a
+    // sticky top bar sits above this page inside the same column.
+    <div className="flex h-full flex-col bg-app">
+      <header className="flex shrink-0 flex-wrap items-center gap-3 border-b border-line bg-surface px-4 py-4 sm:px-6">
         <div className="mr-auto min-w-0">
           <h1 className="text-xl font-semibold tracking-tight">Designs</h1>
           <p className="mt-0.5 text-sm text-muted">Pick up where you left off</p>
@@ -91,7 +93,7 @@ export default function DesignsPage() {
         </Link>
       </header>
 
-      <main className="min-w-0 flex-1 overflow-y-auto px-6 py-5">
+      <main className="min-w-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
         {error && (
           <div className="mb-4">
             <Alert kind="error">{error}</Alert>

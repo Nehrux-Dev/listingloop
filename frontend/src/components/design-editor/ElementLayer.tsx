@@ -29,28 +29,10 @@ import { carriesImage, carriesText } from '../../api/templates.ts'
 import type { ResolvedDesign, ResolvedElement } from '../../api/templates.ts'
 import { geometryToPixelBox } from './geometry.ts'
 
-/** Only families known to be installed in the renderer image — matches
- *  SAFE_FONT_STACK in html_builder.py. The browser previewing this canvas may
- *  substitute a local equivalent if DejaVu isn't present locally; the actual
- *  export always goes through the renderer's own Chromium, where it is. */
-const SAFE_FONT_STACK =
-  "'DejaVu Sans', 'Liberation Sans', 'Noto Sans', 'Helvetica Neue', Arial, sans-serif"
-
-/** Mirrors `html_builder.FONT_STACKS`. A template names a *role* — "display",
- *  "body" — and never a family, so the canvas and the renderer resolve the
- *  same word to the same stack instead of each guessing. */
-const FONT_STACKS: Record<string, string> = {
-  body: SAFE_FONT_STACK,
-  display: `'Roboto Condensed', 'Liberation Sans Narrow', 'DejaVu Sans Condensed', ${SAFE_FONT_STACK}`,
-  serif: "'Liberation Serif', 'DejaVu Serif', Georgia, serif",
-  mono: "'Liberation Mono', 'DejaVu Sans Mono', monospace",
-  // Calligraphic headlines. The renderer installs Dancing Script; a browser
-  // previewing the canvas may not have it and will fall back to its own
-  // cursive, so the canvas can look slightly different here from the export.
-  // That is the one place the two deliberately diverge, and only because the
-  // alternative is shipping a webfont into a page that inlines everything.
-  script: "'Dancing Script', 'Kaushan Script', 'Lobster Two', cursive",
-}
+// The role -> family stacks moved to fonts.ts so the canvas and the font
+// picker read one list; the parity contract with html_builder is documented
+// there.
+import { FONT_STACKS, SAFE_FONT_STACK } from './fonts.ts'
 
 const JUSTIFY_BY_ALIGN: Record<string, string> = {
   left: 'flex-start',
@@ -142,6 +124,9 @@ type Props = {
   onCommitEdit: (id: string, text: string) => void
   onCancelEdit: () => void
   onDragStart: (id: string, event: React.PointerEvent) => void
+  /** Right-click. Fires even on a locked element — the context menu is how a
+   *  locked element gets unlocked without a trip to the layers panel. */
+  onContextMenu?: (id: string, event: React.MouseEvent) => void
 }
 
 export default function ElementLayer({
@@ -154,6 +139,7 @@ export default function ElementLayer({
   onCommitEdit,
   onCancelEdit,
   onDragStart,
+  onContextMenu,
 }: Props) {
   const boxRef = useRef<HTMLDivElement>(null)
 
@@ -302,6 +288,14 @@ export default function ElementLayer({
         event.stopPropagation()
         onSelect(element.id)
         onDragStart(element.id, event)
+      }}
+      // Unlike click, this deliberately does NOT pass through when locked:
+      // the menu it opens is where Unlock lives.
+      onContextMenu={(event) => {
+        if (!onContextMenu || editing) return
+        event.preventDefault()
+        event.stopPropagation()
+        onContextMenu(element.id, event)
       }}
       title={element.name}
     >

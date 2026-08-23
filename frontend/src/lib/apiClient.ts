@@ -125,6 +125,21 @@ export async function refreshAccessToken(): Promise<string | null> {
   return data.access
 }
 
+// Who to tell when a mid-session refresh comes back rejected. The auth
+// provider registers here so the app can transition to "unauthenticated" the
+// moment the session actually ends — wherever the user happens to be.
+//
+// Without this, an expired refresh cookie left the app in a half-state: the
+// auth context still said "authenticated" (it only re-checks on boot), the
+// route guard therefore never redirected, and the user sat on a page whose
+// every request failed with a 401 — a console full of errors and no way
+// forward short of a manual reload.
+let sessionExpiredHandler: (() => void) | null = null
+
+export function onSessionExpired(handler: (() => void) | null): void {
+  sessionExpiredHandler = handler
+}
+
 // A single in-flight refresh shared by all callers. Without this, five
 // concurrent 401s would fire five refreshes — and since refresh tokens rotate
 // and are single-use, four of them would fail and log the user out.
@@ -153,6 +168,12 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     if (token) {
       // Retry the original request with the new access token.
       response = await rawRequest(path, options)
+    } else {
+      // The refresh cookie itself was rejected: the session is over, and the
+      // 401 about to be thrown is a symptom, not the news. Telling the auth
+      // provider is what turns "a page full of failed requests" into "the
+      // login screen, with a way back to where the user was".
+      sessionExpiredHandler?.()
     }
   }
 

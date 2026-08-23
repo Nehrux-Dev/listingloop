@@ -17,11 +17,15 @@ import { useRef, useState } from 'react'
 import type { ListingPhoto } from '../../api/listings.ts'
 import type { BrandKit } from '../../api/profiles.ts'
 
-export const SAFE_FONT_LABEL = 'DejaVu Sans'
-
-/** Why there is no font-family picker anywhere in this editor. */
-export const FONT_FIXED_REASON =
-  'The renderer only has one font family installed and cannot fetch others, so there is nothing to choose between yet.'
+/** A named row of colour swatches for ColorControl — brand tokens, colours
+ *  already in the design, or a preset palette. */
+export type SwatchSection = {
+  label: string
+  colors: string[]
+  /** Rendered inside a closed disclosure — for the preset palettes, which
+   *  would otherwise turn every colour row into a wall of swatches. */
+  collapsed?: boolean
+}
 
 export function ToggleButton({
   active,
@@ -221,6 +225,7 @@ export function ColorControl({
   onChange,
   disabled,
   brandKit,
+  sections,
 }: {
   value: string
   options?: string[]
@@ -228,6 +233,10 @@ export function ColorControl({
   disabled?: boolean
   /** Lets a `@token` swatch show the colour it will actually render as. */
   brandKit?: BrandKit | null
+  /** Optional swatch rows above the free picker: brand tokens, the design's
+   *  own colours, preset palettes. Purely additive — the picker still accepts
+   *  any colour, and callers that pass nothing get the old control. */
+  sections?: SwatchSection[]
 }) {
   if (options && options.length > 0) {
     return (
@@ -251,14 +260,51 @@ export function ColorControl({
     )
   }
 
+  const open = (sections ?? []).filter((section) => !section.collapsed && section.colors.length > 0)
+  const collapsed = (sections ?? []).filter((section) => section.collapsed && section.colors.length > 0)
+
+  const swatchRow = (section: SwatchSection) => (
+    <div key={section.label}>
+      <p className="mb-0.5 text-[10px] font-medium text-muted">{section.label}</p>
+      <div className="flex flex-wrap gap-1">
+        {section.colors.map((color) => (
+          <button
+            key={`${section.label}-${color}`}
+            type="button"
+            disabled={disabled}
+            title={swatchLabel(color)}
+            onClick={() => onChange(color)}
+            className={`size-5 rounded border transition disabled:cursor-not-allowed disabled:opacity-40 ${
+              value.toLowerCase() === color.toLowerCase()
+                ? 'border-brand ring-1 ring-brand'
+                : 'border-line hover:border-brand/60'
+            }`}
+            style={{ backgroundColor: swatchColor(color, brandKit) }}
+          />
+        ))}
+      </div>
+    </div>
+  )
+
   return (
-    <input
-      type="color"
-      disabled={disabled}
-      value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : '#000000'}
-      onChange={(event) => onChange(event.target.value.toUpperCase())}
-      className="size-8 cursor-pointer rounded border border-line bg-surface p-0.5 disabled:cursor-not-allowed disabled:opacity-40"
-    />
+    <div className="space-y-1.5">
+      <input
+        type="color"
+        disabled={disabled}
+        value={/^#[0-9a-fA-F]{6}$/.test(value) ? value : '#000000'}
+        onChange={(event) => onChange(event.target.value.toUpperCase())}
+        className="size-8 cursor-pointer rounded border border-line bg-surface p-0.5 disabled:cursor-not-allowed disabled:opacity-40"
+      />
+      {open.map(swatchRow)}
+      {collapsed.length > 0 && (
+        <details>
+          <summary className="cursor-pointer select-none text-[10px] font-medium text-muted hover:text-ink">
+            Palettes
+          </summary>
+          <div className="mt-1 space-y-1.5">{collapsed.map(swatchRow)}</div>
+        </details>
+      )}
+    </div>
   )
 }
 

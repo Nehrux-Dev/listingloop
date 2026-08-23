@@ -46,6 +46,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import {
+  adaptDesign,
   addDesignElement,
   createDesign,
   deleteDesign,
@@ -79,6 +80,24 @@ import { fetchListing, type ListingPhoto } from '../api/listings.ts'
 import { fetchMyBrandKit, type BrandKit } from '../api/profiles.ts'
 import { usePublishCompliance } from '../components/ComplianceNotice.tsx'
 import Canvas from '../components/design-editor/Canvas.tsx'
+import CanvasContextMenu, {
+  type AlignAction,
+  type LayerAction,
+} from '../components/design-editor/ContextMenu.tsx'
+import {
+  getCopiedElement,
+  getCopiedStyle,
+  nextPasteStep,
+  setCopiedElement,
+  setCopiedStyle,
+} from '../components/design-editor/elementClipboard.ts'
+import {
+  clampToCanvasLimits,
+  geometryToPixelBox,
+  pixelBoxToGeometry,
+  type Box,
+} from '../components/design-editor/geometry.ts'
+import { type ShapePrimitive } from '../components/design-editor/shapeLibrary.ts'
 import LeftPanel, {
   isImageElement,
   useLeftPanelTab,
@@ -86,6 +105,7 @@ import LeftPanel, {
 import EditorHeader from '../components/design-editor/EditorHeader.tsx'
 import ExportDialog from '../components/design-editor/ExportDialog.tsx'
 import PropertiesSidebar from '../components/design-editor/PropertiesSidebar.tsx'
+import QuickActions from '../components/design-editor/QuickActions.tsx'
 import TopToolbar from '../components/design-editor/TopToolbar.tsx'
 import VariationsStrip from '../components/design-editor/VariationsStrip.tsx'
 import { Alert } from '../components/FormControls.tsx'
@@ -118,12 +138,60 @@ type EditorDraft = {
 
 const EMPTY_DRAFT: EditorDraft = { overrides: {}, extraElements: [] }
 
+/**
+ * An id for an element authored in the browser. The `added-`/`clone-` prefix
+ * is what routes edits to the draft's own list (see `isExtraElement`), and
+ * the server accepts any `[\w-]+` id. Not `crypto.randomUUID()`: that only
+ * exists in secure contexts, and the dev stack is served over plain http
+ * from a non-localhost hostname.
+ */
+function localElementId(prefix: 'added' | 'clone'): string {
+  const hex = Array.from({ length: 12 }, () =>
+    Math.floor(Math.random() * 16).toString(16),
+  ).join('')
+  return `${prefix}-${Date.now().toString(36)}-${hex}`
+}
+
 /** Idle time before an autosave fires. Long enough that a drag, a slider
  *  sweep or a burst of typing settles into one request rather than dozens;
  *  short enough that nobody wonders whether their work is safe. */
 const AUTOSAVE_IDLE_MS = 1500
 
 type SaveState = 'saved' | 'unsaved' | 'saving' | 'error'
+
+/**
+ * What "Copy style" carries between elements: presentation only. Geometry,
+ * content and identity stay behind — pasting a headline's style onto a badge
+ * should recolour and re-typeset the badge, not move or rewrite it.
+ */
+const COPYABLE_STYLE_FIELDS = [
+  'color',
+  'background_color',
+  'font_family',
+  'font_size_ratio',
+  'font_weight',
+  'font_style',
+  'text_align',
+  'line_height',
+  'letter_spacing_em',
+  'text_transform',
+  'opacity',
+  'border_radius_ratio',
+  'border_width_ratio',
+  'border_color',
+  'object_fit',
+  'object_position',
+] as const
+
+/** The state behind the right-click menu: where it opens, what it acts on
+ *  (null = the empty-canvas menu), and — for a paste from empty canvas — the
+ *  canvas-frame point to paste under. */
+type ContextMenuState = {
+  x: number
+  y: number
+  targetId: string | null
+  pastePoint?: { x: number; y: number }
+}
 
 /** Key-order-independent signature, so undoing back to the saved state is
  *  recognised as "not dirty" even though the draft object was rebuilt. */
@@ -142,9 +210,11 @@ function draftSignature(draft: EditorDraft): string {
     entry.id,
     entry.source_key,
     entry.kind ?? '',
+    entry.label,
     entry.geometry,
     entry.z_index,
     entry.hidden,
+    entry.locked ?? false,
     entry.content,
     Object.keys(entry.style)
       .sort()
@@ -186,28 +256,67 @@ function deriveResolved(
       // so default it after the spread rather than trusting the declared type.
       const templateGeometry = templateElement?.geometry
       const baseGeometry: Geometry = templateGeometry
-        ? { ...templateGeometry, rotation: templateGeometry.rotation ?? 0 }
+        ? {
+            ...templateGeometry,
+            rotation: templateGeometry.rotation ?? 0,
+            z_index: templateElement?.z_index ?? element.z_index,
+          }
         : element.geometry
 
       let geometry: Geometry = baseGeometry
       let style: Record<string, unknown> = templateElement?.style_properties ?? element.style
       let content = element.content
+      let resolvedContent = element.resolved_content
+      let name = element.name
+      let locked = element.locked
       let hidden = false
+      let visible = element.visible
       let zIndex = templateElement?.z_index ?? element.z_index
 
       for (const [field, value] of Object.entries(override)) {
         if (field === 'geometry') geometry = value as Geometry
-        else if (field === 'hidden') hidden = Boolean(value)
-        else if (field === 'text') content = String(value)
-        else if (field === 'z_index') zIndex = Number(value)
+        else if (field === 'hidden') {
+          // The override is authoritative in either direction — unhiding must
+          // beat a server snapshot that still says invisible.
+          hidden = Boolean(value)
+          visible = !hidden
+        }
+        else if (field === 'name') name = String(value)
+        else if (field === 'locked') locked = Boolean(value)
+        else if (field === 'text') {
+          content = String(value)
+          // The canvas draws `resolved_content`; typed-over text must win
+          // there too, or the edit only appears after a save round-trip.
+          resolvedContent = String(value)
+        } else if (field === 'z_index') zIndex = Number(value)
         else if (field === 'image_key') continue
         else style = { ...style, [field]: value }
       }
 
       const preview = imagePreviews[element.key]
-      if (preview) content = preview
+      if (preview) {
+        content = preview
+        resolvedContent = preview
+      }
 
-      return { ...element, geometry, style, content, hidden, z_index: zIndex }
+      // `transform` and `geometry` are the same numbers under two names — the
+      // canvas reads the former, the older panels the latter — so a drag that
+      // updated only `geometry` left the canvas drawing the stale position.
+      const transform = { ...geometry, z_index: zIndex }
+
+      return {
+        ...element,
+        name,
+        locked,
+        visible,
+        transform,
+        geometry: transform,
+        style,
+        content,
+        resolved_content: resolvedContent,
+        hidden,
+        z_index: zIndex,
+      }
     })
 
   // Added and duplicated elements come from the draft, not from `base` —
@@ -221,12 +330,34 @@ function deriveResolved(
 
   const fromDraft: ResolvedElement[] = draft.extraElements.map((entry) => {
     const server = serverExtras.get(entry.id)
-    const isImage = ['image', 'logo', 'static_graphic'].includes(entry.element_type)
-    const content = isImage
-      ? imagePreviews[entry.id] ?? server?.content ?? entry.content
+    const isImage = ['image', 'logo', 'icon'].includes(entry.element_type)
+    // What the canvas should display. An image needs the server to resolve a
+    // storage key into a data URI, so a preview or the server's answer wins;
+    // everything else displays its own literal content.
+    const shown = isImage
+      ? imagePreviews[entry.id] ?? server?.resolved_content ?? null
       : entry.content
+    // The document shape and the compat shape together, like every element
+    // that came through withResolvedElementCompat — the canvas reads
+    // `id`/`transform`/`visible`, the older panels read `key`/`geometry`/
+    // `hidden`, and an element carrying only one half crashes the other.
+    const transform = { ...entry.geometry, z_index: entry.z_index }
 
     return {
+      id: entry.id,
+      original_element_id: entry.source_key ?? null,
+      type: entry.element_type,
+      name: entry.label,
+      locked: entry.locked ?? false,
+      visible: !entry.hidden,
+      transform,
+      content: entry.content,
+      content_source: '',
+      bound_to: null,
+      manually_overridden: false,
+      style: entry.style,
+      resolved_content: shown,
+      bound_value: null,
       key: entry.id,
       label: entry.label,
       element_type: entry.element_type,
@@ -234,13 +365,11 @@ function deriveResolved(
       // and delete — the server treats it as FREE by construction.
       permission: 'free',
       constraints: server?.constraints ?? {},
-      geometry: entry.geometry,
-      style: entry.style,
-      content,
+      geometry: transform,
       hidden: entry.hidden,
       overridden_fields: [],
       is_clone: true,
-      source_key: entry.source_key,
+      source_key: entry.source_key ?? null,
       z_index: entry.z_index,
     }
   })
@@ -295,11 +424,18 @@ export default function DesignEditorPage() {
   const [brandKit, setBrandKit] = useState<BrandKit | null>(null)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [editingKey, setEditingKey] = useState<string | null>(null)
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
+  /** The full properties panel no longer opens itself on selection — the
+   *  `Position` button in the docked toolbar (and the pill's ⋯) toggles it,
+   *  the way Canva's Position panel works. Sticky across selections: opened
+   *  for one element, it stays open for the next. */
+  const [propertiesOpen, setPropertiesOpen] = useState(false)
   const [listingPhotos, setListingPhotos] = useState<ListingPhoto[]>([])
   const [uploadingImage, setUploadingImage] = useState(false)
   const [leftTab, setLeftTab] = useLeftPanelTab()
   const [uploads, setUploads] = useState<UploadedImage[]>([])
   const [addingElement, setAddingElement] = useState(false)
+  const [adapting, setAdapting] = useState(false)
   /** Sibling designs built from the same template — the bottom strip.
    *  Not pages: each is its own design with its own overrides and its own
    *  export. See VariationsStrip for why the distinction matters. */
@@ -342,6 +478,22 @@ export default function DesignEditorPage() {
 
   const dirty = draftSignature(draft) !== savedSignature
 
+  // The "In this design" swatch row: every literal colour the canvas is
+  // currently using, in paint order. Derived, never stored — it can't drift.
+  const documentColors = useMemo(() => {
+    if (!resolved) return []
+    const seen = new Set<string>()
+    for (const element of resolved.elements) {
+      for (const key of ['background_color', 'color', 'border_color', 'dot_color']) {
+        const candidate = element.style?.[key]
+        if (typeof candidate === 'string' && /^#[0-9A-Fa-f]{6}$/.test(candidate)) {
+          seen.add(candidate.toUpperCase())
+        }
+      }
+    }
+    return [...seen].slice(0, 12)
+  }, [resolved])
+
   const checkCompliance = useCallback(async () => {
     setCheckingCompliance(true)
     try {
@@ -382,18 +534,21 @@ export default function DesignEditorPage() {
     void loadDesign()
   }, [loadDesign])
 
-  // Open in the format the template was drawn for, once — after that the
-  // dimension tabs are the agent's to control.
+  // Open in the format the design was composed for, once — after that the
+  // dimension tabs are the agent's to control. An adapted copy carries its
+  // own `preferred_dimension` and must win over the template's native format:
+  // its layout only reads right at the format it was adapted to.
   //
   // Pinned as soon as the template is known, even when it names no format,
   // because the resolved-design load below waits on this: leaving it false
   // for a template without a `default_dimension` would mean the canvas never
   // loaded at all.
   useEffect(() => {
-    if (dimensionPinned || !template) return
-    if (template.default_dimension) setDimension(template.default_dimension)
+    if (dimensionPinned || !template || !design) return
+    const composedFor = design.preferred_dimension || template.default_dimension
+    if (composedFor) setDimension(composedFor)
     setDimensionPinned(true)
-  }, [template, dimensionPinned])
+  }, [template, design, dimensionPinned])
 
   useEffect(() => {
     dimensionRef.current = dimension
@@ -553,6 +708,8 @@ export default function DesignEditorPage() {
             if (field === 'geometry') return { ...entry, geometry: value as Geometry }
             if (field === 'z_index') return { ...entry, z_index: Number(value) }
             if (field === 'hidden') return { ...entry, hidden: Boolean(value) }
+            if (field === 'name') return { ...entry, label: String(value) }
+            if (field === 'locked') return { ...entry, locked: Boolean(value) }
             if (field === 'text' || field === 'image_key') {
               return { ...entry, content: String(value) }
             }
@@ -680,7 +837,7 @@ export default function DesignEditorPage() {
       await addDesignElement(designId, kind)
       const fresh = await fetchDesign(designId)
       setDesign(fresh)
-      const created = fresh.extra_elements[fresh.extra_elements.length - 1]
+      const created = (fresh.extra_elements ?? [])[(fresh.extra_elements ?? []).length - 1]
       if (!created) return
       applyDraft({ ...draft, extraElements: [...draft.extraElements, created] }, null)
       commitEdits()
@@ -696,6 +853,62 @@ export default function DesignEditorPage() {
     }
   }
 
+  /**
+   * Place a shape from the Elements panel's local library.
+   *
+   * Created locally, unlike `addElement` above: a drop has a position that
+   * must appear under the pointer immediately, and the four shape recipes
+   * differ only in style — which the server's per-type blueprint endpoint
+   * cannot express (templates.ts documents local creation as the normal
+   * path). The entry joins `draft.extraElements` through `applyDraft`, so it
+   * is selectable at once, undoable, and persisted by the same autosave PATCH
+   * as every other edit — there is no separate save path for it.
+   *
+   * `geometry` comes from Canvas's drop handler (already normalized); a click
+   * on the card passes none and the shape lands centred on the canvas.
+   */
+  function addShapeElement(shape: ShapePrimitive, geometry?: Box) {
+    if (!resolved) return
+    const scaleRef = Math.min(resolved.width, resolved.height)
+    const width = shape.width * scaleRef
+    const height = shape.height * scaleRef
+    const placed =
+      geometry ??
+      clampToCanvasLimits(
+        pixelBoxToGeometry(
+          {
+            left: (resolved.width - width) / 2,
+            top: (resolved.height - height) / 2,
+            width,
+            height,
+          },
+          0,
+          resolved,
+        ),
+      )
+    // On top of everything, capped at the document's own z ceiling.
+    const topZ = Math.min(
+      1000,
+      resolved.elements.reduce((highest, element) => Math.max(highest, element.z_index), 0) + 1,
+    )
+    const entry: ExtraElement = {
+      id: localElementId('added'),
+      source_key: null,
+      kind: shape.type,
+      element_type: shape.type,
+      label: shape.label,
+      geometry: { ...placed, z_index: topZ },
+      style: { ...shape.style },
+      content: '',
+      hidden: false,
+      z_index: topZ,
+    }
+    applyDraft({ ...draft, extraElements: [...draft.extraElements, entry] }, null)
+    commitEdits()
+    // It is on top and almost certainly the thing about to be restyled.
+    setSelectedKey(entry.id)
+  }
+
   /** Local: the element leaves the draft, and the next autosave is what
    *  actually removes it server-side. Undo brings it straight back. */
   function removeElement(element: ResolvedElement) {
@@ -708,6 +921,270 @@ export default function DesignEditorPage() {
     )
     commitEdits()
     if (selectedKey === element.key) setSelectedKey(null)
+  }
+
+  /**
+   * The layers panel's delete, by id.
+   *
+   * An added or duplicated element genuinely leaves the draft; a template
+   * element has no entry in the draft to remove, so "delete" becomes hidden —
+   * gone from the canvas and the export, still recoverable from the layers
+   * panel and by undo, which is the only removal the override model can say.
+   */
+  function deleteElementById(id: string) {
+    const element = resolved?.elements.find((entry) => entry.key === id)
+    if (!element) return
+    if (isExtraElement(id)) {
+      removeElement(element)
+      return
+    }
+    changeField(id, 'hidden', true)
+    commitEdits()
+    if (selectedKey === id) setSelectedKey(null)
+  }
+
+  /**
+   * Duplicate any element, locally — the mirror of `addShapeElement`'s local
+   * creation. The copy joins `draft.extraElements` nudged down-right the way
+   * the server's own `duplicate_element` nudges, keeps the original's
+   * template pointer so "reset to template" still means something on it, and
+   * saves through the same autosave as everything else. An image copy shows
+   * its placeholder until the first save round-trip resolves its content —
+   * the same contract every added image element already has.
+   */
+  function duplicateElement(id: string) {
+    if (!resolved) return
+    const element = resolved.elements.find((entry) => entry.key === id)
+    if (!element) return
+    const topZ = Math.min(
+      1000,
+      resolved.elements.reduce((highest, entry) => Math.max(highest, entry.z_index), 0) + 1,
+    )
+    const entry: ExtraElement = {
+      id: localElementId('clone'),
+      source_key: element.original_element_id ?? null,
+      kind: element.type,
+      element_type: element.type,
+      label: `${element.name || 'Element'} copy`,
+      geometry: {
+        ...element.transform,
+        x: element.transform.x + 0.02,
+        y: element.transform.y + 0.02,
+        z_index: topZ,
+      },
+      style: { ...element.style },
+      content: element.content,
+      hidden: false,
+      z_index: topZ,
+    }
+    applyDraft({ ...draft, extraElements: [...draft.extraElements, entry] }, null)
+    commitEdits()
+    setSelectedKey(entry.id)
+  }
+
+  /** Copy an element to the editor's clipboard (module-level, so it survives
+   *  switching designs — see elementClipboard.ts for why not the OS one). */
+  function copyElement(id: string) {
+    if (!resolved || !design) return
+    const element = resolved.elements.find((entry) => entry.key === id)
+    if (!element) return
+    setCopiedElement({
+      designId,
+      templateId: design.template,
+      type: element.type,
+      name: element.name || 'Element',
+      transform: { ...element.transform },
+      style: { ...element.style },
+      content: element.content,
+      sourceKey: element.original_element_id ?? null,
+    })
+  }
+
+  /**
+   * Paste — the clipboard twin of `duplicateElement`, creating locally so it
+   * lands instantly and saves through the same autosave as everything else.
+   *
+   * With a point (right-click on empty canvas), the copy is centred under the
+   * pointer; without one (Ctrl+V, or paste from an element's menu), it lands
+   * one nudge further down-right per paste so repeats stay visible. An image
+   * pasted across designs may show its placeholder until the server resolves
+   * its content — same contract as every added image element.
+   */
+  function pasteElement(at?: { x: number; y: number }) {
+    const clip = getCopiedElement()
+    if (!clip || !resolved || !design) return
+    const topZ = Math.min(
+      1000,
+      resolved.elements.reduce((highest, entry) => Math.max(highest, entry.z_index), 0) + 1,
+    )
+    let geometry: Box
+    if (at) {
+      const box = geometryToPixelBox(clip.transform, resolved)
+      const cx = Math.min(Math.max(at.x, 0), resolved.width)
+      const cy = Math.min(Math.max(at.y, 0), resolved.height)
+      geometry = clampToCanvasLimits(
+        pixelBoxToGeometry(
+          { ...box, left: cx - box.width / 2, top: cy - box.height / 2 },
+          clip.transform.rotation,
+          resolved,
+        ),
+      )
+    } else {
+      const step = nextPasteStep()
+      geometry = clampToCanvasLimits({
+        x: clip.transform.x + 0.02 * step,
+        y: clip.transform.y + 0.02 * step,
+        width: clip.transform.width,
+        height: clip.transform.height,
+        rotation: clip.transform.rotation,
+      })
+    }
+    const entry: ExtraElement = {
+      id: localElementId('clone'),
+      // A template pointer only means something inside the template it names;
+      // pasted into another design, the copy stands on its own.
+      source_key: clip.templateId === design.template ? clip.sourceKey : null,
+      kind: clip.type,
+      element_type: clip.type,
+      label: clip.name,
+      geometry: { ...geometry, z_index: topZ },
+      style: { ...clip.style },
+      content: clip.content,
+      hidden: false,
+      z_index: topZ,
+    }
+    applyDraft({ ...draft, extraElements: [...draft.extraElements, entry] }, null)
+    commitEdits()
+    setSelectedKey(entry.id)
+  }
+
+  function copyStyleOf(id: string) {
+    const element = resolved?.elements.find((entry) => entry.key === id)
+    if (!element) return
+    const style: Record<string, unknown> = {}
+    for (const field of COPYABLE_STYLE_FIELDS) {
+      const value = element.style?.[field]
+      if (value !== undefined && value !== null) style[field] = value
+    }
+    setCopiedStyle({ sourceType: element.type, style })
+  }
+
+  /**
+   * Apply a copied style in one draft update — one history entry, so one
+   * Ctrl+Z takes the whole paste back rather than peeling it off field by
+   * field. Template elements only receive the fields they declare editable;
+   * pasting the rest would author overrides the next save rejects, and a
+   * rejected autosave loses work silently.
+   */
+  function pasteStyleTo(id: string) {
+    const clip = getCopiedStyle()
+    if (!clip || !resolved) return
+    const element = resolved.elements.find((entry) => entry.key === id)
+    if (!element || element.locked) return
+    if (isExtraElement(id)) {
+      applyDraft(
+        {
+          ...draft,
+          extraElements: draft.extraElements.map((entry) =>
+            entry.id === id ? { ...entry, style: { ...entry.style, ...clip.style } } : entry,
+          ),
+        },
+        null,
+      )
+    } else {
+      // The whole style patch, unfiltered: the document model has no per-field
+      // permissions (see document.py), and the old editable_fields lookup was
+      // keyed by template keys that a document element's id never matches —
+      // filtering on it made paste style a silent no-op here.
+      applyDraft(
+        {
+          ...draft,
+          overrides: {
+            ...draft.overrides,
+            [id]: { ...(draft.overrides[id] ?? {}), ...clip.style },
+          },
+        },
+        null,
+      )
+    }
+    commitEdits()
+  }
+
+  /**
+   * The Layer menu's four moves, as z-index arithmetic.
+   *
+   * Same philosophy as `reorderElement` below: only the moved element's
+   * z_index changes — neighbours may be locked and are not the agent's to
+   * restack — so forward/backward step just past the nearest neighbour rather
+   * than renumbering the stack.
+   */
+  function restackElement(id: string, action: LayerAction) {
+    if (!resolved) return
+    const element = resolved.elements.find((entry) => entry.key === id)
+    if (!element) return
+    const others = resolved.elements
+      .filter((entry) => entry.key !== id)
+      .map((entry) => entry.z_index)
+    if (others.length === 0) return
+    let nextZ = element.z_index
+    if (action === 'front') {
+      nextZ = Math.max(...others) + 1
+    } else if (action === 'back') {
+      nextZ = Math.min(...others) - 1
+    } else if (action === 'forward') {
+      const above = others.filter((z) => z > element.z_index)
+      if (above.length === 0) return
+      nextZ = Math.min(...above) + 1
+    } else {
+      const below = others.filter((z) => z < element.z_index)
+      if (below.length === 0) return
+      nextZ = Math.max(...below) - 1
+    }
+    nextZ = Math.min(Math.max(nextZ, 0), 1000)
+    if (nextZ === element.z_index) return
+    changeField(id, 'z_index', nextZ)
+    commitEdits()
+  }
+
+  /** Align to page: reposition against the true canvas edges, in the same
+   *  pixel space every drag uses, then back to fractions. Size and rotation
+   *  are untouched — alignment moves a box, it never reshapes one. */
+  function alignElementToPage(id: string, action: AlignAction) {
+    if (!resolved) return
+    const element = resolved.elements.find((entry) => entry.key === id)
+    if (!element || element.locked) return
+    const box = geometryToPixelBox(element.transform, resolved)
+    const left =
+      action === 'left'
+        ? 0
+        : action === 'center'
+          ? (resolved.width - box.width) / 2
+          : action === 'right'
+            ? resolved.width - box.width
+            : box.left
+    const top =
+      action === 'top'
+        ? 0
+        : action === 'middle'
+          ? (resolved.height - box.height) / 2
+          : action === 'bottom'
+            ? resolved.height - box.height
+            : box.top
+    changeField(
+      id,
+      'geometry',
+      clampToCanvasLimits(
+        pixelBoxToGeometry({ ...box, left, top }, element.transform.rotation, resolved),
+      ),
+    )
+    commitEdits()
+  }
+
+  function toggleLocked(id: string) {
+    const target = resolved?.elements.find((entry) => entry.key === id)
+    if (!target) return
+    changeField(id, 'locked', !target.locked)
+    commitEdits()
   }
 
   /**
@@ -827,6 +1304,116 @@ export default function DesignEditorPage() {
     window.addEventListener('beforeunload', warn)
     return () => window.removeEventListener('beforeunload', warn)
   }, [dirty])
+
+  /**
+   * The editor's keyboard shortcuts — the same set the context menu prints
+   * beside its rows, plus undo/redo. A shortcut a menu advertises but that
+   * does nothing when typed reads as broken, so these ship together.
+   *
+   * Subscribed once through a ref (the pattern Canvas uses for its pointer
+   * listeners): the handler body needs the current draft/selection on every
+   * press, and re-subscribing a window listener per keystroke-induced render
+   * is churn for nothing.
+   */
+  const shortcutRef = useRef<(event: KeyboardEvent) => void>(() => {})
+  shortcutRef.current = (event: KeyboardEvent) => {
+    // Never fight real typing: inline text editing, the properties panel's
+    // inputs, dialogs. Deleting an element because someone pressed Backspace
+    // in a text field is the classic canvas-editor bug.
+    const target = event.target
+    if (editingKey || exportOpen || preview) return
+    if (
+      target instanceof HTMLElement &&
+      (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+    ) {
+      return
+    }
+
+    const mod = event.ctrlKey || event.metaKey
+    const key = event.key.toLowerCase()
+
+    if (mod && !event.shiftKey && !event.altKey && key === 'z') {
+      event.preventDefault()
+      undo()
+      return
+    }
+    if (mod && (key === 'y' || (event.shiftKey && key === 'z'))) {
+      event.preventDefault()
+      redo()
+      return
+    }
+    if (key === 'escape') {
+      if (contextMenu) setContextMenu(null)
+      else setSelectedKey(null)
+      return
+    }
+
+    const selected = selectedKey
+      ? resolved?.elements.find((entry) => entry.key === selectedKey)
+      : null
+
+    if (mod && event.altKey && key === 'c') {
+      if (!selected) return
+      event.preventDefault()
+      copyStyleOf(selected.key)
+      return
+    }
+    if (mod && key === 'c') {
+      // A real text selection wins — that copy belongs to the browser.
+      if (!selected || window.getSelection()?.toString()) return
+      event.preventDefault()
+      copyElement(selected.key)
+      return
+    }
+    if (mod && event.altKey && key === 'v') {
+      if (!selected || selected.locked) return
+      event.preventDefault()
+      pasteStyleTo(selected.key)
+      return
+    }
+    if (mod && key === 'v') {
+      if (!getCopiedElement()) return
+      event.preventDefault()
+      pasteElement()
+      return
+    }
+    if (mod && key === 'd') {
+      if (!selected || selected.locked) return
+      event.preventDefault()
+      duplicateElement(selected.key)
+      return
+    }
+    if ((key === 'delete' || key === 'backspace') && selected && !selected.locked) {
+      event.preventDefault()
+      deleteElementById(selected.key)
+      return
+    }
+    if (event.altKey && event.shiftKey && key === 'l') {
+      if (!selected) return
+      event.preventDefault()
+      toggleLocked(selected.key)
+      return
+    }
+    if (mod && (event.key === ']' || event.key === '[')) {
+      if (!selected || selected.locked) return
+      event.preventDefault()
+      restackElement(
+        selected.key,
+        event.key === ']'
+          ? event.altKey
+            ? 'front'
+            : 'forward'
+          : event.altKey
+            ? 'back'
+            : 'backward',
+      )
+    }
+  }
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => shortcutRef.current(event)
+    window.addEventListener('keydown', listener)
+    return () => window.removeEventListener('keydown', listener)
+  }, [])
 
   async function runPreview() {
     setBusy(true)
@@ -1014,6 +1601,33 @@ export default function DesignEditorPage() {
     }
   }
 
+  /**
+   * "Adapt layout for this format": a server-side copy re-composed for the
+   * dimension currently on screen — boxes keep their shape and corners stay
+   * anchored instead of stretching with the canvas (layout_adaptation.py).
+   *
+   * The draft is persisted first for the same reason goToListings persists:
+   * the server adapts the *stored* document, and adapting a canvas thirty
+   * seconds behind the screen would silently drop those edits from the copy.
+   * The original design is untouched; the editor moves to the copy.
+   */
+  async function adaptForCurrentFormat() {
+    setAdapting(true)
+    setErrors({})
+    try {
+      if (dirty && !(await persist(draft))) return
+      const adapted = await adaptDesign(designId, dimension)
+      void navigate(designEditorPath(adapted.id))
+    } catch (error) {
+      setErrors({
+        detail:
+          error instanceof ApiError ? error.message : 'Could not adapt this design.',
+      })
+    } finally {
+      setAdapting(false)
+    }
+  }
+
   async function handleDelete() {
     if (!window.confirm('Delete this design? Its exports go with it.')) return
     await deleteDesign(designId)
@@ -1052,11 +1666,6 @@ export default function DesignEditorPage() {
 
   const editableByKey = new Map(
     template.elements.map((element) => [element.key, element.editable_fields]),
-  )
-  const textEditableKeys = new Set(
-    template.elements
-      .filter((element) => element.editable_fields.includes('text'))
-      .map((element) => element.key),
   )
   // An added or duplicated element has no template element to read
   // `editable_fields` from — it is FREE by construction, so it gets the full
@@ -1108,7 +1717,9 @@ export default function DesignEditorPage() {
   const hasNotices = Boolean(message || bannerDetail || notReady.length > 0 || hasFieldErrors)
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-app">
+    // h-dvh, not h-screen: on phone browsers the URL bar comes and goes, and
+    // dvh tracks the height that is actually visible.
+    <div className="flex h-dvh flex-col overflow-hidden bg-app">
       <EditorHeader
         designName={design.name}
         updatedAt={design.updated_at}
@@ -1172,7 +1783,9 @@ export default function DesignEditorPage() {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
+      {/* relative: on small screens the tool and properties panels float over
+          this workspace instead of shrinking the canvas to a ribbon. */}
+      <div className="relative flex min-h-0 flex-1">
         <LeftPanel
           tab={leftTab}
           onTabChange={setLeftTab}
@@ -1183,10 +1796,22 @@ export default function DesignEditorPage() {
             setSelectedKey(key)
             setEditingKey(null)
           }}
-          canReorder={(element) => editableFieldsFor(element).includes('z_index')}
           onReorder={(movedKey, targetKey) => void reorderElement(movedKey, targetKey)}
-          onRemoveElement={(element) => void removeElement(element)}
+          onRemoveElement={(id) => deleteElementById(id)}
+          onRenameElement={(id, name) => {
+            changeField(id, 'name', name)
+            commitEdits()
+          }}
+          onToggleVisible={(id) => {
+            const target = resolved.elements.find((entry) => entry.key === id)
+            if (!target) return
+            changeField(id, 'hidden', target.visible)
+            commitEdits()
+          }}
+          onToggleLocked={(id) => toggleLocked(id)}
+          onDuplicateElement={(id) => duplicateElement(id)}
           onAddElement={(kind) => void addElement(kind)}
+          onAddShape={(shape) => addShapeElement(shape)}
           adding={addingElement}
           onPickTemplate={(picked) => void startFromTemplate(picked)}
           pickingTemplate={pickingTemplate}
@@ -1208,7 +1833,7 @@ export default function DesignEditorPage() {
         />
 
         <main className="flex min-w-0 flex-1 flex-col gap-2 p-3">
-          <div className="flex flex-wrap gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             {dimensions.map((option) => (
               <button
                 key={option.key}
@@ -1223,29 +1848,62 @@ export default function DesignEditorPage() {
                 {option.label}
               </button>
             ))}
+
+            {/* Only away from the design's own format — at home there is
+                nothing to adapt, and the tabs alone already render it right. */}
+            {dimension !== (design.preferred_dimension || template.default_dimension) && (
+              <button
+                type="button"
+                onClick={() => void adaptForCurrentFormat()}
+                disabled={adapting}
+                title={
+                  'Create a copy of this design re-composed for this format: ' +
+                  'boxes keep their shape and corners stay anchored instead of ' +
+                  'stretching with the canvas. This design is not changed.'
+                }
+                className="ml-2 rounded-control border border-brand/40 px-3 py-1.5 text-[12px] font-medium text-brand transition hover:bg-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {adapting
+                  ? 'Adapting…'
+                  : `✨ Adapt layout for ${
+                      dimensions.find((option) => option.key === dimension)?.label ?? dimension
+                    }`}
+              </button>
+            )}
           </div>
+
+          {/* The contextual toolbar, docked (Canva-style) rather than floating
+              over the artwork. Always rendered so the canvas below never jumps
+              when selection changes. */}
+          <TopToolbar
+            element={selectedElement ?? undefined}
+            override={overrideFor(selectedElement)}
+            onChange={(field, value) => {
+              if (selectedElement) changeField(selectedElement.key, field, value)
+            }}
+            onCommit={commitEdits}
+            listingPhotos={listingPhotos}
+            onPickPhoto={(imageKey, previewUrl) => {
+              if (selectedElement) replaceImage(selectedElement.key, imageKey, previewUrl)
+            }}
+            onUploadFile={(file) => {
+              if (selectedElement) void uploadAndReplaceImage(selectedElement.key, file)
+            }}
+            uploading={uploadingImage}
+            brandKit={brandKit}
+            propertiesOpen={propertiesOpen}
+            onToggleProperties={() => setPropertiesOpen((open) => !open)}
+          />
 
           <Canvas
             selectionToolbar={
               selectedElement ? (
-                <TopToolbar
-                  element={selectedElement}
-                  editableFields={selectedEditableFields}
-                  override={overrideFor(selectedElement)}
-                  onChange={(field, value) => changeField(selectedElement.key, field, value)}
-                  onCommit={commitEdits}
-                  listingPhotos={listingPhotos}
-                  onPickPhoto={(imageKey, previewUrl) =>
-                    replaceImage(selectedElement.key, imageKey, previewUrl)
-                  }
-                  onUploadFile={(file) =>
-                    void uploadAndReplaceImage(selectedElement.key, file)
-                  }
-                  uploading={uploadingImage}
-                  brandKit={brandKit}
-                  onDelete={
-                    selectedElement.is_clone ? () => removeElement(selectedElement) : undefined
-                  }
+                <QuickActions
+                  locked={selectedElement.locked}
+                  onToggleLock={() => toggleLocked(selectedElement.key)}
+                  onDuplicate={() => duplicateElement(selectedElement.key)}
+                  onDelete={() => deleteElementById(selectedElement.key)}
+                  onMore={() => setPropertiesOpen((open) => !open)}
                 />
               ) : undefined
             }
@@ -1261,13 +1919,33 @@ export default function DesignEditorPage() {
               setSelectedKey(key)
               if (key !== editingKey) setEditingKey(null)
             }}
-            textEditableKeys={textEditableKeys}
             editingKey={editingKey}
             onStartEdit={startTextEdit}
             onCommitEdit={commitTextEdit}
             onCancelEdit={cancelTextEdit}
             onGeometryChange={(key, geometry) => changeField(key, 'geometry', geometry)}
             onGeometryCommit={commitEdits}
+            onShapeDrop={(shape, geometry) => addShapeElement(shape, geometry)}
+            onElementContextMenu={(id, position) => {
+              const element = resolved.elements.find((entry) => entry.key === id)
+              if (!element) return
+              // A locked element opens its (Unlock) menu without being
+              // selected — selection implies handles and a toolbar, which a
+              // locked element should not sprout.
+              if (!element.locked) {
+                setSelectedKey(id)
+                setEditingKey(null)
+              }
+              setContextMenu({ x: position.x, y: position.y, targetId: id })
+            }}
+            onCanvasContextMenu={(position, point) => {
+              setContextMenu({
+                x: position.x,
+                y: position.y,
+                targetId: null,
+                pastePoint: point,
+              })
+            }}
             zoom={zoom}
             onZoomChange={setZoom}
             fitNonce={fitNonce}
@@ -1327,15 +2005,26 @@ export default function DesignEditorPage() {
           )}
         </main>
 
-        {/* Only on selection. With nothing selected there is nothing for this
-            column to say, and an empty panel is 320px of the workspace spent
-            on the words "Nothing selected". */}
-        {selectedElement && (
-          <aside className="w-[320px] shrink-0 overflow-y-auto border-l border-line bg-app p-3">
+        {/* On demand only — the `Position` button in the docked toolbar (or
+            the pill's slider icon) opens it, matching Canva: selection alone
+            never costs the canvas 320px of workspace. */}
+        {selectedElement && propertiesOpen && (
+          <aside className="w-[320px] shrink-0 overflow-y-auto border-l border-line bg-app p-3 max-lg:absolute max-lg:inset-y-0 max-lg:right-0 max-lg:z-30 max-lg:w-[min(320px,85vw)] max-lg:bg-surface max-lg:shadow-pop">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold text-ink">Position &amp; properties</span>
+              <button
+                type="button"
+                onClick={() => setPropertiesOpen(false)}
+                className="rounded px-1.5 text-base leading-none text-muted transition hover:bg-hover hover:text-ink"
+                aria-label="Close the properties panel"
+              >
+                ×
+              </button>
+            </div>
             <PropertiesSidebar
               element={selectedElement}
-              editableFields={selectedEditableFields}
-              override={overrideFor(selectedElement)}
+              documentColors={documentColors}
+              brandKit={brandKit}
               onChange={(field, value) => changeField(selectedElement.key, field, value)}
               onCommit={commitEdits}
               onClear={() => clearElement(selectedElement.key)}
@@ -1352,6 +2041,42 @@ export default function DesignEditorPage() {
           </aside>
         )}
       </div>
+
+      {contextMenu && (
+        <CanvasContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          element={contextMenu.targetId ? selectedElementFor(contextMenu.targetId) : null}
+          canPaste={getCopiedElement() !== null}
+          canPasteStyle={getCopiedStyle() !== null}
+          onCopy={() => {
+            if (contextMenu.targetId) copyElement(contextMenu.targetId)
+          }}
+          onCopyStyle={() => {
+            if (contextMenu.targetId) copyStyleOf(contextMenu.targetId)
+          }}
+          onPaste={() => pasteElement(contextMenu.pastePoint)}
+          onPasteStyle={() => {
+            if (contextMenu.targetId) pasteStyleTo(contextMenu.targetId)
+          }}
+          onDuplicate={() => {
+            if (contextMenu.targetId) duplicateElement(contextMenu.targetId)
+          }}
+          onDelete={() => {
+            if (contextMenu.targetId) deleteElementById(contextMenu.targetId)
+          }}
+          onLayer={(action) => {
+            if (contextMenu.targetId) restackElement(contextMenu.targetId, action)
+          }}
+          onAlign={(action) => {
+            if (contextMenu.targetId) alignElementToPage(contextMenu.targetId, action)
+          }}
+          onToggleLock={() => {
+            if (contextMenu.targetId) toggleLocked(contextMenu.targetId)
+          }}
+          onClose={() => setContextMenu(null)}
+        />
+      )}
 
       {exportOpen && (
         <ExportDialog

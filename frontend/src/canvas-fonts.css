@@ -36,6 +36,18 @@
  *
  *   display -> Roboto Condensed      400, 700
  *   body    -> DejaVu Sans           400, 700
+ *   elegant -> EB Garamond           400, 700
+ *   modern  -> Lato                  400, 700
+ *   rounded -> Quicksand             400, 700
+ *   slab    -> Roboto Slab           400, 700
+ *   retro   -> Lobster Two           400, 700
+ *   soft    -> Comfortaa             400, 700
+ *
+ * The six authoring families are the exact files renderer/Dockerfile
+ * installs from Debian, converted OTF/TTF -> WOFF2. A browser only fetches a
+ * face the moment an element actually uses it, so carrying twelve extra
+ * declarations costs nothing until an agent picks one — and then it costs
+ * one 25–200KB same-origin file, once.
  *
  * `serif` (Liberation Serif) and `mono` (Liberation Mono) are not vendored:
  * no template element uses either yet, and both are metric-compatible with
@@ -84,6 +96,102 @@
 @font-face {
   font-family: 'DejaVu Sans';
   src: url('/fonts/DejaVuSans-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EBGaramond12-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EBGaramond12-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Lato';
+  src: url('/fonts/Lato-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Lato';
+  src: url('/fonts/Lato-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Quicksand';
+  src: url('/fonts/Quicksand-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Quicksand';
+  src: url('/fonts/Quicksand-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Roboto Slab';
+  src: url('/fonts/RobotoSlab-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Roboto Slab';
+  src: url('/fonts/RobotoSlab-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Lobster Two';
+  src: url('/fonts/LobsterTwo-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Lobster Two';
+  src: url('/fonts/LobsterTwo-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Comfortaa';
+  src: url('/fonts/Comfortaa-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: 'Comfortaa';
+  src: url('/fonts/Comfortaa-Bold.woff2') format('woff2');
   font-weight: 700;
   font-style: normal;
   font-display: block;

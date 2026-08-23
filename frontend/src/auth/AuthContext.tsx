@@ -30,7 +30,7 @@ import {
   type ReactNode,
 } from 'react'
 
-import { refreshOnce } from '../lib/apiClient.ts'
+import { onSessionExpired, refreshOnce } from '../lib/apiClient.ts'
 import { fetchCurrentUser, login as loginRequest, logout as logoutRequest } from './api.ts'
 import { clearAccessToken } from './tokenStore.ts'
 import { hasRoleAtLeast, type Credentials, type Role, type User } from './types.ts'
@@ -108,6 +108,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true
     }
+  }, [])
+
+  useEffect(() => {
+    // When a refresh fails mid-session — the cookie expired while the user
+    // was working — the API client has no way to change auth state itself, so
+    // it reports here and this flips the app to "unauthenticated", which is
+    // what makes the route guard redirect to /login instead of leaving the
+    // user on a page whose every request 401s.
+    onSessionExpired(() => {
+      clearAccessToken()
+      setUser(null)
+      setStatus('unauthenticated')
+    })
+    return () => onSessionExpired(null)
   }, [])
 
   const login = useCallback(async (credentials: Credentials) => {

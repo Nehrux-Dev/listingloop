@@ -14,7 +14,7 @@ import {
   TextField,
   fieldErrors,
 } from '../components/FormControls.tsx'
-import { ApiError } from '../lib/apiClient.ts'
+import { ApiError, apiRequest } from '../lib/apiClient.ts'
 
 type Form = {
   name: string
@@ -193,6 +193,63 @@ export default function ProfilePage() {
         brokerage={profile.brokerage_detail ?? null}
         onChanged={reload}
       />
+
+      <SystemStatusCard />
     </div>
+  )
+}
+
+type HealthResponse = {
+  status: 'ok' | 'error'
+  checks: Record<string, { status: 'ok' | 'error'; detail?: string }>
+}
+
+/**
+ * Backend health, relocated from the dashboard.
+ *
+ * It lives in Settings because it is diagnostic, not actionable: an agent
+ * cannot fix a failing Redis, but "is it me or the service?" is a question
+ * this page can answer when something misbehaves — the same reason status
+ * pages exist.
+ */
+function SystemStatusCard() {
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    apiRequest<HealthResponse>('/api/health/')
+      .then(setHealth)
+      .catch(() => setFailed(true))
+  }, [])
+
+  return (
+    <Card title="System status">
+      {failed ? (
+        <p className="text-sm text-slate-500">
+          Could not reach the service — that itself is the status.
+        </p>
+      ) : (
+        <ul className="divide-y divide-slate-100 text-sm">
+          {health ? (
+            Object.entries(health.checks).map(([name, check]) => (
+              <li key={name} className="flex items-center gap-2 py-2">
+                <span
+                  className={`inline-block size-2.5 rounded-full ${
+                    check.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
+                  }`}
+                  aria-hidden="true"
+                />
+                <span className="font-medium capitalize">{name}</span>
+                <span className="ml-auto text-slate-500">
+                  {check.status === 'ok' ? 'ok' : (check.detail ?? 'error')}
+                </span>
+              </li>
+            ))
+          ) : (
+            <li className="py-2 text-slate-500">Checking&hellip;</li>
+          )}
+        </ul>
+      )}
+    </Card>
   )
 }

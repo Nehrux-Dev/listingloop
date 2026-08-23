@@ -27,9 +27,12 @@ from rest_framework import status
 from apps.ai_content.client import AIGenerationError, CompletionResult
 from apps.templates.dimensions import SOCIAL_DIMENSIONS
 from apps.templates.document import elements_from_template
+from apps.templates.extraction_validation import ValidationResult
 from apps.templates.importing import (
     RasterPage,
     TemplateImportError,
+    _maybe_validate,
+    align_and_group,
     bake_assets,
     build_template,
     closest_dimension,
@@ -626,10 +629,21 @@ class FontRoleTestCase(TemplateAPITestCase):
         from apps.templates.html_builder import FONT_STACKS, font_stack
 
         self.assertIn("Roboto Condensed", font_stack({"font_family": "display"}))
+        self.assertIn("EB Garamond", font_stack({"font_family": "elegant"}))
+        self.assertIn("Lato", font_stack({"font_family": "modern"}))
         # An unknown or absent role must not fall through to whatever
         # fontconfig picks — that is how an export stops matching the editor.
         self.assertEqual(font_stack({}), FONT_STACKS["body"])
         self.assertEqual(font_stack({"font_family": "Papyrus"}), FONT_STACKS["body"])
+
+    def test_every_role_the_document_accepts_has_a_stack(self):
+        """The vocabulary and the resolution table must cover each other
+        exactly: a role without a stack falls back to body silently, and a
+        stack without a role is unreachable dead weight."""
+        from apps.templates.document import FONT_FAMILIES
+        from apps.templates.html_builder import FONT_STACKS
+
+        self.assertEqual(set(FONT_STACKS), FONT_FAMILIES)
 
     def test_the_document_only_accepts_known_roles(self):
         from apps.templates.document import DocumentValidationError, validate_element
@@ -660,6 +674,629 @@ class ClosestDimensionTestCase(TemplateAPITestCase):
         # 5:1 is nothing in SOCIAL_DIMENSIONS; forcing it into the nearest
         # would crop the composition without saying so.
         self.assertEqual(closest_dimension(2000, 400), "instagram_post")
+
+
+# ---------------------------------------------------------------------------
+# Step 2b — smart geometry (size-aware snap, spacing, alignment, crop)
+# ---------------------------------------------------------------------------
+
+
+def _box(eid, x, y, w, h, kind="text"):
+    """A minimal aligned-payload element in pixel space."""
+    return {
+        "id": eid,
+        "type": kind,
+        "role": "",
+        "binding": "",
+        "text": "x",
+        "mask": [],
+        "transform": {"x": x, "y": y, "width": w, "height": h, "rotation": 0, "z_index": 0},
+        "style": {},
+    }
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class SmartGeometryTestCase(TemplateAPITestCase):
+    """The deterministic tidy-up that runs on either reader's output.
+
+    Pixel space, since ``align_and_group`` runs before normalisation converts
+    to fractions. The page is 1000x1000, so the snap tolerance is 5px.
+    """
+
+    W = H = 1000
+
+    def align(self, elements):
+        payload = {"page": {}, "elements": elements}
+        return align_and_group(payload, self.W, self.H, smart=True)["elements"]
+
+    def test_a_column_of_near_equal_cards_is_given_one_shared_edge(self):
+        # Two left-aligned cards whose right edges are 3px apart were meant to
+        # line up. Position-only snapping cannot fix this — the widths differ.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 403, 50, "image")
+        self.align([a, b])
+        self.assertEqual(a["transform"]["width"], b["transform"]["width"])
+        self.assertAlmostEqual(
+            a["transform"]["x"] + a["transform"]["width"],
+            b["transform"]["x"] + b["transform"]["width"],
+            places=2,
+        )
+
+    def test_genuinely_different_widths_are_left_alone(self):
+        # Right edges 200px apart: a design decision, not placement slop.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 600, 50, "image")
+        self.align([a, b])
+        self.assertEqual(a["transform"]["width"], 400)
+        self.assertEqual(b["transform"]["width"], 600)
+
+    def test_a_nearly_even_column_is_regularised_to_one_rhythm(self):
+        # Gaps of 24 / 24 / 25 px collapse to a single mean gap.
+        run = [
+            _box("t1", 100, 0, 200, 50),
+            _box("t2", 100, 74, 200, 50),
+            _box("t3", 100, 148, 200, 50),
+            _box("t4", 100, 223, 200, 50),
+        ]
+        self.align(run)
+        ys = [e["transform"]["y"] for e in run]
+        gaps = [ys[i + 1] - (ys[i] + 50) for i in range(3)]
+        self.assertLess(max(gaps) - min(gaps), 0.05)
+
+    def test_an_intentionally_uneven_column_is_preserved(self):
+        run = [
+            _box("t1", 100, 0, 200, 50),
+            _box("t2", 100, 60, 200, 50),
+            _box("t3", 100, 150, 200, 50),
+        ]
+        before = [e["transform"]["y"] for e in run]
+        self.align(run)
+        self.assertEqual([e["transform"]["y"] for e in run], before)
+
+    def test_confident_alignment_is_recorded_as_a_relationship(self):
+        a = _box("a", 100, 100, 200, 50)
+        b = _box("b", 100, 300, 200, 50)
+        self.align([a, b])
+        left = a["style"].get("layout_constraints", {}).get("align_left_with", [])
+        self.assertIn("b", left)
+
+    def test_recorded_relationships_survive_normalisation_as_stored_keys(self):
+        # align_and_group records peers by the reader's throwaway ids; after
+        # normalisation those must point at the keys actually stored, or the
+        # relationship references nothing.
+        page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+        payload = {
+            "page": {"background_color": "#FFFFFF"},
+            "elements": [
+                _box("raw_a", 100, 100, 200, 50),
+                _box("raw_b", 100, 300, 200, 50),
+            ],
+        }
+        align_and_group(payload, 800, 1000, smart=True)
+        elements = normalise_elements(payload, page)
+        keys = {e.key for e in elements}
+        for element in elements:
+            for peers in (element.style_properties.get("layout_constraints") or {}).values():
+                for peer in peers:
+                    self.assertIn(peer, keys)
+                    self.assertNotIn(peer, {"raw_a", "raw_b"})
+
+    @override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=False)
+    def test_the_flag_off_is_exactly_the_old_behaviour(self):
+        # No size changes, no relationships — only the original position snap.
+        # Called without an explicit ``smart`` — an explicit bool overrides the
+        # setting (which is what ``self.align`` passes), and the thing under
+        # test here is precisely that the *flag* rolls the behaviour back.
+        a = _box("a", 100, 100, 400, 50, "image")
+        b = _box("b", 100, 200, 403, 50, "image")
+        align_and_group({"page": {}, "elements": [a, b]}, self.W, self.H)
+        self.assertEqual(a["transform"]["width"], 400)
+        self.assertEqual(b["transform"]["width"], 403)
+        self.assertNotIn("layout_constraints", a["style"])
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class TextFitTestCase(TemplateAPITestCase):
+    """A text box measured too tight for the substitute font is widened.
+
+    Page is 800x1000, so the type scale reference is 800px.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+
+    def _price(self, width, align="left", x=80.0):
+        return layout_payload(
+            [
+                element_payload(
+                    id="price",
+                    type="text",
+                    role="price",
+                    binding="",
+                    text="$1,300,000",
+                    transform={"x": x, "y": 500.0, "width": width, "height": 90.0},
+                    style={"font_size_px": 80.0, "text_align": align},
+                )
+            ]
+        )
+
+    def test_a_too_narrow_price_box_is_widened_to_fit(self):
+        # 10 glyphs at ~80px in the substitute body font need ~470px; the box is
+        # 200px, which is what clips "$1,300,000" to "$1,300,00".
+        [element] = normalise_elements(self._price(200.0), self.page)
+        self.assertGreater(element.geometry["width"], 200.0 / 800.0)
+
+    def test_a_box_already_wide_enough_is_left_alone(self):
+        [element] = normalise_elements(self._price(700.0), self.page)
+        self.assertAlmostEqual(element.geometry["width"], 700.0 / 800.0, places=3)
+
+    def test_a_right_aligned_box_grows_leftward_keeping_its_right_edge(self):
+        before = self._price(200.0, align="right", x=500.0)
+        right_before = 500.0 + 200.0
+        [element] = normalise_elements(before, self.page)
+        right_after = (element.geometry["x"] + element.geometry["width"]) * 800.0
+        self.assertLess(element.geometry["x"] * 800.0, 500.0)
+        self.assertAlmostEqual(right_after, right_before, delta=3.0)
+
+    def test_widening_never_leaves_the_canvas(self):
+        [element] = normalise_elements(self._price(200.0, x=700.0), self.page)
+        right = (element.geometry["x"] + element.geometry["width"]) * 800.0
+        self.assertLessEqual(right, 800.0 + 0.5)
+
+    @override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=False)
+    def test_the_flag_off_leaves_the_box_as_measured(self):
+        [element] = normalise_elements(self._price(200.0), self.page)
+        self.assertAlmostEqual(element.geometry["width"], 200.0 / 800.0, places=3)
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class TextTrackingTestCase(TemplateAPITestCase):
+    """Measured PDF geometry lets the substitute face be spaced to the width
+    the original run actually occupied.
+
+    Page is 800x1000, so the type scale reference is 800px. The fixture text
+    is 17 glyphs at 40px in the body advance (0.58), so the substitute run is
+    estimated at ~394px.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+
+    def _header(self, width, exact=True):
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="header",
+                    type="text",
+                    role="header",
+                    binding="",
+                    text="EXCLUSIVE LISTING",
+                    transform={"x": 40.0, "y": 100.0, "width": width, "height": 60.0},
+                    style={"font_size_px": 40.0, "font_weight": "400", "text_align": "left"},
+                )
+            ]
+        )
+        if exact:
+            payload["page"]["geometry_is_exact"] = True
+        return payload
+
+    def test_a_wide_tracked_header_gets_its_tracking_back(self):
+        # The original occupied 500px; the substitute needs ~394px, so the
+        # designer's letter-spacing is recovered rather than the type sitting
+        # bunched at the left of a too-wide box.
+        [element] = normalise_elements(self._header(500.0), self.page)
+        spacing = element.style_properties.get("letter_spacing_em")
+        self.assertIsNotNone(spacing)
+        self.assertGreater(spacing, 0.1)
+        self.assertLess(spacing, 0.2)
+
+    def test_tracking_is_clamped_rather_than_trusted(self):
+        # A box far wider than the run would need absurd tracking; the clamp
+        # holds it at the widest spacing real flyer headers use.
+        [element] = normalise_elements(self._header(700.0), self.page)
+        self.assertEqual(element.style_properties.get("letter_spacing_em"), 0.35)
+
+    def test_a_slightly_tight_box_is_squeezed_not_widened(self):
+        # 380px measured against ~394px estimated: within the negative clamp,
+        # so the glyphs tighten to fit and the measured geometry survives.
+        [element] = normalise_elements(self._header(380.0), self.page)
+        spacing = element.style_properties.get("letter_spacing_em")
+        self.assertIsNotNone(spacing)
+        self.assertLess(spacing, 0.0)
+        self.assertGreaterEqual(spacing, -0.06)
+        self.assertAlmostEqual(element.geometry["width"], 380.0 / 800.0, places=3)
+
+    def test_vision_measurements_are_never_tracked(self):
+        # A vision box is itself an estimate; spacing text into it would
+        # stretch correct type to fit a wrong number.
+        [element] = normalise_elements(self._header(500.0, exact=False), self.page)
+        self.assertNotIn("letter_spacing_em", element.style_properties)
+
+
+@override_settings(TEMPLATE_IMPORT_VALIDATE=True, TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class AutoCorrectionTestCase(TemplateAPITestCase):
+    """Validation's offset findings are applied, kept only if the page improves."""
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+        self.elements = normalise_elements(layout_payload(), self.page)
+        self.element = self.elements[0]
+        self.before = dict(self.element.geometry)
+
+    def _offset_outcome(self, score, dx=4, dy=-2):
+        return ValidationResult(
+            score=score,
+            issues=[
+                {
+                    "element_id": self.element.key,
+                    "type": "offset",
+                    "region_score": 0.7,
+                    "delta_x": dx,
+                    "delta_y": dy,
+                }
+            ],
+        )
+
+    def test_a_correction_that_improves_the_score_is_kept(self):
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[self._offset_outcome(0.80), ValidationResult(score=0.90)],
+        ):
+            outcome = _maybe_validate(completion(layout_payload()), self.elements, self.page)
+
+        self.assertEqual(outcome.score, 0.90)
+        # The element rendered 4px right and 2px up of the source, so it moves
+        # 4px left and 2px down.
+        self.assertAlmostEqual(self.element.geometry["x"], self.before["x"] - 4 / 800, places=4)
+        self.assertAlmostEqual(self.element.geometry["y"], self.before["y"] + 2 / 1000, places=4)
+
+    def test_a_correction_that_does_not_help_is_reverted(self):
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[self._offset_outcome(0.80), ValidationResult(score=0.75)],
+        ):
+            outcome = _maybe_validate(completion(layout_payload()), self.elements, self.page)
+
+        self.assertEqual(outcome.score, 0.80)
+        self.assertEqual(self.element.geometry, self.before)
+
+    def test_a_region_mismatch_is_reported_but_never_moved(self):
+        # No offset explains the difference — moving the box would be a guess.
+        mismatch = ValidationResult(
+            score=0.80,
+            issues=[
+                {
+                    "element_id": self.element.key,
+                    "type": "region_mismatch",
+                    "region_score": 0.6,
+                    "delta_x": 0,
+                    "delta_y": 0,
+                }
+            ],
+        )
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[mismatch],
+        ) as validate:
+            outcome = _maybe_validate(completion(layout_payload()), self.elements, self.page)
+
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(outcome.score, 0.80)
+        self.assertEqual(self.element.geometry, self.before)
+
+    @override_settings(TEMPLATE_IMPORT_AUTOCORRECT=False)
+    def test_the_flag_off_reports_without_touching_geometry(self):
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[self._offset_outcome(0.80)],
+        ) as validate:
+            outcome = _maybe_validate(completion(layout_payload()), self.elements, self.page)
+
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(outcome.score, 0.80)
+        self.assertEqual(self.element.geometry, self.before)
+
+
+@override_settings(TEMPLATE_IMPORT_VALIDATE=True, TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class StructuralValidationTestCase(TemplateAPITestCase):
+    """Structural reads get a score — fonts and rescued fills still diverge —
+    but never the offset correction, whose findings against exact geometry
+    describe the substitute face, not a measurement error."""
+
+    def _structural(self, payload) -> CompletionResult:
+        return CompletionResult(
+            payload=payload,
+            raw_text="",
+            model="pdf-structure",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            duration_ms=0,
+        )
+
+    def test_a_structural_read_is_scored(self):
+        page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+        payload = layout_payload()
+        payload["page"]["geometry_is_exact"] = True
+        elements = normalise_elements(payload, page)
+
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[ValidationResult(score=0.87)],
+        ) as validate:
+            outcome = _maybe_validate(self._structural(payload), elements, page)
+
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(outcome.score, 0.87)
+
+    def test_a_structural_read_is_never_offset_corrected(self):
+        page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+        payload = layout_payload()
+        payload["page"]["geometry_is_exact"] = True
+        elements = normalise_elements(payload, page)
+        element = elements[0]
+        before = dict(element.geometry)
+        offsets = ValidationResult(
+            score=0.80,
+            issues=[
+                {
+                    "element_id": element.key,
+                    "type": "offset",
+                    "region_score": 0.7,
+                    "delta_x": 4,
+                    "delta_y": -2,
+                }
+            ],
+        )
+
+        with mock.patch(
+            "apps.templates.extraction_validation.validate_extraction",
+            side_effect=[offsets],
+        ) as validate:
+            outcome = _maybe_validate(self._structural(payload), elements, page)
+
+        # One call: the score. A second would be the correction re-render.
+        self.assertEqual(validate.call_count, 1)
+        self.assertEqual(outcome.score, 0.80)
+        self.assertEqual(element.geometry, before)
+
+
+def make_region_png(paint, width: int = 800, height: int = 1000) -> bytes:
+    """A white page with a 300x300 region at (100, 100) painted by `paint`."""
+    image = Image.new("RGB", (width, height), "#FFFFFF")
+    paint(image)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def unclassified_shape(**overrides) -> dict:
+    """A shape neither reader could describe, sitting on the painted region."""
+    return element_payload(
+        id="wash",
+        type="shape",
+        role="panel",
+        binding="",
+        text="",
+        transform={"x": 100.0, "y": 100.0, "width": 300.0, "height": 300.0, "z_index": 1},
+        style={
+            "color": "",
+            "background_color": "",
+            "font_size_px": 0.0,
+            "fill_type": "unsupported_pattern",
+            "shape_type": "rectangle",
+        },
+        **overrides,
+    )
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class UnclassifiedFillRescueTestCase(TemplateAPITestCase):
+    """An `unsupported_pattern` box is given what the raster shows there,
+    instead of arriving on the canvas as an empty rectangle."""
+
+    def test_a_smooth_fade_becomes_a_real_gradient(self):
+        def paint(image):
+            for y in range(100, 400):
+                t = (y - 100) / 299
+                row = (
+                    round(0x20 + t * (0xC0 - 0x20)),
+                    round(0x20 + t * (0xC0 - 0x20)),
+                    round(0x40 + t * (0xE0 - 0x40)),
+                )
+                image.paste(Image.new("RGB", (300, 1), row), (100, y))
+
+        page = RasterPage(png=make_region_png(paint), width=800, height=1000)
+        [element] = normalise_elements(layout_payload([unclassified_shape()]), page)
+
+        self.assertEqual(element.style_properties["fill_type"], "gradient")
+        gradient = element.style_properties["background_gradient"]
+        self.assertTrue(gradient.startswith("linear-gradient(180deg"), gradient)
+        self.assertIn("0%", gradient)
+        self.assertIn("100%", gradient)
+        self.assertNotIn("background_color", element.style_properties)
+
+    def test_a_flat_region_becomes_its_measured_colour(self):
+        page = RasterPage(
+            png=make_region_png(
+                lambda image: image.paste(Image.new("RGB", (300, 300), "#784E2A"), (100, 100))
+            ),
+            width=800,
+            height=1000,
+        )
+        [element] = normalise_elements(layout_payload([unclassified_shape()]), page)
+
+        self.assertEqual(element.style_properties["fill_type"], "solid_color")
+        self.assertEqual(element.style_properties["background_color"], "#784E2A")
+
+    def _stripes(self, image) -> None:
+        # A 1px checkerboard: every row and every column alternates, so no
+        # axis reads as uniform-and-smooth and no gradient or solid colour can
+        # honestly claim the region.
+        rows = []
+        for parity in (0, 1):
+            row = Image.new("RGB", (300, 1))
+            row.putdata(
+                [(255, 255, 255) if (x + parity) % 2 else (0, 0, 0) for x in range(300)]
+            )
+            rows.append(row)
+        for y in range(100, 400):
+            image.paste(rows[y % 2], (100, y))
+
+    def test_a_true_texture_is_baked_as_its_own_pixels(self):
+        page = RasterPage(png=make_region_png(self._stripes), width=800, height=1000)
+        [element] = normalise_elements(layout_payload([unclassified_shape()]), page)
+
+        self.assertEqual(element.element_type, ElementType.STATIC_GRAPHIC)
+        self.assertEqual(element.style_properties["fill_type"], "image_texture")
+        self.assertIsNotNone(element.crop_box)
+        self.assertEqual(bake_assets([element], page), 1)
+
+    def test_a_texture_with_content_on_it_is_left_alone(self):
+        """Baking the region would bake the text into the picture and then
+        render the text again on top — the double-drawn failure."""
+        page = RasterPage(png=make_region_png(self._stripes), width=800, height=1000)
+        overlapping_text = element_payload(
+            transform={"x": 150.0, "y": 200.0, "width": 200.0, "height": 50.0, "z_index": 5}
+        )
+        elements = normalise_elements(
+            layout_payload([unclassified_shape(), overlapping_text]), page
+        )
+        shape = next(e for e in elements if e.element_type != ElementType.TEXT)
+
+        self.assertEqual(shape.element_type, ElementType.COLOR_BLOCK)
+        self.assertEqual(shape.style_properties["fill_type"], "unsupported_pattern")
+        self.assertIsNone(shape.crop_box)
+
+
+@override_settings(TEMPLATE_IMPORT_RASTER_MAX_EDGE=600, TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class EmbeddedImageBakeTestCase(TemplateAPITestCase):
+    """A photo baked from a PDF keeps the original stream's pixels.
+
+    The raster is capped for the whole page, so a photo occupying part of it
+    keeps only part of those pixels; the embedded stream is the photograph the
+    designer actually placed.
+    """
+
+    def _flyer_with_photo(self) -> bytes:
+        try:
+            import pymupdf
+        except ImportError:  # pragma: no cover - depends on the installed wheel
+            import fitz as pymupdf
+
+        photo = Image.new("RGB", (800, 800), "#FF0000")
+        photo.paste(Image.new("RGB", (400, 800), "#0000FF"), (400, 0))
+        buffer = io.BytesIO()
+        photo.save(buffer, format="PNG")
+
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.draw_rect(pymupdf.Rect(0, 0, 400, 600), color=None, fill=(1, 1, 1))
+        page.insert_image(pymupdf.Rect(100, 150, 300, 350), stream=buffer.getvalue())
+        data = document.tobytes()
+        document.close()
+        return data
+
+    def _photo_element(self, data):
+        from apps.templates.pdf_extraction import extract_pdf_layout
+
+        page = rasterise(data, "photo.pdf")
+        payload = extract_pdf_layout(data, page.width, page.height)
+        elements = normalise_elements(payload, page)
+        photo = next(e for e in elements if e.element_type == ElementType.IMAGE)
+        return page, elements, photo
+
+    def _asset_size(self, element) -> tuple[int, int]:
+        with Image.open(io.BytesIO(element.asset.file.getvalue())) as asset:
+            return asset.size
+
+    def test_the_original_pixels_beat_the_raster_crop(self):
+        data = self._flyer_with_photo()
+        page, elements, photo = self._photo_element(data)
+
+        self.assertEqual(bake_assets(elements, page, source_pdf=data), 1)
+
+        width, height = self._asset_size(photo)
+        # The 200x200pt placement on a 600px raster is a 200x200px crop; the
+        # embedded stream is 800x800. Anything past the raster's ceiling
+        # proves the original pixels were used.
+        self.assertGreater(width, 300)
+        self.assertGreater(height, 300)
+
+    def test_without_the_source_pdf_the_raster_crop_still_bakes(self):
+        data = self._flyer_with_photo()
+        page, elements, photo = self._photo_element(data)
+
+        self.assertEqual(bake_assets(elements, page), 1)
+
+        width, height = self._asset_size(photo)
+        self.assertLessEqual(width, 220)
+        self.assertLessEqual(height, 220)
+
+
+@override_settings(TEMPLATE_IMPORT_SMART_GEOMETRY=True)
+class CropPreservationTestCase(TemplateAPITestCase):
+    """A photo whose box bleeds off the page keeps its visible composition."""
+
+    def setUp(self):
+        super().setUp()
+        self.page = RasterPage(png=PAGE_PNG, width=800, height=1000)
+
+    def test_a_bleeding_photo_renders_the_region_that_is_actually_there(self):
+        # A hero photo running 100px off the right and bottom edges. The crop is
+        # clamped to the page; the render geometry must follow it, or cover
+        # would slide the visible region.
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="hero",
+                    type="image",
+                    role="hero",
+                    binding="photo_1",
+                    text="",
+                    transform={"x": 600.0, "y": 700.0, "width": 300.0, "height": 400.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        # Visible width is 800-600=200 of 800 -> 0.25; height 1000-700=300 -> 0.30.
+        self.assertAlmostEqual(element.geometry["width"], 0.25, places=3)
+        self.assertAlmostEqual(element.geometry["height"], 0.30, places=3)
+        self.assertIn("source_box", element.style_properties)
+
+    def test_a_photo_inside_the_page_is_geometry_unchanged(self):
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="p",
+                    type="image",
+                    role="photo",
+                    binding="photo_1",
+                    text="",
+                    transform={"x": 100.0, "y": 100.0, "width": 200.0, "height": 200.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        self.assertAlmostEqual(element.geometry["x"], 0.125, places=3)
+        self.assertAlmostEqual(element.geometry["width"], 0.25, places=3)
+        self.assertNotIn("source_box", element.style_properties)
+
+    def test_a_flat_background_is_never_cropped_into_a_screenshot(self):
+        payload = layout_payload(
+            [
+                element_payload(
+                    id="bg", type="background", role="page", binding="", text="",
+                    transform={"x": 0.0, "y": 0.0, "width": 800.0, "height": 1000.0},
+                )
+            ]
+        )
+        [element] = normalise_elements(payload, self.page)
+        self.assertEqual(element.element_type, ElementType.COLOR_BLOCK)
+        self.assertIsNone(element.crop_box)
 
 
 # ---------------------------------------------------------------------------

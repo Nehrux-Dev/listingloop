@@ -1,21 +1,25 @@
 /**
- * The toolbar above the canvas: a persistent row of document-level actions,
- * plus a contextual row that changes with what's selected.
+ * The contextual toolbar, DOCKED across the top of the workspace — the way
+ * Canva's is — rather than floating beside the selected element.
  *
- * WHY THE GLOBAL ROW IS PERSISTENT RATHER THAN "ONLY WHEN NOTHING IS
- * SELECTED"
+ * WHY DOCKED RATHER THAN FLOATING
  * ---------------------------------------------------------------------------
- * The spec lists Undo/Redo/Zoom/Preview/Save/Export as the no-selection
- * toolbar. Taken literally that would mean Save disappears the moment you
- * click an element — you'd have to deselect to save the edit you just made.
- * So the global row stays put and the contextual row appears *in addition*
- * when something is selected. With nothing selected the toolbar shows
- * exactly the specified set, which is the behaviour the spec was describing.
+ * The floating version sat on top of the artwork: a wide control strip
+ * anchored to the selection routinely buried the element above or below the
+ * one being edited, and its position jumped with every drag. A fixed strip
+ * above the canvas is always in the same place, never covers the design, and
+ * leaves the on-canvas chrome to a small quick-action pill (see
+ * QuickActions.tsx) that is short enough not to hide anything.
  *
- * Every contextual control is gated on `editable_fields`, the list the API
- * derives from the element's permission — so a control the server would
- * reject is never rendered. That is UX, not security: `overrides.py`
- * re-validates every write regardless.
+ * The strip is always rendered — with nothing selected it shows a hint at a
+ * constant height — because appearing and disappearing would make the canvas
+ * itself jump on every selection change.
+ *
+ * The full property inventory (position, size, rotation, every slider) lives
+ * in PropertiesSidebar, which no longer opens on selection: the `Position`
+ * button at the right end of this strip toggles it, mirroring Canva's
+ * Position button. Mid-flow edits happen here; the panel is for deliberate
+ * numeric work.
  */
 
 import type { ListingPhoto } from '../../api/listings.ts'
@@ -23,29 +27,24 @@ import type { BrandKit } from '../../api/profiles.ts'
 import type { ResolvedElement } from '../../api/templates.ts'
 import {
   ColorControl,
-  FONT_FIXED_REASON,
   ImageReplaceControl,
   PositionGrid,
-  SAFE_FONT_LABEL,
   SliderControl,
   ToggleButton,
   ToolbarGroup,
 } from './controls.tsx'
-import { IconTrash } from '../icons.tsx'
+import { IconSliders } from '../icons.tsx'
 import { elementKind } from './elementKind.ts'
+import { FONT_OPTIONS, FONT_STACKS } from './fonts.ts'
 
 type Props = {
-  /** Undefined when nothing is selected — the toolbar then shows only its
-   *  global row. */
+  /** Undefined when nothing is selected — the strip then shows its hint. */
   element?: ResolvedElement
   override: Record<string, unknown>
   onChange: (field: string, value: unknown) => void
   /** Ends the current run of edits so a slider drag is one undo step. */
   onCommit: () => void
 
-  /** Only supplied for elements the agent owns — a template element has
-   *  nothing to delete back to, so the button simply is not rendered. */
-  onDelete?: () => void
   /** So `@accent_color` swatches show the real colour. */
   brandKit?: BrandKit | null
 
@@ -53,6 +52,10 @@ type Props = {
   onPickPhoto: (imageKey: string, previewUrl: string) => void
   onUploadFile: (file: File) => void
   uploading: boolean
+
+  /** The `Position` toggle — opens/closes the full properties panel. */
+  propertiesOpen: boolean
+  onToggleProperties: () => void
 }
 
 export default function TopToolbar(props: Props) {
@@ -63,20 +66,26 @@ export default function TopToolbar(props: Props) {
   const isLocked = element?.locked ?? false
 
   return (
-    <div>
+    <div className="flex min-h-[46px] w-full flex-wrap items-center gap-x-3 gap-y-2 rounded-panel border border-line bg-surface px-3 py-1.5 shadow-panel">
+      {!element && (
+        <span className="text-[11px] text-muted">
+          Select an element on the canvas to edit it here.
+        </span>
+      )}
+
       {element && isLocked && (
-        <div className="flex items-center gap-2 rounded-panel border border-line bg-surface px-3 py-2 shadow-pop">
+        <div className="flex items-center gap-2">
           <span className="rounded bg-ink px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white">
             Locked
           </span>
           <span className="whitespace-nowrap text-[11px] text-muted">
-            Set by the template
+            Unlock it from the pill on the canvas or the layers panel to edit.
           </span>
         </div>
       )}
 
       {element && !isLocked && (
-        <div className="flex max-w-[min(760px,72vw)] flex-wrap items-center gap-x-3 gap-y-2 rounded-panel border border-line bg-surface px-2.5 py-2 shadow-pop">
+        <>
           {kind === 'text' && (
             <TextControls
               element={element}
@@ -107,21 +116,26 @@ export default function TopToolbar(props: Props) {
               brandKit={props.brandKit}
             />
           )}
+        </>
+      )}
 
-          {props.onDelete && (
-            <>
-              <span className="h-5 w-px bg-line" />
-              <button
-                type="button"
-                onClick={props.onDelete}
-                title="Delete element"
-                aria-label="Delete element"
-                className="flex size-7 items-center justify-center rounded-control text-muted transition hover:bg-hover hover:text-danger"
-              >
-                <IconTrash className="size-4" />
-              </button>
-            </>
-          )}
+      {element && (
+        <div className="ml-auto flex items-center gap-1.5 pl-2">
+          <span className="h-5 w-px bg-line" />
+          <button
+            type="button"
+            onClick={props.onToggleProperties}
+            aria-pressed={props.propertiesOpen}
+            title="Position, size and every property of this element"
+            className={`flex items-center gap-1.5 rounded-control px-2.5 py-1 text-[12px] font-medium transition ${
+              props.propertiesOpen
+                ? 'bg-active text-brand'
+                : 'text-muted hover:bg-hover hover:text-ink'
+            }`}
+          >
+            <IconSliders className="size-3.5" />
+            Position
+          </button>
         </div>
       )}
     </div>
@@ -159,9 +173,24 @@ function TextControls({
   return (
     <>
       <ToolbarGroup label="Font">
-        <span className="whitespace-nowrap text-[11px] italic text-muted" title={FONT_FIXED_REASON}>
-          {SAFE_FONT_LABEL} (fixed)
-        </span>
+        <select
+          value={String(value('font_family', 'body'))}
+          onChange={(event) => {
+            onChange('font_family', event.target.value)
+            onCommit()
+          }}
+          // Wears the selected role's own face, so the control doubles as a
+          // live preview without needing per-option styling (which the native
+          // select cannot do cross-browser).
+          style={{ fontFamily: FONT_STACKS[String(value('font_family', 'body'))] }}
+          className="max-w-[130px] rounded-md border border-line bg-surface px-1.5 py-1 text-xs outline-none focus:border-brand"
+        >
+          {FONT_OPTIONS.map((option) => (
+            <option key={option.role} value={option.role}>
+              {option.family}
+            </option>
+          ))}
+        </select>
       </ToolbarGroup>
 
       {(

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import re
 import uuid
 
@@ -417,6 +418,14 @@ def _extraction_schema() -> dict:
                                     "type": "string",
                                     "enum": ["300", "400", "500", "600", "700", "800", "900", ""],
                                 },
+                                "font_style": {
+                                    "type": "string",
+                                    "enum": ["normal", "italic", ""],
+                                    "description": (
+                                        "'italic' when the type visibly slants. "
+                                        "'' for non-text elements."
+                                    ),
+                                },
                                 "font_family": {
                                     "type": "string",
                                     "enum": ["body", "display", "serif", "mono", "script", ""],
@@ -633,13 +642,25 @@ def _snap_axis(elements: list[dict], pos: str, size: str, tolerance: float) -> N
                 settled.add(marker)
 
 
-def align_and_group(payload: dict, width: int, height: int) -> dict:
+def align_and_group(
+    payload: dict, width: int, height: int, *, smart: bool | None = None
+) -> dict:
     """Snap near-alignments and label visual groups. Returns the payload.
 
     Runs on whatever either reader produced, so the vision model and the PDF
     reader are tidied by the same rules rather than each having its own idea of
     what "aligned" means.
+
+    ``smart`` turns on the deterministic geometry clean-up added on top of the
+    original position snap: reconciling shared edges and equal sizes (which the
+    position-only snap structurally cannot do), regularising even spacing, and
+    recording the alignment relationships it is confident about. ``None`` reads
+    the ``TEMPLATE_IMPORT_SMART_GEOMETRY`` setting; an explicit bool overrides
+    it, which is what the tests use. Off is exactly the pre-existing behaviour.
     """
+    if smart is None:
+        smart = bool(getattr(settings, "TEMPLATE_IMPORT_SMART_GEOMETRY", True))
+
     elements = [
         element
         for element in payload.get("elements", [])
@@ -651,11 +672,182 @@ def align_and_group(payload: dict, width: int, height: int) -> dict:
     short_side = max(1.0, min(width, height))
     tolerance = max(_SNAP_FLOOR_PX, short_side * _SNAP_RATIO)
 
+    meta = payload.setdefault("extraction_meta", {})
+    if getattr(settings, "TEMPLATE_IMPORT_DEBUG", False):
+        # The boxes as either reader measured them, before any snapping. Kept
+        # for the debug overlay so "what did the tidy-up move" is a diff rather
+        # than a guess. Pixel space, matching the transforms at this point.
+        meta["pre_align_boxes"] = [
+            {
+                "id": str(element.get("id") or ""),
+                "type": element.get("type", ""),
+                "x": float(element["transform"].get("x", 0.0)),
+                "y": float(element["transform"].get("y", 0.0)),
+                "width": float(element["transform"].get("width", 0.0)),
+                "height": float(element["transform"].get("height", 0.0)),
+            }
+            for element in elements
+        ]
+
+    # The original position snap always runs: it is the behaviour every existing
+    # import was built on, and the smart steps refine its output rather than
+    # replacing it.
     _snap_axis(elements, "x", "width", tolerance)
     _snap_axis(elements, "y", "height", tolerance)
 
+    if smart:
+        # Order matters: edges/sizes first so a run's members share an exact
+        # leading edge before spacing is measured between them; then spacing;
+        # then relationships, recorded from the final, settled geometry.
+        meta["edge_corrections"] = _reconcile_edges(elements, tolerance)
+        meta["spacing_corrections"] = _regularize_spacing(elements, tolerance)
+        meta["alignment_relationships"] = _record_alignment(elements, tolerance)
+
     _assign_groups(elements, short_side, width * height)
     return payload
+
+
+#: A width/height equalisation is only made when the two boxes are already this
+#: close, as a multiple of the snap tolerance. Past it the difference is a
+#: design decision, not placement slop, and forcing it would be the "do NOT
+#: resize the photo to match the button" case the spec calls out.
+_SIZE_RECONCILE_FACTOR = 1.0
+
+#: An evenly-spaced run is only regularised when its gaps already agree this
+#: closely (max gap minus min gap, against the tolerance). A run whose gaps
+#: genuinely differ is left alone — the spacing was intended.
+_SPACING_AGREE_FACTOR = 1.0
+
+
+def _edge_clusters(
+    elements: list[dict], pos: str, tolerance: float
+) -> list[list[dict]]:
+    """Elements grouped by a shared leading edge on one axis.
+
+    The position snap has already pulled near-equal leading edges onto one
+    value, so "shares a left edge" is now an exact-equality question within a
+    hair. Each returned run is the raw material for equalising width and for
+    finding an evenly spaced column.
+    """
+    ordered = sorted(elements, key=lambda e: float(e["transform"][pos]))
+    clusters: list[list[dict]] = []
+    for element in ordered:
+        value = float(element["transform"][pos])
+        if clusters and value - float(clusters[-1][0]["transform"][pos]) <= tolerance:
+            clusters[-1].append(element)
+        else:
+            clusters.append([element])
+    return [cluster for cluster in clusters if len(cluster) >= 2]
+
+
+def _reconcile_edges(elements: list[dict], tolerance: float) -> int:
+    """Give boxes that share one edge a shared *opposite* edge too, by size.
+
+    The position snap can align leading edges, centres or trailing edges, but
+    only ever by *moving* a box — it can never change a width, so two panels
+    meant to share both a left and a right edge (a column of cards) come out
+    left-aligned and a few pixels apart on the right. This closes that gap:
+    within a run that already shares a leading edge, boxes whose trailing edges
+    are within tolerance are given a common size, so the shared edge becomes
+    exact. Boxes further apart than the tolerance are left alone — that width
+    difference is the design, not slop.
+    """
+    corrections = 0
+    for pos, size in (("x", "width"), ("y", "height")):
+        for cluster in _edge_clusters(elements, pos, tolerance):
+            lead = min(float(e["transform"][pos]) for e in cluster)
+            trailing = [float(e["transform"][pos]) + float(e["transform"][size]) for e in cluster]
+            if max(trailing) - min(trailing) > tolerance * _SIZE_RECONCILE_FACTOR:
+                continue
+            shared_size = sum(trailing) / len(trailing) - lead
+            if shared_size <= 0:
+                continue
+            for element in cluster:
+                current = float(element["transform"][size])
+                if abs(current - shared_size) > 1e-6:
+                    element["transform"][pos] = round(lead, 2)
+                    element["transform"][size] = round(shared_size, 2)
+                    corrections += 1
+    return corrections
+
+
+def _regularize_spacing(elements: list[dict], tolerance: float) -> int:
+    """Even out the gaps in a column or row that is already nearly even.
+
+    A stack of three text blocks measured at 24 / 24 / 25 px apart was set on a
+    24px rhythm; the one-pixel drift is measurement noise that becomes visible
+    once the design is re-rendered at another size. When a run of three or more
+    left- or top-aligned boxes has gaps that already agree within tolerance,
+    the gaps are set to their mean. A run whose gaps genuinely differ is a
+    deliberate layout and is left untouched.
+    """
+    corrections = 0
+    for pos, size, other in (("x", "width", "y"), ("y", "height", "x")):
+        for cluster in _edge_clusters(elements, other, tolerance):
+            run = sorted(cluster, key=lambda e: float(e["transform"][pos]))
+            if len(run) < 3:
+                continue
+            gaps = [
+                float(run[i + 1]["transform"][pos])
+                - (float(run[i]["transform"][pos]) + float(run[i]["transform"][size]))
+                for i in range(len(run) - 1)
+            ]
+            if any(gap < 0 for gap in gaps):
+                continue
+            if max(gaps) - min(gaps) > tolerance * _SPACING_AGREE_FACTOR:
+                continue
+            target = sum(gaps) / len(gaps)
+            cursor = float(run[0]["transform"][pos]) + float(run[0]["transform"][size])
+            for element in run[1:]:
+                new_pos = cursor + target
+                if abs(new_pos - float(element["transform"][pos])) > 1e-6:
+                    element["transform"][pos] = round(new_pos, 2)
+                    corrections += 1
+                cursor = new_pos + float(element["transform"][size])
+    return corrections
+
+
+def _record_alignment(elements: list[dict], tolerance: float) -> int:
+    """Note, on each element, which others it is confidently aligned with.
+
+    Additive metadata under ``style.layout_constraints`` — the ids that share
+    this element's left, centre, right, top or bottom line. Nothing renders
+    from it today; it is recorded so a later editor can *maintain* an alignment
+    the agent did not deliberately break, and so the debug report can show why
+    two boxes were treated as a column. Only exact-within-tolerance matches are
+    recorded: the spec's rule is that no relationship beats a wrong one.
+    """
+
+    def anchor(element: dict, pos: str, size: str, which: str) -> float:
+        start = float(element["transform"][pos])
+        extent = float(element["transform"][size])
+        return {"start": start, "center": start + extent / 2, "end": start + extent}[which]
+
+    keys = {
+        "align_left_with": ("x", "width", "start"),
+        "align_center_with": ("x", "width", "center"),
+        "align_right_with": ("x", "width", "end"),
+        "align_top_with": ("y", "height", "start"),
+        "align_bottom_with": ("y", "height", "end"),
+    }
+    recorded = 0
+    for element in elements:
+        constraints: dict[str, list[str]] = {}
+        for name, (pos, size, which) in keys.items():
+            mine = anchor(element, pos, size, which)
+            peers = [
+                str(other.get("id"))
+                for other in elements
+                if other is not element
+                and other.get("id")
+                and abs(anchor(other, pos, size, which) - mine) <= tolerance
+            ]
+            if peers:
+                constraints[name] = peers
+        if constraints:
+            element.setdefault("style", {})["layout_constraints"] = constraints
+            recorded += 1
+    return recorded
 
 
 def _assign_groups(elements: list[dict], short_side: float, page_area: float) -> None:
@@ -841,6 +1033,13 @@ class ExtractedElement:
     #: keeps the shape when the agent drops their own photograph into the slot.
     #: An alpha mask would be thrown away with the pixels it was painted on.
     mask: list[tuple[float, float]] = field(default_factory=list)
+    #: For an image read structurally out of a PDF: the xref of the embedded
+    #: image stream and its *full* placement box on the raster (x, y, w, h in
+    #: raster pixels — the crop box may be a clipped part of it). Baking uses
+    #: the pair to cut the same region out of the original pixels, which the
+    #: raster's size cap never touched. Zero/None on the vision path.
+    pdf_xref: int = 0
+    pdf_placement: tuple[float, float, float, float] | None = None
     asset: ContentFile | None = field(default=None, repr=False)
 
 
@@ -889,8 +1088,14 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         )
 
     scale_reference = float(min(page.width, page.height))
+    smart = bool(getattr(settings, "TEMPLATE_IMPORT_SMART_GEOMETRY", True))
     elements: list[ExtractedElement] = []
     used_keys: set[str] = set()
+    # Raw extraction id -> the stable key it became, so the alignment
+    # relationships recorded pre-normalisation can be rewritten to point at the
+    # keys that are actually stored. Without this they would reference the
+    # throwaway ids the reader used and resolve to nothing.
+    raw_id_to_key: dict[str, str] = {}
 
     for index, raw in enumerate(raw_elements):
         if not isinstance(raw, dict):
@@ -917,6 +1122,8 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         if key in used_keys:  # pragma: no cover - _slug_key suffixes with index
             key = f"{key}_{len(used_keys)}"
         used_keys.add(key)
+        if raw.get("id"):
+            raw_id_to_key[str(raw["id"])] = key
 
         raw_style = raw.get("style") if isinstance(raw.get("style"), dict) else {}
         binding = raw.get("binding") if raw.get("binding") in BINDING_CHOICES else ""
@@ -948,6 +1155,13 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
         if clip:
             style["clip_polygon"] = clip
 
+        # Alignment relationships the tidy-up pass was confident about. Recorded
+        # under the raw style by ``_record_alignment``; carried onto the stored
+        # element so the debug report and any future constraint-aware editor can
+        # read it. Purely additive — nothing renders from it.
+        if smart and isinstance(raw_style.get("layout_constraints"), dict):
+            style["layout_constraints"] = raw_style["layout_constraints"]
+
         # Crop from what the element *became*, not what it was called.
         #
         # A flat page background resolves to a COLOR_BLOCK a dozen lines up,
@@ -963,16 +1177,59 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
             else None
         )
 
+        # The structural reader's pointer back at the original image stream.
+        # Untrusted like everything else in the payload: anything malformed
+        # degrades to the raster crop rather than failing the element.
+        pdf_xref, pdf_placement = 0, None
+        if crop_box is not None:
+            raw_placement = raw.get("source_placement")
+            try:
+                xref = int(raw.get("source_xref") or 0)
+                if xref > 0 and isinstance(raw_placement, (list, tuple)) and len(raw_placement) == 4:
+                    px, py, pw, ph = (float(v) for v in raw_placement)
+                    if pw > 0 and ph > 0:
+                        pdf_xref, pdf_placement = xref, (px, py, pw, ph)
+            except (TypeError, ValueError):
+                pass
+
+        # The visible box, as a fraction of the page. For an image whose box
+        # bled off the canvas the crop was clamped to what is actually there,
+        # and the render geometry has to follow it: leaving geometry on the raw
+        # off-canvas box would stretch the clamped crop across empty space with
+        # object-fit:cover and slide the visible region sideways — the "images
+        # cropped differently from the original" failure. Re-deriving geometry
+        # from the crop keeps the pixels that were baked lined up with the box
+        # they render into. Non-image elements keep their raw box (a full-bleed
+        # colour panel is legitimately off-canvas).
+        gx, gy, gw, gh = x_px, y_px, w_px, h_px
+        if smart and crop_box is not None and element_type == ElementType.IMAGE:
+            cl, ct, cr, cb = crop_box
+            if (cr - cl) > 0 and (cb - ct) > 0 and (
+                abs(cl - x_px) > 0.5
+                or abs(ct - y_px) > 0.5
+                or abs((cr - cl) - w_px) > 0.5
+                or abs((cb - ct) - h_px) > 0.5
+            ):
+                gx, gy, gw, gh = cl, ct, cr - cl, cb - ct
+                # What region of the source this crop is, kept so a replaced
+                # photo can be framed the same way rather than re-centred.
+                style["source_box"] = {
+                    "x": round(cl / page.width, 4),
+                    "y": round(ct / page.height, 4),
+                    "width": round((cr - cl) / page.width, 4),
+                    "height": round((cb - ct) / page.height, 4),
+                }
+
         elements.append(
             ExtractedElement(
                 key=key,
                 label=(role.replace("_", " ").strip().title() or f"Element {index + 1}")[:120],
                 element_type=element_type,
                 geometry={
-                    "x": round(x_px / page.width, 4),
-                    "y": round(y_px / page.height, 4),
-                    "width": round(w_px / page.width, 4),
-                    "height": round(h_px / page.height, 4),
+                    "x": round(gx / page.width, 4),
+                    "y": round(gy / page.height, 4),
+                    "width": round(gw / page.width, 4),
+                    "height": round(gh / page.height, 4),
                     "rotation": round(_clamp(transform.get("rotation"), -360, 360), 2),
                 },
                 style_properties=style,
@@ -984,6 +1241,8 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
                 z_index=int(_clamp(transform.get("z_index"), 0, 999, default=index)),
                 crop_box=crop_box,
                 mask=mask,
+                pdf_xref=pdf_xref,
+                pdf_placement=pdf_placement,
             )
         )
 
@@ -992,12 +1251,251 @@ def normalise_elements(payload: dict, page: RasterPage) -> list[ExtractedElement
             "Nothing usable could be extracted from that page. Try a "
             "higher-resolution version, or a PNG export of the design."
         )
+
+    if smart:
+        # Width compensation only against measured geometry: a structural PDF
+        # read reports the box the designer actually drew, so the gap between
+        # it and the substitute face's estimated run is real and worth closing.
+        # A vision measurement is itself an estimate, and tracking text to fit
+        # an estimated box would stretch correct type to fit a wrong number.
+        if bool(payload.get("page", {}).get("geometry_is_exact")):
+            _track_text_to_measured_width(elements, page)
+        _fit_text_boxes(elements, page)
+        # After the geometry passes, because the overlap gate inside reads the
+        # settled boxes: an `unsupported_pattern` box is given something to
+        # render — a measured gradient, or its own pixels — instead of arriving
+        # on the canvas as an empty rectangle.
+        _rescue_unclassified_fills(elements, page)
+
+    # Rewrite alignment relationships from the reader's throwaway ids onto the
+    # stored keys, dropping any peer that did not survive normalisation. A
+    # relationship pointing at nothing is worse than no relationship, so an
+    # emptied set is removed entirely.
+    if raw_id_to_key:
+        for element in elements:
+            constraints = element.style_properties.get("layout_constraints")
+            if not isinstance(constraints, dict):
+                continue
+            remapped: dict[str, list[str]] = {}
+            for relation, peers in constraints.items():
+                mapped = [raw_id_to_key[p] for p in peers if p in raw_id_to_key]
+                if mapped:
+                    remapped[relation] = mapped
+            if remapped:
+                element.style_properties["layout_constraints"] = remapped
+            else:
+                element.style_properties.pop("layout_constraints", None)
+
     return elements
 
 
 #: Template types that display words. A BADGE is a filled shape with a label
 #: inside it, so it carries text too.
 _TEXT_ELEMENT_TYPES = frozenset({ElementType.TEXT, ElementType.BADGE})
+
+#: Per-character advance classes, in em, approximating the body substitute
+#: stack (DejaVu / Liberation Sans) at regular weight. Used only to estimate
+#: whether a text box fits its content — not to lay type out, which the
+#: renderer does for real. A flat per-family average was tried first and its
+#: bias was systematic: it priced an "i" and an "M" the same, so ordinary
+#: mixed-case sentences were over-estimated by ~10% and the tracking pass
+#: squeezed every one of them to its clamp. Five coarse classes remove the
+#: bias without pretending to be a font engine.
+_NARROW_GLYPHS = set("iIlj!.,:;'\"|·")
+_SEMI_NARROW_GLYPHS = set("tfr()-[]{}/ ")
+_WIDE_GLYPHS = set("mwMW@%&")
+_CAPS_ADVANCE, _LOWER_ADVANCE = 0.66, 0.55
+_NARROW_ADVANCE, _SEMI_NARROW_ADVANCE, _WIDE_ADVANCE = 0.28, 0.35, 0.85
+
+#: How much narrower each substitute family runs than the body stack. The
+#: serif stack leads with Liberation Serif (Times metrics), the display stack
+#: is condensed by design, and scripts are the narrowest family there is.
+_FAMILY_WIDTH_FACTOR = {"body": 1.0, "serif": 0.92, "display": 0.85, "script": 0.78}
+
+#: Mono is mono: every glyph advances the same.
+_MONO_ADVANCE = 0.60
+
+
+def _run_advance_em(text: str, family: str) -> float:
+    """The estimated width of one line in the substitute face, in em."""
+    if family == "mono":
+        return len(text) * _MONO_ADVANCE
+    total = 0.0
+    for glyph in text:
+        if glyph in _NARROW_GLYPHS:
+            total += _NARROW_ADVANCE
+        elif glyph in _SEMI_NARROW_GLYPHS:
+            total += _SEMI_NARROW_ADVANCE
+        elif glyph in _WIDE_GLYPHS:
+            total += _WIDE_ADVANCE
+        elif glyph.isupper() or glyph.isdigit() or glyph in "$€£₹#":
+            total += _CAPS_ADVANCE
+        else:
+            total += _LOWER_ADVANCE
+    return total * _FAMILY_WIDTH_FACTOR.get(family, 1.0)
+
+#: A box is never widened past this multiple of its measured width, nor past the
+#: canvas edge. A text run that needs more than this to fit is a measurement the
+#: renderer's shrink-to-fit should handle, not one to rescue by dragging the
+#: element halfway across the page and onto its neighbour.
+_MAX_TEXT_WIDEN = 1.6
+
+#: A whisker of slack past the estimate so the fit pass is not sitting exactly
+#: on the box edge, where a rounding difference still clips.
+_TEXT_FIT_MARGIN = 1.03
+
+#: Bounds on the tracking compensation below, in em per glyph. The positive
+#: cap is set by what wide-tracked flyer headers actually use ("L U X U R Y"
+#: sits near 0.3em); the negative cap is much tighter because squeezing type
+#: is visible long before stretching it is, and past a few hundredths the cure
+#: reads worse than the clipped glyph it prevents. Estimation error beyond
+#: these bounds is left to the widening and shrink-to-fit passes.
+_MAX_TRACK_EM, _MIN_TRACK_EM = 0.35, -0.06
+
+#: Below this the compensation is smaller than the estimate's own noise.
+_MIN_TRACK_APPLY_EM = 0.01
+
+#: A run shorter than this gives the per-glyph estimate too little to average
+#: over — one unusually wide glyph dominates and the correction is noise.
+_MIN_TRACK_GLYPHS = 4
+
+
+def _track_text_to_measured_width(elements: list[ExtractedElement], page: RasterPage) -> int:
+    """Space the substitute face into the width the original actually occupied.
+
+    The deepest fidelity gap in an import is typographic: the artwork's face is
+    not installed and cannot be licensed, so a substitute renders every run a
+    little wider or narrower than the original — and the page's rhythm drifts.
+    The web's answer to this is metric compensation (CSS ``size-adjust`` and
+    friends): don't match the font, make the fallback *occupy the same space*.
+    This is that idea per element, expressed as ``letter_spacing_em`` because
+    that is the one spacing knob the document schema, the renderer and the
+    editor already agree on.
+
+    Only runs on structural PDF reads, where the box width is the document's
+    own measurement of the original run (see the callsite). The substitute's
+    run is estimated from ``_run_advance_em``, the gap is spread across the
+    glyphs, and the result is clamped hard — an estimate is allowed to nudge
+    tracking, never to restyle the type. Elements that already carry an
+    explicit tracking value are left alone. Returns how many were adjusted.
+    """
+    scale_ref = float(min(page.width, page.height))
+    adjusted = 0
+    for element in elements:
+        if element.element_type not in _TEXT_ELEMENT_TYPES:
+            continue
+        text = (element.default_content or "").strip()
+        # Multi-line content has per-line widths this single-box arithmetic
+        # cannot see; the PDF reader emits one element per visual line, so in
+        # practice this skips almost nothing.
+        if not text or "\n" in text or len(text) < _MIN_TRACK_GLYPHS:
+            continue
+        style = element.style_properties or {}
+        if style.get("letter_spacing_em") is not None:
+            continue
+        ratio = float(style.get("font_size_ratio") or 0)
+        if ratio <= 0:
+            continue
+
+        font_px = ratio * scale_ref
+        family = str(style.get("font_family") or "body")
+        estimated_px = _run_advance_em(text, family) * font_px
+        measured_px = float(element.geometry.get("width", 0.0)) * page.width
+        if measured_px <= 0 or estimated_px <= 0:
+            continue
+
+        # Aim a whisker short of the measured width, so the widening pass —
+        # which demands _TEXT_FIT_MARGIN of slack — sees a run that already
+        # fits and leaves the measured geometry alone.
+        target_px = measured_px / _TEXT_FIT_MARGIN
+        spacing_em = (target_px - estimated_px) / (len(text) * font_px)
+        # Floored to 3dp, not rounded: rounding up can nudge the estimated run
+        # a hair past the measured box, and the widening pass would then
+        # "rescue" a box this pass had just fitted. Clamped after, so the
+        # bounds land on their exact values.
+        spacing_em = math.floor(spacing_em * 1000) / 1000
+        spacing_em = max(_MIN_TRACK_EM, min(_MAX_TRACK_EM, spacing_em))
+        if abs(spacing_em) < _MIN_TRACK_APPLY_EM:
+            continue
+        style["letter_spacing_em"] = spacing_em
+        element.style_properties = style
+        adjusted += 1
+    return adjusted
+
+
+def _fit_text_boxes(elements: list[ExtractedElement], page: RasterPage) -> int:
+    """Widen a text box just enough that its content is not clipped on render.
+
+    The import measures a headline in the artwork's own typeface; the renderer
+    draws it in a substitute, which is usually wider, so a box cut tight to the
+    original clips the last glyph — "$1,300,000" comes out "$1,300,00". The
+    renderer's shrink-to-fit only shrinks to ``FIT_MIN_SCALE`` (0.5) and then
+    lets ``overflow:hidden`` cut the rest, so a box a few percent too narrow at
+    that floor still loses a character.
+
+    This gives the box room at import, anchored by the element's own text-align
+    so the text does not appear to jump: a left-aligned box grows rightward, a
+    right-aligned box leftward, a centred one both ways. It never crosses the
+    canvas edge and never grows past ``_MAX_TEXT_WIDEN`` — a wildly wrong
+    measurement is left to the shrink pass rather than dragged across the page.
+
+    The estimate does not need to be exact: the renderer's fit pass is still the
+    real guarantee against overflow. All this has to do is stop that pass from
+    bottoming out on a box that was only a little too tight. Returns how many
+    boxes it widened.
+    """
+    scale_ref = float(min(page.width, page.height))
+    widened = 0
+    for element in elements:
+        if element.element_type not in _TEXT_ELEMENT_TYPES:
+            continue
+        text = (element.default_content or "").strip()
+        if not text:
+            continue
+        style = element.style_properties or {}
+        ratio = float(style.get("font_size_ratio") or 0)
+        if ratio <= 0:
+            continue
+
+        font_px = ratio * scale_ref
+        family = str(style.get("font_family") or "body")
+        lines = text.splitlines() or [text]
+        # Tracking widens (or narrows) every glyph's footprint, so the estimate
+        # must include it — a run the tracking pass just compensated to fit its
+        # measured box would otherwise be "too narrow" by its own tracking and
+        # get widened right back out of alignment.
+        spacing_em = float(style.get("letter_spacing_em") or 0.0)
+        needed_em = max(
+            _run_advance_em(line, family) + spacing_em * len(line) for line in lines
+        )
+        if needed_em <= 0:
+            continue
+        needed_px = needed_em * font_px * _TEXT_FIT_MARGIN
+
+        box_px = float(element.geometry.get("width", 0.0)) * page.width
+        if box_px <= 0 or needed_px <= box_px:
+            continue
+
+        new_px = min(needed_px, box_px * _MAX_TEXT_WIDEN, float(page.width))
+        if new_px <= box_px:
+            continue
+
+        x_px = float(element.geometry.get("x", 0.0)) * page.width
+        align = str(style.get("text_align") or "left")
+        grow = new_px - box_px
+        if align == "right":
+            new_x = x_px - grow
+        elif align == "center":
+            new_x = x_px - grow / 2
+        else:
+            new_x = x_px
+        # Keep the widened box on the canvas.
+        new_x = max(0.0, min(new_x, page.width - new_px))
+
+        element.geometry["x"] = round(new_x / page.width, 4)
+        element.geometry["width"] = round(new_px / page.width, 4)
+        widened += 1
+    return widened
 
 #: The longest literal string worth keeping as default content. Well past a
 #: flyer's description paragraph; short of a model that has started
@@ -1038,6 +1536,10 @@ def _style_for(kind: str, raw: dict, scale_reference: float) -> dict:
         weight = str(raw.get("font_weight") or "")
         if weight in {"300", "400", "500", "600", "700", "800", "900"}:
             style["font_weight"] = weight
+        # Only the slanted case is worth a key; "normal" is already the
+        # default and storing it would be noise on every element.
+        if str(raw.get("font_style") or "") == "italic":
+            style["font_style"] = "italic"
         family = str(raw.get("font_family") or "")
         if family in FONT_FAMILIES:
             style["font_family"] = family
@@ -1198,11 +1700,217 @@ def _crop_box(x, y, w, h, page: RasterPage) -> tuple[int, int, int, int] | None:
 
 
 # ---------------------------------------------------------------------------
+# Step 3 (continued) — rescue fills neither reader could describe
+# ---------------------------------------------------------------------------
+#
+# A PDF shading (or a fill the vision model would not commit to) arrives as
+# `unsupported_pattern`: an honest box with nothing to render in it. Honest,
+# but the flyer plainly *shows* something there — and the raster has it. So
+# the region's own pixels are measured: a smooth fade becomes a real gradient
+# (numbers in, CSS out — the same no-string rule every other fill follows), a
+# flat region becomes its measured colour, and a genuine texture is baked as a
+# static crop, but only when nothing else sits on top of it — baking a region
+# with text on it would give the canvas a picture of words next to the words.
+
+#: The probe is a thumbnail, resampled NEAREST so noise and texture survive
+#: into the measurement instead of being averaged into a fake smooth fade.
+_FILL_SAMPLE_EDGE = 48
+
+#: Mean per-channel deviation (0-255) a row/column may show around its own
+#: mean before the region is not uniform along that axis.
+_FILL_ROW_NOISE = 8.0
+
+#: Below this end-to-end colour distance the "fade" is flatness plus noise,
+#: and the honest description is a solid colour.
+_FILL_MIN_FADE = 24.0
+
+#: A fade's total variation may exceed its end-to-end distance only by this
+#: factor; past it the region is stripes or texture, not a gradient.
+_FILL_SMOOTH_FACTOR = 1.35
+
+#: How much of an unclassified fill another element may cover before baking
+#: the region would bake that element into the picture too.
+_RESCUE_MAX_OVERLAP = 0.02
+
+#: Peers at least this large (as a fraction of the page) are the ground the
+#: fill sits *on*, not content sitting on the fill; they never block a bake.
+_CONTAINER_COVERAGE = 0.95
+
+
+def _rescue_unclassified_fills(elements: list[ExtractedElement], page: RasterPage) -> int:
+    """Replace `unsupported_pattern` fills with what the raster shows there.
+
+    Returns how many elements were rescued. Anything that fails a confidence
+    gate keeps its `unsupported_pattern` marker and its import warning — a
+    wrong description is still worse than an honest gap.
+    """
+    from PIL import Image
+
+    targets = [
+        element
+        for element in elements
+        if element.element_type == ElementType.COLOR_BLOCK
+        and element.style_properties.get("fill_type") == "unsupported_pattern"
+    ]
+    if not targets:
+        return 0
+
+    rescued = 0
+    try:
+        with Image.open(io.BytesIO(page.png)) as source:
+            source.load()
+            raster = source.convert("RGB")
+    except Exception:  # pragma: no cover - the raster was produced upstream
+        logger.warning("Could not reopen the raster for fill rescue", exc_info=True)
+        return 0
+
+    for element in targets:
+        box = _crop_box(
+            float(element.geometry.get("x", 0.0)) * page.width,
+            float(element.geometry.get("y", 0.0)) * page.height,
+            float(element.geometry.get("width", 0.0)) * page.width,
+            float(element.geometry.get("height", 0.0)) * page.height,
+            page,
+        )
+        if box is None:
+            continue
+        fit = _fit_region_fill(raster.crop(box))
+        style = element.style_properties
+        if fit is not None and fit["kind"] == "gradient":
+            style["fill_type"] = "gradient"
+            style["background_gradient"] = fit["css"]
+            style.pop("background_color", None)
+            rescued += 1
+        elif fit is not None:
+            style["fill_type"] = "solid_color"
+            style["background_color"] = fit["color"]
+            rescued += 1
+        elif _rescue_crop_allowed(element, elements):
+            # Not describable as colour — bake the region itself. It becomes a
+            # static graphic (the icon route: baked pixels, never rebound) and
+            # is marked `image_texture`, which still surfaces in the import's
+            # review warnings: a snapshot is a fix, not a clean bill.
+            element.element_type = ElementType.STATIC_GRAPHIC
+            element.crop_box = box
+            style["fill_type"] = "image_texture"
+            style.setdefault("object_fit", "cover")
+            style.setdefault("object_position", "center center")
+            rescued += 1
+    return rescued
+
+
+def _fit_region_fill(region) -> dict | None:
+    """A gradient or flat colour that explains this region, or None.
+
+    Measured, not guessed: per-row and per-column means over a small NEAREST
+    thumbnail. An axis fits when every line across it is near-uniform
+    (`_FILL_ROW_NOISE`) — text or a photo under the region breaks that and
+    correctly refuses the fit — and its means either barely move (a solid) or
+    move smoothly end to end (a gradient). The CSS is assembled here from
+    numbers only; `document.GRADIENT_RE` re-checks it at store time.
+    """
+    from PIL import Image
+
+    width = max(1, min(region.width, _FILL_SAMPLE_EDGE))
+    height = max(1, min(region.height, _FILL_SAMPLE_EDGE))
+    if width < 2 or height < 2:
+        return None
+    sample = region.resize((width, height), Image.Resampling.NEAREST)
+    pixels = list(sample.getdata())
+
+    def axis_fit(lines: list[list[tuple[int, int, int]]]):
+        means: list[tuple[float, float, float]] = []
+        noise = 0.0
+        for line in lines:
+            count = len(line)
+            mean = tuple(sum(p[c] for p in line) / count for c in range(3))
+            noise += sum(abs(p[c] - mean[c]) for p in line for c in range(3)) / (3 * count)
+            means.append(mean)
+        noise /= len(lines)
+        variation = sum(
+            abs(means[i + 1][c] - means[i][c])
+            for i in range(len(means) - 1)
+            for c in range(3)
+        )
+        span = sum(abs(means[-1][c] - means[0][c]) for c in range(3))
+        return means, noise, variation, span
+
+    rows = [pixels[y * width : (y + 1) * width] for y in range(height)]
+    cols = [[pixels[y * width + x] for y in range(height)] for x in range(width)]
+
+    candidates = []
+    for axis, lines in (("vertical", rows), ("horizontal", cols)):
+        means, noise, variation, span = axis_fit(lines)
+        if noise > _FILL_ROW_NOISE:
+            continue
+        if span < _FILL_MIN_FADE:
+            candidates.append((noise, axis, means, "solid"))
+        elif variation <= span * _FILL_SMOOTH_FACTOR:
+            candidates.append((noise, axis, means, "gradient"))
+    if not candidates:
+        return None
+
+    _, axis, means, kind = min(candidates, key=lambda item: item[0])
+    if kind == "solid":
+        overall = tuple(sum(mean[c] for mean in means) / len(means) for c in range(3))
+        return {"kind": "solid", "color": _hex_of(overall)}
+    # 180deg paints the 0% stop at the top, 90deg at the left — matching the
+    # first row/column of the measurement.
+    angle = "180deg" if axis == "vertical" else "90deg"
+    return {
+        "kind": "gradient",
+        "css": (
+            f"linear-gradient({angle}, "
+            f"{_hex_of(means[0])} 0%, {_hex_of(means[-1])} 100%)"
+        ),
+    }
+
+
+def _hex_of(rgb: tuple[float, float, float]) -> str:
+    red, green, blue = (max(0, min(255, round(c))) for c in rgb)
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+def _rescue_crop_allowed(element: ExtractedElement, elements: list[ExtractedElement]) -> bool:
+    """True when baking this region would bake only the region.
+
+    Anything stacked *above* the fill — text, a photo, a badge — would be
+    frozen into the crop and then rendered again as itself, which is the
+    double-drawn-text failure the background crop rule exists to prevent.
+    Page-covering grounds beneath it are fine: their pixels compose into the
+    snapshot exactly as they compose on the page.
+    """
+    own = element.geometry
+    own_area = float(own.get("width", 0.0)) * float(own.get("height", 0.0))
+    if own_area <= 0:
+        return False
+    x0, y0 = float(own.get("x", 0.0)), float(own.get("y", 0.0))
+    x1, y1 = x0 + float(own.get("width", 0.0)), y0 + float(own.get("height", 0.0))
+    for peer in elements:
+        if peer is element or peer.z_index <= element.z_index:
+            continue
+        geometry = peer.geometry
+        if float(geometry.get("width", 0.0)) * float(geometry.get("height", 0.0)) >= _CONTAINER_COVERAGE:
+            continue
+        px0, py0 = float(geometry.get("x", 0.0)), float(geometry.get("y", 0.0))
+        px1 = px0 + float(geometry.get("width", 0.0))
+        py1 = py0 + float(geometry.get("height", 0.0))
+        overlap = max(0.0, min(x1, px1) - max(x0, px0)) * max(0.0, min(y1, py1) - max(y0, py0))
+        if overlap / own_area > _RESCUE_MAX_OVERLAP:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Step 3b — bake the crops
 # ---------------------------------------------------------------------------
 
 
-def bake_assets(elements: list[ExtractedElement], page: RasterPage) -> int:
+def bake_assets(
+    elements: list[ExtractedElement],
+    page: RasterPage,
+    source_pdf: bytes | None = None,
+) -> int:
     """Cut each image element's own pixels out of the raster.
 
     This is what makes an imported template *look* like the artwork it came
@@ -1210,31 +1918,154 @@ def bake_assets(elements: list[ExtractedElement], page: RasterPage) -> int:
     carry a binding, the crop is a fallback: attaching a listing replaces it
     with the agent's real photo (see ``html_builder.resolve_content``).
 
+    When ``source_pdf`` is given and an element knows the xref of the stream
+    it was placed from, the crop is taken from the *original* embedded image
+    instead — the raster is capped at ``TEMPLATE_IMPORT_RASTER_MAX_EDGE`` for
+    the whole page, so a photo occupying half of it keeps at most half those
+    pixels, while the embedded stream is the photograph the designer placed.
+    The swap is verified, never trusted (see ``_embedded_crop``); anything
+    that fails a gate keeps the raster crop.
+
     Failures are per-element and non-fatal. One unreadable region should cost
     that element its picture, not cost the user the whole import.
     """
     from PIL import Image
 
-    with Image.open(io.BytesIO(page.png)) as source:
-        source.load()
-        baked = 0
-        for element in elements:
-            if element.crop_box is None:
-                continue
-            try:
-                crop = source.crop(element.crop_box).convert("RGB")
-                if max(crop.size) > _MAX_CROP_EDGE:
-                    crop.thumbnail((_MAX_CROP_EDGE, _MAX_CROP_EDGE), Image.LANCZOS)
-                buffer = io.BytesIO()
-                crop.save(buffer, format="PNG", optimize=True)
-            except Exception:
-                logger.warning(
-                    "Could not crop %r from the source page", element.key, exc_info=True
-                )
-                continue
-            element.asset = ContentFile(buffer.getvalue(), name=f"{element.key}.png")
-            baked += 1
+    pdf_lib = document = None
+    if source_pdf and any(e.pdf_xref and e.crop_box for e in elements):
+        pdf_lib, document = _open_source_pdf(source_pdf)
+
+    try:
+        with Image.open(io.BytesIO(page.png)) as source:
+            source.load()
+            baked = 0
+            for element in elements:
+                if element.crop_box is None:
+                    continue
+                try:
+                    crop = source.crop(element.crop_box).convert("RGB")
+                    if document is not None and element.pdf_xref and element.pdf_placement:
+                        crop = _embedded_crop(pdf_lib, document, element, crop) or crop
+                    if max(crop.size) > _MAX_CROP_EDGE:
+                        crop.thumbnail((_MAX_CROP_EDGE, _MAX_CROP_EDGE), Image.LANCZOS)
+                    buffer = io.BytesIO()
+                    crop.save(buffer, format="PNG", optimize=True)
+                except Exception:
+                    logger.warning(
+                        "Could not crop %r from the source page", element.key, exc_info=True
+                    )
+                    continue
+                element.asset = ContentFile(buffer.getvalue(), name=f"{element.key}.png")
+                baked += 1
+    finally:
+        if document is not None:
+            document.close()
     return baked
+
+
+def _open_source_pdf(source_pdf: bytes):
+    """(pymupdf module, open document) — or (module, None) when it cannot be."""
+    try:
+        import pymupdf
+    except ImportError:  # pragma: no cover - depends on the installed wheel
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            return None, None
+    try:
+        return pymupdf, pymupdf.open(stream=source_pdf, filetype="pdf")
+    except Exception:  # pragma: no cover - the same bytes rasterised upstream
+        logger.warning("Could not reopen the source PDF for baking", exc_info=True)
+        return pymupdf, None
+
+
+#: The embedded image is only worth swapping in when it carries meaningfully
+#: more pixels than the raster crop on both axes. At or near parity the swap
+#: buys re-encoding for nothing.
+_EMBED_MIN_GAIN = 1.15
+
+#: Mean per-channel difference (0-255) between the candidate and the raster
+#: crop, at probe size, above which the mapping is wrong and the raster crop
+#: stays. Generous enough to survive JPEG artefacts and an overlay or two;
+#: far below what a flipped or mis-mapped image produces.
+_EMBED_MATCH_MAD = 34.0
+
+#: Both sides are shrunk to this square for the comparison.
+_EMBED_PROBE_EDGE = 32
+
+
+def _embedded_crop(pdf_lib, document, element: ExtractedElement, raster_crop):
+    """The original image's pixels for this element, or None to keep the crop.
+
+    The placement matrix can flip or rotate the image on the page, and nothing
+    in the payload is trusted to say so — instead the candidate (and its
+    mirrored and half-turned variants) is *compared against the raster crop*,
+    which is known-correct because it is what the page actually shows. The
+    best variant only wins if it matches; a 90°-rotated placement matches
+    nothing and correctly falls back.
+    """
+    from PIL import Image, ImageChops, ImageStat
+
+    try:
+        # A soft-masked image composites with transparency that flat RGB
+        # extraction loses; the raster crop already shows it composited right.
+        kind, _ = document.xref_get_key(element.pdf_xref, "SMask")
+        if kind not in ("null", ""):
+            return None
+
+        pixmap = pdf_lib.Pixmap(document, element.pdf_xref)
+        if pixmap.colorspace is None:
+            return None  # a stencil mask, not a picture
+        if pixmap.n - pixmap.alpha != 3:
+            pixmap = pdf_lib.Pixmap(pdf_lib.csRGB, pixmap)
+        mode = "RGBA" if pixmap.alpha else "RGB"
+        image = Image.frombytes(mode, (pixmap.width, pixmap.height), pixmap.samples).convert("RGB")
+
+        # The crop box is a (possibly clipped) window on the placement; the
+        # same window, as fractions, cuts the region out of the original.
+        left, top, right, bottom = element.crop_box
+        px, py, pw, ph = element.pdf_placement
+        window = (
+            round(min(max((left - px) / pw, 0.0), 1.0) * image.width),
+            round(min(max((top - py) / ph, 0.0), 1.0) * image.height),
+            round(min(max((right - px) / pw, 0.0), 1.0) * image.width),
+            round(min(max((bottom - py) / ph, 0.0), 1.0) * image.height),
+        )
+        if window[2] - window[0] < _MIN_CROP_PX or window[3] - window[1] < _MIN_CROP_PX:
+            return None
+        candidate = image.crop(window)
+
+        if (
+            candidate.width < raster_crop.width * _EMBED_MIN_GAIN
+            or candidate.height < raster_crop.height * _EMBED_MIN_GAIN
+        ):
+            return None
+
+        probe = raster_crop.resize((_EMBED_PROBE_EDGE, _EMBED_PROBE_EDGE))
+        best_score, best = None, None
+        for operation in (
+            None,
+            Image.Transpose.FLIP_LEFT_RIGHT,
+            Image.Transpose.FLIP_TOP_BOTTOM,
+            Image.Transpose.ROTATE_180,
+        ):
+            oriented = candidate if operation is None else candidate.transpose(operation)
+            thumb = oriented.resize((_EMBED_PROBE_EDGE, _EMBED_PROBE_EDGE))
+            channels = ImageStat.Stat(ImageChops.difference(thumb, probe)).mean
+            score = sum(channels) / len(channels)
+            if best_score is None or score < best_score:
+                best_score, best = score, oriented
+        if best is None or best_score > _EMBED_MATCH_MAD:
+            return None
+        return best
+    except Exception:
+        logger.warning(
+            "Embedded image %s for %r could not be used; keeping the raster crop",
+            element.pdf_xref,
+            element.key,
+            exc_info=True,
+        )
+        return None
 
 
 def _clip_polygon(
@@ -1323,6 +2154,7 @@ def build_template(
     elements: list[ExtractedElement],
     payload: dict,
     description: str = "",
+    fidelity: dict | None = None,
 ) -> Template:
     """Persist the extraction as a Template the editor can open.
 
@@ -1331,6 +2163,19 @@ def build_template(
     """
     background = _colour(payload.get("page", {}).get("background_color")) or "#FFFFFF"
 
+    layout_definition = {
+        "background_color": background,
+        # Kept so a later re-extraction, or anyone debugging geometry, knows
+        # the coordinate space these fractions were measured in.
+        "source_width": page.width,
+        "source_height": page.height,
+    }
+    # A fidelity score, when the validation stage ran. Additive JSON on an
+    # existing field — no migration — and read by the serializer to warn on a
+    # reconstruction that came back looking unlike the source.
+    if fidelity:
+        layout_definition["import_fidelity"] = fidelity
+
     template = Template.objects.create(
         owner=owner,
         name=name,
@@ -1338,13 +2183,7 @@ def build_template(
         description=description,
         category=category,
         style=style,
-        layout_definition={
-            "background_color": background,
-            # Kept so a later re-extraction, or anyone debugging geometry, knows
-            # the coordinate space these fractions were measured in.
-            "source_width": page.width,
-            "source_height": page.height,
-        },
+        layout_definition=layout_definition,
         default_dimension=closest_dimension(page.width, page.height),
         allows_added_elements=True,
         is_active=True,
@@ -1370,6 +2209,118 @@ def build_template(
         row.save()
 
     return template
+
+
+# ---------------------------------------------------------------------------
+# Optional validation and debug — off the cheap path, never fatal
+# ---------------------------------------------------------------------------
+
+
+def _maybe_validate(result, elements, page):
+    """Render-and-compare the extraction if enabled. Returns a result or None.
+
+    Structural PDF reads are scored too. Their *geometry* is the document's
+    own, but the render of it is not: the faces are substituted, fills are
+    rescued from measurements, and this score is the only number that says how
+    far the rebuilt page drifted — which is exactly where the structural
+    path's fidelity gaps live. What structural reads never get is the offset
+    auto-correction: an offset finding against exact geometry describes the
+    substitute face's rendering, not a measurement error, and moving the
+    document's own numbers to chase it would trade real fidelity for the
+    metric. Any failure inside validation is swallowed there and surfaces
+    here as None.
+
+    For vision extractions, when the score comes back with per-element
+    offsets, one bounded correction round runs (see ``_autocorrect_offsets``)
+    before the result is recorded, so the fidelity stored on the template is
+    the fidelity of what was stored.
+    """
+    if not getattr(settings, "TEMPLATE_IMPORT_VALIDATE", False):
+        return None
+    geometry_is_exact = getattr(result, "model", "") == "pdf-structure"
+
+    from apps.templates.extraction_validation import validate_extraction
+
+    background = _colour(result.payload.get("page", {}).get("background_color")) or "#FFFFFF"
+    outcome = validate_extraction(elements, page, background)
+    if (
+        outcome.ok
+        and not geometry_is_exact
+        and getattr(settings, "TEMPLATE_IMPORT_AUTOCORRECT", True)
+    ):
+        outcome = _autocorrect_offsets(outcome, elements, page, background)
+    if outcome.ok:
+        logger.info(
+            "Import validation scored %.3f with %s element issue(s)",
+            outcome.score,
+            len(outcome.issues),
+        )
+    return outcome
+
+
+def _autocorrect_offsets(outcome, elements, page, background: str):
+    """One bounded round of moving elements where the pixels say they sit.
+
+    Validation's offset search already answers "would this box match if it
+    were a few pixels over" (``extraction_validation._best_offset``). A vision
+    model's localisation error is mostly exactly that — the right element, a
+    hair off — so the answer is applied rather than only reported: each
+    offset-flagged element is shifted by the delta that explained its
+    mismatch, capped by the search radius itself (±6px at source scale).
+
+    The historical objection to correcting from a pixel diff — it can move a
+    correct element as easily as fix a wrong one — is met by making the change
+    conditional: the corrected layout is re-rendered and re-scored, and kept
+    only when the whole page got closer to the original. One extra render,
+    no iteration, and the failure mode is "no change" rather than drift.
+    """
+    shifts: dict[str, tuple[int, int]] = {}
+    for issue in outcome.issues:
+        delta = (int(issue.get("delta_x") or 0), int(issue.get("delta_y") or 0))
+        if issue.get("type") == "offset" and issue.get("element_id") and delta != (0, 0):
+            shifts[issue["element_id"]] = delta
+    if not shifts:
+        return outcome
+
+    # delta is where the *rendered* box's content matched the original, i.e.
+    # the extraction error itself — so the element moves by minus delta.
+    moved: list[tuple[ExtractedElement, dict]] = []
+    for element in elements:
+        delta = shifts.get(element.key)
+        if delta is None:
+            continue
+        before = dict(element.geometry)
+        element.geometry["x"] = round(before["x"] - delta[0] / page.width, 4)
+        element.geometry["y"] = round(before["y"] - delta[1] / page.height, 4)
+        moved.append((element, before))
+    if not moved:
+        return outcome
+
+    from apps.templates.extraction_validation import validate_extraction
+
+    corrected = validate_extraction(elements, page, background)
+    if corrected.ok and corrected.score > outcome.score:
+        logger.info(
+            "Import auto-correction moved %s element(s): %.3f -> %.3f",
+            len(moved),
+            outcome.score,
+            corrected.score,
+        )
+        return corrected
+
+    for element, before in moved:
+        element.geometry = before
+    return outcome
+
+
+def _write_debug(job, page, result, elements, fidelity) -> None:
+    """Write the debug gallery. Best-effort; never disturbs the import."""
+    try:
+        from apps.templates.extraction_debug import write_debug_gallery
+
+        write_debug_gallery(job.pk, page, result.payload, elements, fidelity)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Import debug gallery failed for job %s", job.pk, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1403,7 +2354,21 @@ def run_import(job) -> Template:
     result = extract_page(data, page)
 
     elements = normalise_elements(result.payload, page)
-    baked = bake_assets(elements, page)
+    baked = bake_assets(
+        elements,
+        page,
+        source_pdf=data if data[:4] == _PDF_MAGIC else None,
+    )
+
+    # Optional render-and-compare, off by default so the cheap path stays
+    # cheap. Structural PDF reads are scored but never offset-corrected (their
+    # geometry is the file's own; see _maybe_validate). It may apply one
+    # bounded, score-gated correction round for vision reads but never fails
+    # the import — a low score, or no score at all, is only a note.
+    fidelity = _maybe_validate(result, elements, page)
+
+    if getattr(settings, "TEMPLATE_IMPORT_DEBUG", False):
+        _write_debug(job, page, result, elements, fidelity)
 
     template = build_template(
         owner=job.agent,
@@ -1418,6 +2383,11 @@ def run_import(job) -> Template:
             f"{len(elements)} elements, {baked} with artwork extracted from the "
             f"page. Every element is editable — attach a listing to fill the "
             f"photos and details with a real property."
+        ),
+        fidelity=(
+            {"score": fidelity.score, "issues": len(fidelity.issues)}
+            if fidelity is not None and fidelity.ok
+            else None
         ),
     )
 

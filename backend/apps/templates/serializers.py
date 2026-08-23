@@ -251,7 +251,7 @@ class TemplateImportSerializer(serializers.ModelSerializer):
         template = job.template
         if template is None:
             return []
-        return [
+        warnings = [
             {
                 "element": element.label or element.key,
                 "issue": _WARNING_TEXT[fill_type],
@@ -261,6 +261,29 @@ class TemplateImportSerializer(serializers.ModelSerializer):
             for fill_type in [str((element.style_properties or {}).get("fill_type", ""))]
             if fill_type in _WARNING_TEXT
         ]
+
+        # A whole-page fidelity note, when the render-and-compare stage ran and
+        # scored the reconstruction below the threshold. Derived, like the
+        # above, from what was stored on the template rather than a second copy
+        # on the job — and absent entirely when validation was off, which is the
+        # default, so this adds nothing to the common import.
+        fidelity = (template.layout_definition or {}).get("import_fidelity") or {}
+        score = fidelity.get("score")
+        threshold = getattr(settings, "TEMPLATE_IMPORT_VALIDATE_MIN_SCORE", 0.9)
+        if isinstance(score, (int, float)) and score < threshold:
+            warnings.append(
+                {
+                    "element": "",
+                    "issue": (
+                        "The rebuilt layout came back looking noticeably "
+                        f"different from the upload (similarity {score:.0%}). "
+                        "Check the positions and photos in the editor before "
+                        "publishing."
+                    ),
+                    "fill_type": "low_fidelity",
+                }
+            )
+        return warnings
 
 
 class CalendarEventSerializer(serializers.ModelSerializer):
@@ -354,6 +377,7 @@ class DesignSerializer(serializers.ModelSerializer):
             "listing",
             "listing_address",
             "calendar_event",
+            "preferred_dimension",
             "elements",
             "exports",
             "fresh",
@@ -364,6 +388,10 @@ class DesignSerializer(serializers.ModelSerializer):
             "id",
             "template_detail",
             "listing_address",
+            # Set only by the adapt endpoint — an adapted layout is composed
+            # for one format, and that fact is the server's to record, not a
+            # field a stray PATCH should be able to flip.
+            "preferred_dimension",
             "exports",
             "created_at",
             "updated_at",
@@ -530,6 +558,13 @@ class DesignRenameSerializer(serializers.Serializer):
 
 
 class DesignDuplicateSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=160, required=False, allow_blank=True)
+
+
+class DesignAdaptSerializer(serializers.Serializer):
+    """Ask for a copy of a design re-laid-out for another format."""
+
+    dimension = serializers.ChoiceField(choices=sorted(SOCIAL_DIMENSIONS))
     name = serializers.CharField(max_length=160, required=False, allow_blank=True)
 
 
